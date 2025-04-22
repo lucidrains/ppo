@@ -13,10 +13,10 @@ import torch
 from torch import nn, tensor, cat, stack
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader
 from torch.distributions import Categorical
 
-from einops import reduce, repeat, einsum, rearrange
+from einops import reduce, repeat, einsum, rearrange, pack
 
 from ema_pytorch import EMA
 
@@ -26,37 +26,25 @@ from hl_gauss_pytorch import HLGaussLoss
 
 from hyper_connections import HyperConnections
 
+from assoc_scan import AssocScan
+
 import gymnasium as gym
 
 # constants
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-# data
+# memory tuple
 
 Memory = namedtuple('Memory', [
+    'learnable',
     'state',
     'action',
     'action_log_prob',
     'reward',
-    'done',
+    'is_boundary',
     'value'
 ])
-
-class ExperienceDataset(Dataset):
-    def __init__(self, data):
-        super().__init__()
-        self.data = data
-
-    def __len__(self):
-        return len(self.data[0])
-
-    def __getitem__(self, ind):
-        return tuple(map(lambda t: t[ind], self.data))
-
-def create_shuffled_dataloader(data, batch_size):
-    ds = ExperienceDataset(data)
-    return DataLoader(ds, batch_size = batch_size, shuffle = True)
 
 # helpers
 
@@ -329,9 +317,40 @@ def simba_orthogonal_loss(
 
     return loss
 
+# GAE
+
+def calc_gae(
+    rewards,
+    values,
+    masks,
+    gamma = 0.99,
+    lam = 0.95,
+    use_accelerated = None
+):
+    assert values.shape[-1] == rewards.shape[-1]
+    use_accelerated = default(use_accelerated, rewards.is_cuda)
+
+    values = F.pad(values, (0, 1), value = 0.)
+    values, values_next = values[:-1], values[1:]
+
+    delta = rewards + gamma * values_next * masks - values
+    gates = gamma * lam * masks
+
+    gates, delta = gates[..., :, None], delta[..., :, None]
+
+    scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
+
+    gae = scan(gates, delta)
+
+    gae = gae[..., :, 0]
+
+    returns = gae + values
+
+    return returns
+
 # agent
 
-class PPG:
+class PPO:
     def __init__(
         self,
         state_dim,
@@ -410,55 +429,57 @@ class PPG:
         self.actor.load_state_dict(data['actor'])
         self.critic.load_state_dict(data['critic'])
 
-    def learn(self, memories, next_state):
+    def learn(self, memories):
 
         hl_gauss = self.critic_hl_gauss_loss
 
         # retrieve and prepare data from memory for training
 
         (
+            learnable,
             states,
             actions,
             old_log_probs,
             rewards,
-            dones,
+            is_boundaries,
             values
         ) = zip(*memories)
-
+        
         actions = [tensor(action) for action in actions]
-        masks = [(1. - float(done)) for done in dones]
+        masks = [(1. - float(is_boundary)) for is_boundary in is_boundaries]
 
         # calculate generalized advantage estimate
 
-        next_state = torch.from_numpy(next_state).to(device)
-        next_value = self.critic(next_state).detach()
-
         scalar_values = hl_gauss(stack(values))
-        scalar_next_value = hl_gauss(next_value)
 
-        scalar_values = list(scalar_values) + [scalar_next_value]
-
-        returns = []
-        gae = 0
-        for i in reversed(range(len(rewards))):
-            delta = rewards[i] + self.gamma * scalar_values[i + 1] * masks[i] - scalar_values[i]
-            gae = delta + self.gamma * self.lam * masks[i] * gae
-            returns.insert(0, gae + scalar_values[i])
+        with torch.no_grad():
+            rewards = calc_gae(
+                rewards = tensor(rewards).to(device),
+                values = scalar_values,
+                masks = tensor(masks).to(device),
+                lam = self.lam,
+                gamma = self.gamma,
+                use_accelerated = False
+            )
 
         # convert values to torch tensors
 
-        to_torch_tensor = lambda t: torch.stack(t).to(device).detach()
+        to_torch_tensor = lambda t: stack(t).to(device).detach()
 
         states = to_torch_tensor(states)
         actions = to_torch_tensor(actions)
         old_values = to_torch_tensor(values)
-        old_log_probs = to_torch_tensor(old_log_probs)
-
-        rewards = tensor(returns).float().to(device)
+        old_log_probs = to_torch_tensor(old_log_probs)        
 
         # prepare dataloader for policy phase training
 
-        dl = create_shuffled_dataloader([states, actions, old_log_probs, rewards, old_values], self.minibatch_size)
+        learnable = tensor(learnable).to(device)
+        data = (states, actions, old_log_probs, rewards, old_values)
+        data = tuple(t[learnable] for t in data)
+
+        dataset = TensorDataset(*data)
+
+        dl = DataLoader(dataset, batch_size = self.minibatch_size, shuffle = True)
 
         # policy phase training, similar to original PPO
 
@@ -562,7 +583,7 @@ def main(
 
     memories = deque([])
 
-    agent = PPG(
+    agent = PPO(
         state_dim,
         num_actions,
         actor_hidden_dim,
@@ -599,11 +620,11 @@ def main(
     for eps in tqdm(range(num_episodes), desc = 'episodes'):
 
         state, info = env.reset(seed = seed)
+        state = torch.from_numpy(state).to(device)
 
         for timestep in range(max_timesteps):
             time += 1
 
-            state = torch.from_numpy(state).to(device)
             action_probs, _ = agent.ema_actor.forward_eval(state)
             value = agent.ema_critic.forward_eval(state)
 
@@ -614,17 +635,40 @@ def main(
 
             next_state, reward, terminated, truncated, _ = env.step(action)
 
-            done = terminated or truncated
+            reward = float(reward)
 
-            memory = Memory(state, action, action_log_prob, reward, done, value)
+            memory = Memory(True, state, action, action_log_prob, reward, terminated, value)
+
             memories.append(memory)
 
-            state = next_state
+            state = torch.from_numpy(next_state).to(device)
 
-            if divisible_by(time, update_timesteps):
-                agent.learn(memories, next_state)
+            # determine if truncating, either from environment or learning phase of the agent
+
+            updating_agent = divisible_by(time, update_timesteps)
+            done = terminated or truncated or updating_agent
+
+            # take care of truncated by adding a non-learnable memory storing the next value for GAE
+
+            if done and not terminated:
+                next_value = agent.ema_critic.forward_eval(state)
+
+                bootstrap_value_memory = memory._replace(
+                    learnable = False,
+                    is_boundary = True,
+                    value = next_value
+                )
+
+                memories.append(bootstrap_value_memory)
+
+            # updating of the agent
+
+            if updating_agent:
+                agent.learn(memories)
                 num_policy_updates += 1
                 memories.clear()
+
+            # break if done
 
             if done:
                 break
