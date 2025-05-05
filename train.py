@@ -221,7 +221,10 @@ class Actor(Module):
         )
 
     def forward(self, x):
-        x = self.rsmnorm(x)
+        with torch.no_grad():
+            self.rsmnorm.eval()
+            x = self.rsmnorm(x)
+
         hidden = self.net(x)
         action_probs = self.action_head(hidden).softmax(dim = -1)
         return action_probs
@@ -249,7 +252,11 @@ class Critic(Module):
         self.value_head = nn.Linear(hidden_dim, dim_pred)
 
     def forward(self, x):
-        x = self.rsmnorm(x)
+
+        with torch.no_grad():
+            self.rsmnorm.eval()
+            x = self.rsmnorm(x)
+
         hidden = self.net(x)
         value = self.value_head(hidden)
         return value
@@ -366,6 +373,11 @@ class PPO:
         self.actor = Actor(state_dim, actor_hidden_dim, num_actions).to(device)
 
         self.critic = Critic(state_dim, critic_hidden_dim, dim_pred = critic_pred_num_bins).to(device)
+
+        # weight tie rsmnorm
+
+        self.rsmnorm = self.actor.rsmnorm
+        self.critic.rsmnorm = self.rsmnorm
 
         # https://arxiv.org/abs/2403.03950
 
@@ -516,6 +528,13 @@ class PPO:
                     value_loss = value_loss + model_spectral_entropy_loss(self.critic) * self.spectral_entropy_reg_weight
 
                 update_network_(value_loss, self.opt_critic)
+
+        # update the state normalization with rsmnorm for 1 epoch after actor critic are updated
+
+        self.rsmnorm.train()
+
+        for states, *_ in dl:
+            self.rsmnorm(states)
 
 # main
 
