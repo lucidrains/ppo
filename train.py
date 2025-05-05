@@ -220,20 +220,11 @@ class Actor(Module):
             nn.Linear(hidden_dim, num_actions)
         )
 
-        self.value_head = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            ReluSquared(),
-            nn.Linear(hidden_dim, 1)
-        )
-
     def forward(self, x):
         x = self.rsmnorm(x)
         hidden = self.net(x)
-
         action_probs = self.action_head(hidden).softmax(dim = -1)
-        values = self.value_head(hidden)
-
-        return action_probs, values
+        return action_probs
 
 class Critic(Module):
     def __init__(
@@ -336,13 +327,9 @@ def calc_gae(
     delta = rewards + gamma * values_next * masks - values
     gates = gamma * lam * masks
 
-    gates, delta = gates[..., :, None], delta[..., :, None]
-
     scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
 
     gae = scan(gates, delta)
-
-    gae = gae[..., :, 0]
 
     returns = gae + values
 
@@ -374,7 +361,7 @@ class PPO:
         eps_clip,
         value_clip,
         ema_decay,
-        save_path = './ppg.pt'
+        save_path = './ppo.pt'
     ):
         self.actor = Actor(state_dim, actor_hidden_dim, num_actions).to(device)
 
@@ -486,7 +473,7 @@ class PPO:
         for _ in range(self.epochs):
             for i, (states, actions, old_log_probs, rewards, old_values) in enumerate(dl):
 
-                action_probs, _ = self.actor(states)
+                action_probs = self.actor(states)
                 values = self.critic(states)
                 dist = Categorical(action_probs)
                 action_log_probs = dist.log_prob(actions)
@@ -625,7 +612,7 @@ def main(
         for timestep in range(max_timesteps):
             time += 1
 
-            action_probs, _ = agent.ema_actor.forward_eval(state)
+            action_probs = agent.ema_actor.forward_eval(state)
             value = agent.ema_critic.forward_eval(state)
 
             dist = Categorical(action_probs)

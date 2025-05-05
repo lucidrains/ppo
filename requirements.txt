@@ -1,5 +1,5 @@
 adam-atan2-pytorch
-assoc-scan
+assoc-scan>=0.0.2
 box2d-py
 einops>=0.8.0
 ema-pytorch>=0.7.3
