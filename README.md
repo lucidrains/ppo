@@ -91,3 +91,12 @@ $ python train.py
     url    = {https://api.semanticscholar.org/CorpusID:268253088}
 }
 ```
+
+```bibtex
+@article{Lee2024AnalysisClippedCritic
+    title   = {On Analysis of Clipped Critic Loss in Proximal Policy Gradient},
+    author  = {Yongjin Lee, Moonyoung Chung},
+    journal = {Authorea},
+    year    = {2024}
+}
+```

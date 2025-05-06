@@ -514,15 +514,27 @@ class PPO:
 
                 scalar_values = hl_gauss(values)
 
-                scalar_value_clipped = scalar_old_values + (scalar_values - scalar_old_values).clamp(-clip, clip)
-                value_clipped_logits = hl_gauss.transform_to_logprobs(scalar_value_clipped)
+                # using the proposal from https://www.authorea.com/users/855021/articles/1240083-on-analysis-of-clipped-critic-loss-in-proximal-policy-gradient
 
-                value_loss_1 = hl_gauss(value_clipped_logits, rewards, reduction = 'none')
-                value_loss_2 = hl_gauss(values, rewards, reduction = 'none')
+                clipped_rewards = rewards.clamp(-clip, clip)
 
-                value_loss = torch.mean(torch.max(value_loss_1, value_loss_2))
+                clipped_loss = hl_gauss(values, clipped_rewards)
+                loss = hl_gauss(values, rewards)
 
-                value_loss = value_loss + simba_orthogonal_loss(self.critic)
+                old_values_lo = scalar_old_values - clip
+                old_values_hi = scalar_old_values + clip
+
+                def is_between(mid, lo, hi):
+                    return (lo < mid) & (mid < hi)
+
+                value_loss = torch.where(
+                    is_between(scalar_values, rewards, old_values_lo) |
+                    is_between(scalar_values, old_values_hi, rewards),
+                    0.,
+                    torch.min(loss, clipped_loss)
+                )
+
+                value_loss = value_loss.mean() + simba_orthogonal_loss(self.critic)
 
                 if self.spectral_entropy_reg and divisible_by(i, self.apply_spectral_entropy_every):
                     value_loss = value_loss + model_spectral_entropy_loss(self.critic) * self.spectral_entropy_reg_weight
