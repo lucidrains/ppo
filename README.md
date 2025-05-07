@@ -100,3 +100,12 @@ $ python train.py
     year    = {2024}
 }
 ```
+
+```bibtex
+@inproceedings{Felizardo2025ARL,
+    title   = {A Reinforcement Learning Method for Environments with Stochastic Variables: Post-Decision Proximal Policy Optimization with Dual Critic Networks},
+    author  = {Leonardo Kanashiro Felizardo and Edoardo Fadda and Paolo Brandimarte and Emilio Del-Moral-Hernandez and Mari'a Cristina Vasconcelos Nascimento},
+    year    = {2025},
+    url     = {https://api.semanticscholar.org/CorpusID:277621941}
+}
+```

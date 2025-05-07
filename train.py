@@ -3,6 +3,8 @@ from __future__ import annotations
 import fire
 from pathlib import Path
 from shutil import rmtree
+from copy import deepcopy
+from functools import partial
 from collections import deque, namedtuple
 from random import randrange
 
@@ -43,7 +45,8 @@ Memory = namedtuple('Memory', [
     'action_log_prob',
     'reward',
     'is_boundary',
-    'value'
+    'value',
+    'post_value'
 ])
 
 # helpers
@@ -344,7 +347,7 @@ def calc_gae(
 
 # agent
 
-class PPO:
+class PPO(Module):
     def __init__(
         self,
         state_dim,
@@ -365,14 +368,20 @@ class PPO:
         apply_spectral_entropy_every,
         spectral_entropy_reg_weight,
         cautious_factor,
+        use_post_decision_critic,
         eps_clip,
         value_clip,
         ema_decay,
+        ema_kwargs: dict = dict(
+            update_model_with_ema_every = 1000
+        ),
         save_path = './ppo.pt'
     ):
-        self.actor = Actor(state_dim, actor_hidden_dim, num_actions).to(device)
+        super().__init__()
 
-        self.critic = Critic(state_dim, critic_hidden_dim, dim_pred = critic_pred_num_bins).to(device)
+        self.actor = Actor(state_dim, actor_hidden_dim, num_actions)
+
+        self.critic = Critic(state_dim, critic_hidden_dim, dim_pred = critic_pred_num_bins)
 
         # weight tie rsmnorm
 
@@ -386,16 +395,30 @@ class PPO:
             max_value = reward_range[1],
             num_bins = critic_pred_num_bins,
             clamp_to_range = True
-        ).to(device)
+        )
 
-        self.ema_actor = EMA(self.actor, beta = ema_decay, include_online_model = False, update_model_with_ema_every = 1000)
-        self.ema_critic = EMA(self.critic, beta = ema_decay, include_online_model = False, update_model_with_ema_every = 1000)
+        self.ema_actor = EMA(self.actor, beta = ema_decay, include_online_model = False, **ema_kwargs)
+        self.ema_critic = EMA(self.critic, beta = ema_decay, include_online_model = False, **ema_kwargs)
 
         self.opt_actor = AdoptAtan2(self.actor.parameters(), lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
         self.opt_critic = AdoptAtan2(self.critic.parameters(), lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
 
         self.ema_actor.add_to_optimizer_post_step_hook(self.opt_actor)
         self.ema_critic.add_to_optimizer_post_step_hook(self.opt_critic)
+
+        # post decision critic
+
+        self.use_post_decision_critic = use_post_decision_critic
+
+        if use_post_decision_critic:
+            self.post_critic = deepcopy(self.critic)
+            self.post_critic.rsmnorm = self.rsmnorm
+
+            self.ema_post_critic = EMA(self.post_critic, beta = ema_decay, include_online_model = False, **ema_kwargs)
+            self.opt_post_critic = AdoptAtan2(self.post_critic.parameters(), lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
+            self.ema_post_critic.add_to_optimizer_post_step_hook(self.opt_post_critic)
+
+        # learning hparams
 
         self.minibatch_size = minibatch_size
 
@@ -417,19 +440,24 @@ class PPO:
     def save(self):
         torch.save({
             'actor': self.actor.state_dict(),
-            'critic': self.critic.state_dict()
+            'critic': self.critic.state_dict(),
+            'post_critic': self.post_critic.state_dict() if self.use_post_decision_critic else None,
         }, str(self.save_path))
 
     def load(self):
         if not self.save_path.exists():
             return
 
-        data = torch.load(str(self.save_path))
+        data = torch.load(str(self.save_path), weights_only = True)
+
         self.actor.load_state_dict(data['actor'])
         self.critic.load_state_dict(data['critic'])
 
-    def learn(self, memories):
+        if self.use_post_decision_critic:
+            self.post_critic.load_state_dict(data['post_critic'])
 
+    def learn(self, memories):
+        use_post_decision = self.use_post_decision_critic
         hl_gauss = self.critic_hl_gauss_loss
 
         # retrieve and prepare data from memory for training
@@ -441,7 +469,8 @@ class PPO:
             old_log_probs,
             rewards,
             is_boundaries,
-            values
+            values,
+            post_values
         ) = zip(*memories)
         
         actions = [tensor(action) for action in actions]
@@ -452,14 +481,21 @@ class PPO:
         scalar_values = hl_gauss(stack(values))
 
         with torch.no_grad():
-            rewards = calc_gae(
+            calc_gae_from_values = partial(calc_gae,
                 rewards = tensor(rewards).to(device),
-                values = scalar_values,
                 masks = tensor(masks).to(device),
                 lam = self.lam,
                 gamma = self.gamma,
                 use_accelerated = False
             )
+
+            returns = calc_gae_from_values(values = scalar_values)
+
+            if use_post_decision:
+                scalar_post_value = hl_gauss(stack(post_values))
+
+                post_returns = calc_gae_from_values(values = scalar_post_value)
+                returns = stack((returns, post_returns), dim = 1)
 
         # convert values to torch tensors
 
@@ -470,10 +506,14 @@ class PPO:
         old_values = to_torch_tensor(values)
         old_log_probs = to_torch_tensor(old_log_probs)        
 
+        if use_post_decision:
+            old_post_values = to_torch_tensor(post_values)
+            old_values = stack((old_values, old_post_values), dim = 1)
+
         # prepare dataloader for policy phase training
 
         learnable = tensor(learnable).to(device)
-        data = (states, actions, old_log_probs, rewards, old_values)
+        data = (states, actions, old_log_probs, returns, old_values)
         data = tuple(t[learnable] for t in data)
 
         dataset = TensorDataset(*data)
@@ -483,20 +523,32 @@ class PPO:
         # policy phase training, similar to original PPO
 
         for _ in range(self.epochs):
-            for i, (states, actions, old_log_probs, rewards, old_values) in enumerate(dl):
+            for i, (states, actions, old_log_probs, returns, old_values) in enumerate(dl):
+
+                if use_post_decision:
+                    old_values, old_post_values = old_values.unbind(dim = 1)
+                    returns, post_returns = returns.unbind(dim = 1)
 
                 action_probs = self.actor(states)
-                values = self.critic(states)
                 dist = Categorical(action_probs)
                 action_log_probs = dist.log_prob(actions)
                 entropy = dist.entropy()
 
                 scalar_old_values = hl_gauss(old_values)
 
+                if use_post_decision:
+                    scalar_old_post_values = hl_gauss(old_post_values)
+
                 # calculate clipped surrogate objective, classic PPO loss
 
                 ratios = (action_log_probs - old_log_probs).exp()
-                advantages = normalize(rewards - scalar_old_values.detach())
+
+                advantages = normalize(returns - scalar_old_values.detach())
+
+                if use_post_decision:
+                    post_advantages = normalize(post_returns - scalar_old_post_values.detach())
+                    advantages = torch.max(advantages, post_advantages)
+
                 surr1 = ratios * advantages
                 surr2 = ratios.clamp(1 - self.eps_clip, 1 + self.eps_clip) * advantages
                 policy_loss = - torch.min(surr1, surr2) - self.beta_s * entropy
@@ -508,38 +560,46 @@ class PPO:
 
                 update_network_(policy_loss, self.opt_actor)
 
-                # calculate clipped value loss and update value network separate from policy network
-
                 clip = self.value_clip
 
-                scalar_values = hl_gauss(values)
+                def update_critic(critic, old_values, opt_critic):
+                    # calculate clipped value loss and update value network separate from policy network
 
-                # using the proposal from https://www.authorea.com/users/855021/articles/1240083-on-analysis-of-clipped-critic-loss-in-proximal-policy-gradient
+                    values = critic(states)
 
-                clipped_rewards = rewards.clamp(-clip, clip)
+                    scalar_values = hl_gauss(values)
 
-                clipped_loss = hl_gauss(values, clipped_rewards)
-                loss = hl_gauss(values, rewards)
+                    # using the proposal from https://www.authorea.com/users/855021/articles/1240083-on-analysis-of-clipped-critic-loss-in-proximal-policy-gradient
 
-                old_values_lo = scalar_old_values - clip
-                old_values_hi = scalar_old_values + clip
+                    clipped_returns = returns.clamp(-clip, clip)
 
-                def is_between(mid, lo, hi):
-                    return (lo < mid) & (mid < hi)
+                    clipped_loss = hl_gauss(values, clipped_returns)
+                    loss = hl_gauss(values, returns)
 
-                value_loss = torch.where(
-                    is_between(scalar_values, rewards, old_values_lo) |
-                    is_between(scalar_values, old_values_hi, rewards),
-                    0.,
-                    torch.min(loss, clipped_loss)
-                )
+                    old_values_lo = scalar_old_values - clip
+                    old_values_hi = scalar_old_values + clip
 
-                value_loss = value_loss.mean() + simba_orthogonal_loss(self.critic)
+                    def is_between(mid, lo, hi):
+                        return (lo < mid) & (mid < hi)
 
-                if self.spectral_entropy_reg and divisible_by(i, self.apply_spectral_entropy_every):
-                    value_loss = value_loss + model_spectral_entropy_loss(self.critic) * self.spectral_entropy_reg_weight
+                    value_loss = torch.where(
+                        is_between(scalar_values, returns, old_values_lo) |
+                        is_between(scalar_values, old_values_hi, returns),
+                        0.,
+                        torch.min(loss, clipped_loss)
+                    )
 
-                update_network_(value_loss, self.opt_critic)
+                    value_loss = value_loss.mean() + simba_orthogonal_loss(critic)
+
+                    if self.spectral_entropy_reg and divisible_by(i, self.apply_spectral_entropy_every):
+                        value_loss = value_loss + model_spectral_entropy_loss(critic) * self.spectral_entropy_reg_weight
+
+                    update_network_(value_loss, opt_critic)
+
+            update_critic(self.critic, old_values, self.opt_critic)
+
+            if use_post_decision:
+                update_critic(self.post_critic, old_post_values, self.opt_post_critic)
 
         # update the state normalization with rsmnorm for 1 epoch after actor critic are updated
 
@@ -567,6 +627,7 @@ def main(
     value_clip = 0.4,
     beta_s = .01,
     regen_reg_rate = 1e-4,
+    use_post_decision_critic = True,
     spectral_entropy_reg = False,
     apply_spectral_entropy_every = 4,
     spectral_entropy_reg_weight = 0.025,
@@ -620,10 +681,11 @@ def main(
         apply_spectral_entropy_every,
         spectral_entropy_reg_weight,
         cautious_factor,
+        use_post_decision_critic,
         eps_clip,
         value_clip,
         ema_decay,
-    )
+    ).to(device)
 
     if load:
         agent.load()
@@ -653,13 +715,17 @@ def main(
 
             next_state, reward, terminated, truncated, _ = env.step(action)
 
+            next_state = torch.from_numpy(next_state).to(device)
+
+            post_value = agent.ema_post_critic.forward_eval(next_state) if use_post_decision_critic else None
+
             reward = float(reward)
 
-            memory = Memory(True, state, action, action_log_prob, reward, terminated, value)
+            memory = Memory(True, state, action, action_log_prob, reward, terminated, value, post_value)
 
             memories.append(memory)
 
-            state = torch.from_numpy(next_state).to(device)
+            state = next_state
 
             # determine if truncating, either from environment or learning phase of the agent
 
@@ -671,10 +737,14 @@ def main(
             if done and not terminated:
                 next_value = agent.ema_critic.forward_eval(state)
 
+                next_post_value = agent.ema_post_critic.forward_eval(next_state) if use_post_decision_critic else None
+
                 bootstrap_value_memory = memory._replace(
+                    state = state,
                     learnable = False,
                     is_boundary = True,
-                    value = next_value
+                    value = next_value,
+                    post_value = next_post_value
                 )
 
                 memories.append(bootstrap_value_memory)
