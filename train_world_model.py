@@ -297,7 +297,7 @@ class PPO(Module):
         value_clip,
         ema_decay,
         ema_kwargs: dict = dict(
-            update_model_with_ema_every = 1000
+            update_model_with_ema_every = 500
         ),
         save_path = './ppo.pt'
     ):
@@ -558,10 +558,7 @@ def main(
         for timestep in range(max_timesteps):
             time += 1
 
-            with torch.no_grad():
-                action_probs = temp_batch_dim(agent.actor_critic)(state, return_actions = True)
-
-            value = temp_batch_dim(agent.ema_actor_critic.forward_eval)(state, return_values = True)
+            action_probs, value = temp_batch_dim(agent.ema_actor_critic.forward_eval)(state, return_actions = True, return_values = True)
 
             dist = Categorical(action_probs)
             action = dist.sample()
