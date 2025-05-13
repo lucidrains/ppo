@@ -27,6 +27,8 @@ from adam_atan2_pytorch.adopt_atan2 import AdoptAtan2
 
 from hl_gauss_pytorch import HLGaussLoss
 
+from x_transformers import Decoder
+
 from assoc_scan import AssocScan
 
 import gymnasium as gym
