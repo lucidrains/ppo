@@ -339,16 +339,22 @@ class PPO(Module):
 
         self.use_world_model = use_world_model
 
-        self.world_model = ContinuousTransformerWrapper(
-            dim_in = state_dim,
-            dim_out = state_dim,
-            max_seq_len = max_timesteps,
-            probabilistic = True,
-            attn_layers = Decoder(
-                dim = world_model_dim,
-                **world_model
+        self.world_model = None
+        self.autoregressive_wrapper = None
+
+        if use_world_model:
+            self.world_model = ContinuousTransformerWrapper(
+                dim_in = state_dim,
+                dim_out = state_dim,
+                max_seq_len = max_timesteps,
+                probabilistic = True,
+                attn_layers = Decoder(
+                    dim = world_model_dim,
+                    **world_model
+                )
             )
-        ) if use_world_model else None
+
+            self.autoregressive_wrapper = ContinuousAutoregressiveWrapper(self.world_model)
 
         # weight tie rsmnorm
 
