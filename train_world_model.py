@@ -27,7 +27,11 @@ from adam_atan2_pytorch.adopt_atan2 import AdoptAtan2
 
 from hl_gauss_pytorch import HLGaussLoss
 
-from x_transformers import Decoder
+from x_transformers import (
+    Decoder,
+    ContinuousTransformerWrapper,
+    ContinuousAutoregressiveWrapper
+)
 
 from assoc_scan import AssocScan
 
@@ -285,6 +289,7 @@ class PPO(Module):
         critic_pred_num_bins,
         reward_range: tuple[float, float],
         epochs,
+        max_timesteps,
         minibatch_size,
         lr,
         betas,
@@ -296,6 +301,12 @@ class PPO(Module):
         eps_clip,
         value_clip,
         ema_decay,
+        world_model: dict = dict(
+            dim = 128,
+            attn_dim_head = 32,
+            heads = 4,
+            depth = 4
+        ),
         ema_kwargs: dict = dict(
             update_model_with_ema_every = 500
         ),
@@ -304,6 +315,14 @@ class PPO(Module):
         super().__init__()
 
         self.actor_critic = ActorCritic(state_dim, hidden_dim, num_actions, critic_dim_pred = critic_pred_num_bins)
+
+        self.world_model = ContinuousTransformerWrapper(
+            dim_in = state_dim,
+            dim_out = state_dim,
+            max_seq_len = max_timesteps,
+            probabilistic = True,
+            attn_layers = Decoder(**world_model)
+        )
 
         # weight tie rsmnorm
 
@@ -321,6 +340,8 @@ class PPO(Module):
         self.ema_actor_critic = EMA(self.actor_critic, beta = ema_decay, include_online_model = False, **ema_kwargs)
 
         self.opt_actor_critic = AdoptAtan2(self.actor_critic.parameters(), lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
+
+        self.opt_world_model = AdoptAtan2(self.world_model.parameters(), lr = lr, betas = betas, cautious_factor = cautious_factor)
 
         self.ema_actor_critic.add_to_optimizer_post_step_hook(self.opt_actor_critic)
 
@@ -525,6 +546,7 @@ def main(
         critic_pred_num_bins,
         reward_range,
         epochs,
+        max_timesteps,
         minibatch_size,
         lr,
         betas,
