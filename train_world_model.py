@@ -192,8 +192,8 @@ class SimBa(Module):
         x = self.proj_in(x)
 
         if exists(cond):
-            assert exists(self.cond_proj_to_hidden)
-            x = x + self.cond_proj_to_hidden(cond), f'`dim_cond` needs to be set on SimBa to accept world model embeds'
+            assert exists(self.cond_proj_to_hidden), f'`dim_cond` needs to be set on SimBa to accept world model embeds'
+            x = x + self.cond_proj_to_hidden(cond)
 
         for layer in self.layers:
             x = layer(x) + x
@@ -315,8 +315,9 @@ class PPO(Module):
         eps_clip,
         value_clip,
         ema_decay,
+        use_world_model = True,
+        world_model_dim = 64,
         world_model: dict = dict(
-            dim = 128,
             attn_dim_head = 32,
             heads = 4,
             depth = 4
@@ -328,15 +329,26 @@ class PPO(Module):
     ):
         super().__init__()
 
-        self.actor_critic = ActorCritic(state_dim, hidden_dim, num_actions, critic_dim_pred = critic_pred_num_bins)
+        self.actor_critic = ActorCritic(
+            state_dim,
+            hidden_dim,
+            num_actions,
+            dim_world_model_embed = world_model_dim if use_world_model else None,
+            critic_dim_pred = critic_pred_num_bins
+        )
+
+        self.use_world_model = use_world_model
 
         self.world_model = ContinuousTransformerWrapper(
             dim_in = state_dim,
             dim_out = state_dim,
             max_seq_len = max_timesteps,
             probabilistic = True,
-            attn_layers = Decoder(**world_model)
-        )
+            attn_layers = Decoder(
+                dim = world_model_dim,
+                **world_model
+            )
+        ) if use_world_model else None
 
         # weight tie rsmnorm
 
@@ -355,7 +367,8 @@ class PPO(Module):
 
         self.opt_actor_critic = AdoptAtan2(self.actor_critic.parameters(), lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
 
-        self.opt_world_model = AdoptAtan2(self.world_model.parameters(), lr = lr, betas = betas, cautious_factor = cautious_factor)
+        if use_world_model:
+            self.opt_world_model = AdoptAtan2(self.world_model.parameters(), lr = lr, betas = betas, cautious_factor = cautious_factor)
 
         self.ema_actor_critic.add_to_optimizer_post_step_hook(self.opt_actor_critic)
 
@@ -526,13 +539,14 @@ def main(
     ema_decay = 0.9,
     update_timesteps = 5000,
     epochs = 2,
+    use_world_model = True,
     seed = None,
     render = True,
     render_every_eps = 250,
     save_every = 1000,
     clear_videos = True,
     video_folder = './lunar-recording',
-    load = False
+    load = False,
 ):
     env = gym.make(env_name, render_mode = 'rgb_array')
 
@@ -572,6 +586,7 @@ def main(
         eps_clip,
         value_clip,
         ema_decay,
+        use_world_model
     ).to(device)
 
     if load:
@@ -585,16 +600,41 @@ def main(
     num_policy_updates = 0
 
     agent.eval()
+    world_model = agent.world_model
 
     for eps in tqdm(range(num_episodes), desc = 'episodes'):
 
         state, info = env.reset(seed = seed)
         state = torch.from_numpy(state).to(device)
 
+        world_model_cache = None
+
         for timestep in range(max_timesteps):
             time += 1
 
-            action_probs, value = temp_batch_dim(agent.ema_actor_critic.forward_eval)(state, return_actions = True, return_values = True)
+            world_model_embed = None
+
+            if exists(world_model):
+                world_model.eval()
+
+                with torch.no_grad():
+                    world_model_input = rearrange(state, 'd -> 1 1 d')
+
+                    world_model_embed, world_model_cache = world_model(
+                        world_model_input,
+                        cache = world_model_cache,
+                        return_embeddings = True,
+                        return_intermediates = True
+                    )
+
+                    world_model_embed = rearrange(world_model_embed, '1 1 d -> d')
+
+            action_probs, value = temp_batch_dim(agent.ema_actor_critic.forward_eval)(
+                state,
+                world_model_embed = world_model_embed,
+                return_actions = True,
+                return_values = True
+            )
 
             dist = Categorical(action_probs)
             action = dist.sample()
