@@ -51,6 +51,7 @@ Memory = namedtuple('Memory', [
     'reward',
     'is_boundary',
     'value',
+    'world_model_embed'
 ])
 
 # helpers
@@ -419,6 +420,7 @@ class PPO(Module):
             rewards,
             is_boundaries,
             values,
+            world_model_embeds
         ) = zip(*memories)
         
         actions = [tensor(action) for action in actions]
@@ -452,7 +454,16 @@ class PPO(Module):
 
         learnable = tensor(learnable).to(device)
         data = (states, actions, old_log_probs, returns, old_values)
+
+        # take care of maybe world embeds
+
+        if self.use_world_model:
+            world_model_embeds = to_torch_tensor(world_model_embeds)
+            data = (*data, world_model_embeds)
+
         data = tuple(t[learnable] for t in data)
+
+        # learn the actor critic network
 
         dataset = TensorDataset(*data)
 
@@ -461,9 +472,16 @@ class PPO(Module):
         # policy phase training, similar to original PPO
 
         for _ in range(self.epochs):
-            for i, (states, actions, old_log_probs, returns, old_values) in enumerate(dl):
+            for i, batched_data in enumerate(dl):
 
-                action_probs = self.actor_critic(states, return_actions = True)
+                states, actions, old_log_probs, returns, old_values, *rest_data = batched_data
+
+                world_model_embeds = None
+
+                if self.use_world_model:
+                    world_model_embeds, = rest_data
+
+                action_probs = self.actor_critic(states, world_model_embed = world_model_embeds, return_actions = True)
                 dist = Categorical(action_probs)
                 action_log_probs = dist.log_prob(actions)
                 entropy = dist.entropy()
@@ -653,7 +671,7 @@ def main(
 
             reward = float(reward)
 
-            memory = Memory(True, state, action, action_log_prob, reward, terminated, value)
+            memory = Memory(True, state, action, action_log_prob, reward, terminated, value, world_model_embed)
 
             memories.append(memory)
 
