@@ -151,6 +151,7 @@ class SimBa(Module):
         depth = 3,
         dropout = 0.,
         expansion_factor = 2,
+        dim_cond = None
     ):
         super().__init__()
         """
@@ -162,6 +163,8 @@ class SimBa(Module):
         layers = []
 
         self.proj_in = nn.Linear(dim, dim_hidden) if dim != dim_hidden else nn.Identity()
+
+        self.cond_proj_to_hidden = nn.Linear(dim_cond, dim_hidden) if exists(dim_cond) else None
 
         dim_inner = dim_hidden * expansion_factor
 
@@ -181,8 +184,16 @@ class SimBa(Module):
 
         self.layers = ModuleList(layers)
 
-    def forward(self, x):
+    def forward(
+        self,
+        x,
+        cond = None
+    ):
         x = self.proj_in(x)
+
+        if exists(cond):
+            assert exists(self.cond_proj_to_hidden)
+            x = x + self.cond_proj_to_hidden(cond), f'`dim_cond` needs to be set on SimBa to accept world model embeds'
 
         for layer in self.layers:
             x = layer(x) + x
@@ -198,6 +209,7 @@ class ActorCritic(Module):
         hidden_dim,
         num_actions,
         critic_dim_pred,
+        dim_world_model_embed = None,
         mlp_depth = 4,
         dropout = 0.1,
         rsmnorm_input = True,  # use the RSMNorm for inputs proposed by KAIST + SonyAI
@@ -209,7 +221,8 @@ class ActorCritic(Module):
             state_dim,
             dim_hidden = hidden_dim * 2,
             depth = mlp_depth,
-            dropout = dropout
+            dropout = dropout,
+            dim_cond = dim_world_model_embed
         )
 
         self.critic_head = nn.Sequential(
@@ -229,6 +242,7 @@ class ActorCritic(Module):
     def forward(
         self,
         state,
+        world_model_embed = None,
         return_actions = False,
         return_values = False
     ):
@@ -236,7 +250,7 @@ class ActorCritic(Module):
             self.rsmnorm.eval()
             state = self.rsmnorm(state)
 
-        hidden = self.net(state)
+        hidden = self.net(state, cond = world_model_embed)
 
         if not (return_actions or return_values):
             return hidden
