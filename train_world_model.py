@@ -712,7 +712,7 @@ def main(
             action = dist.sample()
             action_log_prob = dist.log_prob(action)
 
-            action_embed = agent.action_embeds(action)
+            prev_action_embed = agent.action_embeds(action)
             action = action.item()
 
             next_state, reward, terminated, truncated, _ = env.step(action)
@@ -735,7 +735,7 @@ def main(
             # take care of truncated by adding a non-learnable memory storing the next value for GAE
 
             if done and not terminated:
-                world_model_embed = state_to_world_model_embed(state, action_embed)
+                world_model_embed = state_to_world_model_embed(state, prev_action_embed)
 
                 next_value = temp_batch_dim(agent.ema_actor_critic.forward_eval)(world_model_embed, return_values = True)
 
