@@ -155,7 +155,6 @@ class SimBa(Module):
         depth = 3,
         dropout = 0.,
         expansion_factor = 2,
-        dim_cond = None
     ):
         super().__init__()
         """
@@ -167,8 +166,6 @@ class SimBa(Module):
         layers = []
 
         self.proj_in = nn.Linear(dim, dim_hidden) if dim != dim_hidden else nn.Identity()
-
-        self.cond_proj_to_hidden = nn.Linear(dim_cond, dim_hidden) if exists(dim_cond) else None
 
         dim_inner = dim_hidden * expansion_factor
 
@@ -190,14 +187,9 @@ class SimBa(Module):
 
     def forward(
         self,
-        x,
-        cond = None
+        x
     ):
         x = self.proj_in(x)
-
-        if exists(cond):
-            assert exists(self.cond_proj_to_hidden), f'`dim_cond` needs to be set on SimBa to accept world model embeds'
-            x = x + self.cond_proj_to_hidden(cond)
 
         for layer in self.layers:
             x = layer(x) + x
@@ -209,24 +201,21 @@ class SimBa(Module):
 class ActorCritic(Module):
     def __init__(
         self,
-        state_dim,
+        input_dim,
         hidden_dim,
         num_actions,
         critic_dim_pred,
-        dim_world_model_embed = None,
         mlp_depth = 4,
         dropout = 0.1,
         rsmnorm_input = True,  # use the RSMNorm for inputs proposed by KAIST + SonyAI
     ):
         super().__init__()
-        self.rsmnorm = RSMNorm(state_dim) if rsmnorm_input else nn.Identity()
 
         self.net = SimBa(
-            state_dim,
+            input_dim,
             dim_hidden = hidden_dim * 2,
             depth = mlp_depth,
             dropout = dropout,
-            dim_cond = dim_world_model_embed
         )
 
         self.critic_head = nn.Sequential(
@@ -245,16 +234,11 @@ class ActorCritic(Module):
 
     def forward(
         self,
-        state,
-        world_model_embed = None,
+        inp,
         return_actions = False,
         return_values = False
     ):
-        with torch.no_grad():
-            self.rsmnorm.eval()
-            state = self.rsmnorm(state)
-
-        hidden = self.net(state, cond = world_model_embed)
+        hidden = self.net(inp)
 
         if not (return_actions or return_values):
             return hidden
@@ -337,35 +321,31 @@ class PPO(Module):
         super().__init__()
 
         self.actor_critic = ActorCritic(
-            state_dim,
+            world_model_dim,
             hidden_dim,
             num_actions,
-            dim_world_model_embed = world_model_dim if use_world_model else None,
             critic_dim_pred = critic_pred_num_bins
         )
-
-        self.use_world_model = use_world_model
 
         self.world_model = None
         self.autoregressive_wrapper = None
 
-        if use_world_model:
-            self.world_model = ContinuousTransformerWrapper(
-                dim_in = state_dim,
-                dim_out = state_dim,
-                max_seq_len = max_timesteps,
-                probabilistic = True,
-                attn_layers = Decoder(
-                    dim = world_model_dim,
-                    **world_model
-                )
+        self.world_model = ContinuousTransformerWrapper(
+            dim_in = state_dim,
+            dim_out = state_dim,
+            max_seq_len = max_timesteps,
+            probabilistic = True,
+            attn_layers = Decoder(
+                dim = world_model_dim,
+                **world_model
             )
+        )
 
-            self.autoregressive_wrapper = ContinuousAutoregressiveWrapper(self.world_model)
+        self.autoregressive_wrapper = ContinuousAutoregressiveWrapper(self.world_model)
 
         # weight tie rsmnorm
 
-        self.rsmnorm = self.actor_critic.rsmnorm
+        self.rsmnorm = RSMNorm(state_dim)
 
         # https://arxiv.org/abs/2403.03950
 
@@ -380,11 +360,10 @@ class PPO(Module):
 
         self.opt_actor_critic = AdoptAtan2(self.actor_critic.parameters(), lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
 
-        if use_world_model:
-            self.opt_world_model = AdoptAtan2(self.world_model.parameters(), lr = world_model_lr, betas = betas, cautious_factor = cautious_factor)
+        self.opt_world_model = AdoptAtan2(self.world_model.parameters(), lr = world_model_lr, betas = betas, cautious_factor = cautious_factor)
 
-            self.world_model_batch_size = world_model_batch_size
-            self.world_model_max_grad_norm = world_model_max_grad_norm
+        self.world_model_batch_size = world_model_batch_size
+        self.world_model_max_grad_norm = world_model_max_grad_norm
 
         self.ema_actor_critic.add_to_optimizer_post_step_hook(self.opt_actor_critic)
 
@@ -466,51 +445,53 @@ class PPO(Module):
 
         # take care of maybe world embeds
 
-        if self.use_world_model:
-            world_model_embeds = to_torch_tensor(world_model_embeds)
-            data = (*data, world_model_embeds)
+        world_model_embeds = to_torch_tensor(world_model_embeds)
+        data = (*data, world_model_embeds)
 
         data = tuple(t[episodes >= 0] for t in data)
 
         # learn the world model
 
-        if self.use_world_model:
-            world_model = self.world_model
+        world_model = self.world_model
 
-            episodes, states, *_ = data
-            max_episode = episodes.amax().item()
+        episodes, states, *_ = data
+        max_episode = episodes.amax().item()
 
-            seq_arange = torch.arange(episodes.shape[0], device = episodes.device) + 1
-            episodes = F.pad(episodes, (0, 1), value = max_episode + 1)
+        seq_arange = torch.arange(episodes.shape[0], device = episodes.device) + 1
+        episodes = F.pad(episodes, (0, 1), value = max_episode + 1)
 
-            boundary_mask = (episodes[1:] - episodes[:-1]).bool()
-            cum_episode_lens = seq_arange[boundary_mask]
+        boundary_mask = (episodes[1:] - episodes[:-1]).bool()
+        cum_episode_lens = seq_arange[boundary_mask]
 
-            cum_episode_lens = F.pad(cum_episode_lens, (1, 0), value = 0)
-            episode_lens = cum_episode_lens[1:] - cum_episode_lens[:-1]
+        cum_episode_lens = F.pad(cum_episode_lens, (1, 0), value = 0)
+        episode_lens = cum_episode_lens[1:] - cum_episode_lens[:-1]
 
-            states_per_episode = states.split(episode_lens.tolist(), dim = 0)
+        states_per_episode = states.split(episode_lens.tolist(), dim = 0)
 
-            states_per_episode = pad_sequence(states_per_episode)
+        states_per_episode = pad_sequence(states_per_episode)
 
-            # transformer world model is trained on all states per episode all at once
-            # will slowly incorporate rewards, actions etc
+        # transformer world model is trained on all states per episode all at once
+        # will slowly incorporate rewards, actions etc
 
-            world_model_dataset = TensorDataset(states_per_episode, episode_lens)
-            world_model_dl = DataLoader(world_model_dataset, batch_size = self.world_model_batch_size, shuffle = True)
+        world_model_dataset = TensorDataset(states_per_episode, episode_lens)
+        world_model_dl = DataLoader(world_model_dataset, batch_size = self.world_model_batch_size, shuffle = True)
 
-            world_model.train()
+        world_model.train()
 
-            for _ in range(self.epochs):
-                for states, episode_lens in world_model_dl:
+        for _ in range(self.epochs):
+            for states, episode_lens in world_model_dl:
 
-                    loss = self.autoregressive_wrapper(states, lens = episode_lens)
-                    loss.backward()
+                with torch.no_grad():
+                    self.rsmnorm.eval()
+                    states = self.rsmnorm(states)
 
-                    torch.nn.utils.clip_grad_norm_(world_model.parameters(), self.world_model_max_grad_norm)
+                loss = self.autoregressive_wrapper(states, lens = episode_lens)
+                loss.backward()
 
-                    self.opt_world_model.step()
-                    self.opt_world_model.zero_grad()
+                torch.nn.utils.clip_grad_norm_(world_model.parameters(), self.world_model_max_grad_norm)
+
+                self.opt_world_model.step()
+                self.opt_world_model.zero_grad()
 
         # learn the actor critic network
 
@@ -525,14 +506,9 @@ class PPO(Module):
         for _ in range(self.epochs):
             for i, batched_data in enumerate(dl):
 
-                _, states, actions, old_log_probs, returns, old_values, *rest_data = batched_data
+                _, states, actions, old_log_probs, returns, old_values, world_model_embeds = batched_data
 
-                world_model_embeds = None
-
-                if self.use_world_model:
-                    world_model_embeds, = rest_data
-
-                action_probs = self.actor_critic(states, world_model_embed = world_model_embeds, return_actions = True)
+                action_probs = self.actor_critic(world_model_embeds, return_actions = True)
                 dist = Categorical(action_probs)
                 action_log_probs = dist.log_prob(actions)
                 entropy = dist.entropy()
@@ -553,7 +529,7 @@ class PPO(Module):
 
                 clip = self.value_clip
 
-                values = self.actor_critic(states, return_values = True)
+                values = self.actor_critic(world_model_embeds, return_values = True)
 
                 scalar_values = hl_gauss(values)
 
@@ -686,29 +662,34 @@ def main(
 
         world_model_cache = None
 
+        @torch.no_grad()
+        def state_to_world_model_embed(state):
+            nonlocal world_model_cache
+
+            agent.rsmnorm.eval()
+            normed_state = agent.rsmnorm(state)
+
+            world_model.eval()
+
+            world_model_input = rearrange(normed_state, 'd -> 1 1 d')
+
+            world_model_embed, world_model_cache = world_model(
+                world_model_input,
+                cache = world_model_cache,
+                return_embeddings = True,
+                return_intermediates = True
+            )
+
+            world_model_embed = rearrange(world_model_embed, '1 1 d -> d')
+            return world_model_embed
+
         for timestep in range(max_timesteps):
             time += 1
-
-            world_model_embed = None
-
-            if exists(world_model):
-                world_model.eval()
-
-                with torch.no_grad():
-                    world_model_input = rearrange(state, 'd -> 1 1 d')
-
-                    world_model_embed, world_model_cache = world_model(
-                        world_model_input,
-                        cache = world_model_cache,
-                        return_embeddings = True,
-                        return_intermediates = True
-                    )
-
-                    world_model_embed = rearrange(world_model_embed, '1 1 d -> d')
+            
+            world_model_embed = state_to_world_model_embed(state)
 
             action_probs, value = temp_batch_dim(agent.ema_actor_critic.forward_eval)(
-                state,
-                world_model_embed = world_model_embed,
+                world_model_embed,
                 return_actions = True,
                 return_values = True
             )
@@ -738,7 +719,9 @@ def main(
             # take care of truncated by adding a non-learnable memory storing the next value for GAE
 
             if done and not terminated:
-                next_value = temp_batch_dim(agent.ema_actor_critic.forward_eval)(state, return_values = True)
+                world_model_embed = state_to_world_model_embed(state)
+
+                next_value = temp_batch_dim(agent.ema_actor_critic.forward_eval)(world_model_embed, return_values = True)
 
                 bootstrap_value_memory = memory._replace(
                     state = state,
