@@ -303,7 +303,6 @@ class PPO(Module):
         eps_clip,
         value_clip,
         ema_decay,
-        use_world_model = True,
         world_model_dim = 64,
         world_model: dict = dict(
             attn_dim_head = 32,
@@ -590,7 +589,6 @@ def main(
     ema_decay = 0.9,
     update_timesteps = 5000,
     epochs = 2,
-    use_world_model = True,
     seed = None,
     render = True,
     render_every_eps = 250,
@@ -637,7 +635,6 @@ def main(
         eps_clip,
         value_clip,
         ema_decay,
-        use_world_model
     ).to(device)
 
     if load:
