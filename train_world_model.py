@@ -332,6 +332,7 @@ class PPO(Module):
 
         self.world_model = ContinuousTransformerWrapper(
             dim_in = state_dim,
+            dim_out = state_dim,
             max_seq_len = max_timesteps,
             probabilistic = False,
             attn_layers = Decoder(
@@ -531,8 +532,6 @@ class PPO(Module):
 
                 clip = self.value_clip
 
-                values = self.actor_critic(world_model_embeds, return_values = True)
-
                 scalar_values = hl_gauss(values)
 
                 # using the proposal from https://www.authorea.com/users/855021/articles/1240083-on-analysis-of-clipped-critic-loss-in-proximal-policy-gradient
@@ -594,7 +593,7 @@ def main(
     epochs = 2,
     seed = None,
     render = True,
-    render_every_eps = 250,
+    render_every_eps = 100,
     save_every = 1000,
     clear_videos = True,
     video_folder = './lunar-recording',
