@@ -22,6 +22,7 @@ from torch.utils._pytree import tree_map
 from torch.nn.utils.rnn import pad_sequence
 pad_sequence = partial(pad_sequence, batch_first = True)
 
+import einx
 from einops import reduce, repeat, einsum, rearrange, pack
 
 from ema_pytorch import EMA
@@ -332,6 +333,7 @@ class PPO(Module):
         self.autoregressive_wrapper = None
 
         self.action_embeds = nn.Embedding(num_actions, world_model_dim)
+        self.reward_embed = nn.Parameter(torch.randn(world_model_dim) * 1e-5)
 
         self.world_model = ContinuousTransformerWrapper(
             dim_in = state_dim,
@@ -364,7 +366,11 @@ class PPO(Module):
 
         self.opt_actor_critic = AdoptAtan2(self.actor_critic.parameters(), lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
 
-        self.opt_world_model = AdoptAtan2([*self.world_model.parameters(), *self.action_embeds.parameters()], lr = world_model_lr, betas = betas, cautious_factor = cautious_factor)
+        self.opt_world_model = AdoptAtan2([
+            *self.world_model.parameters(),
+            *self.action_embeds.parameters(),
+            self.reward_embed
+        ], lr = world_model_lr, betas = betas, cautious_factor = cautious_factor)
 
         self.world_model_batch_size = world_model_batch_size
         self.world_model_epochs = world_model_epochs
@@ -416,8 +422,9 @@ class PPO(Module):
             world_model_embeds
         ) = zip(*memories)
         
-        actions = [tensor(action) for action in actions]
-        masks = [(1. - float(is_boundary)) for is_boundary in is_boundaries]
+        actions = tensor(actions).to(device)
+        rewards = tensor(rewards).to(device)
+        masks = tensor([(1. - float(is_boundary)) for is_boundary in is_boundaries]).to(device)
 
         # calculate generalized advantage estimate
 
@@ -425,8 +432,8 @@ class PPO(Module):
 
         with torch.no_grad():
             calc_gae_from_values = partial(calc_gae,
-                rewards = tensor(rewards).to(device),
-                masks = tensor(masks).to(device),
+                rewards = rewards,
+                masks = masks,
                 lam = self.lam,
                 gamma = self.gamma,
                 use_accelerated = False
@@ -439,14 +446,13 @@ class PPO(Module):
         to_torch_tensor = lambda t: stack(t).to(device).detach()
 
         states = to_torch_tensor(states)
-        actions = to_torch_tensor(actions)
         old_values = to_torch_tensor(values)
         old_log_probs = to_torch_tensor(old_log_probs)
 
         # prepare dataloader for policy phase training
 
         episodes = tensor(episodes).to(device)
-        data = (episodes, states, actions, old_log_probs, returns, old_values)
+        data = (episodes, states, actions, rewards, old_log_probs, returns, old_values)
 
         # world model embeds
 
@@ -459,7 +465,7 @@ class PPO(Module):
 
         world_model = self.world_model
 
-        episodes, states, actions, *_ = data
+        episodes, states, actions,rewards, *_ = data
         max_episode = episodes.amax().item()
 
         seq_arange = torch.arange(episodes.shape[0], device = episodes.device) + 1
@@ -477,16 +483,19 @@ class PPO(Module):
         actions_per_episode = actions.split(episode_lens.tolist(), dim = 0)
         actions_per_episode = pad_sequence(actions_per_episode)
 
+        rewards_per_episode = rewards.split(episode_lens.tolist(), dim = 0)
+        rewards_per_episode = pad_sequence(rewards_per_episode)
+
         # transformer world model is trained on all states per episode all at once
         # will slowly incorporate rewards and other ssl objectives
 
-        world_model_dataset = TensorDataset(states_per_episode, actions_per_episode, episode_lens)
+        world_model_dataset = TensorDataset(states_per_episode, actions_per_episode, rewards_per_episode, episode_lens)
         world_model_dl = DataLoader(world_model_dataset, batch_size = self.world_model_batch_size, shuffle = True)
 
         world_model.train()
 
         for _ in range(self.world_model_epochs):
-            for states, actions, episode_lens in world_model_dl:
+            for states, actions, rewards, episode_lens in world_model_dl:
 
                 with torch.no_grad():
                     self.rsmnorm.eval()
@@ -495,9 +504,12 @@ class PPO(Module):
                 action_embeds = self.action_embeds(actions[:, :-1])
                 action_embeds = F.pad(action_embeds, (0, 0, 1, -1), value = 0.)
 
+                reward_embeds = einx.multiply('b n, d -> b n d', rewards[:, :-1], self.reward_embed)
+                reward_embeds = F.pad(reward_embeds, (0, 0, 1, -1), value = 0.)
+
                 loss = self.autoregressive_wrapper(
                     states,
-                    sum_embeds = action_embeds,
+                    sum_embeds = action_embeds + reward_embeds,
                     lens = episode_lens
                 )
 
@@ -521,7 +533,7 @@ class PPO(Module):
         for _ in range(self.epochs):
             for i, batched_data in enumerate(dl):
 
-                _, states, actions, old_log_probs, returns, old_values, world_model_embeds = batched_data
+                _, states, actions, _, old_log_probs, returns, old_values, world_model_embeds = batched_data
 
                 action_probs, values = self.actor_critic(world_model_embeds, return_actions = True, return_values = True)
 
@@ -673,6 +685,8 @@ def main(
         state = torch.from_numpy(state).to(device)
 
         prev_action_embed = torch.zeros(agent.world_model_dim, device = device)
+        prev_reward_embed = 0.
+
         world_model_cache = None
 
         @torch.no_grad()
@@ -700,7 +714,7 @@ def main(
         for timestep in range(max_timesteps):
             time += 1
             
-            world_model_embed = state_to_world_model_embed(state, prev_action_embed)
+            world_model_embed = state_to_world_model_embed(state, prev_action_embed + prev_reward_embed)
 
             action_probs, value = temp_batch_dim(agent.ema_actor_critic.forward_eval)(
                 world_model_embed,
@@ -712,16 +726,18 @@ def main(
             action = dist.sample()
             action_log_prob = dist.log_prob(action)
 
-            prev_action_embed = agent.action_embeds(action)
-            action = action.item()
+            action_item = action.item()
 
-            next_state, reward, terminated, truncated, _ = env.step(action)
+            next_state, reward, terminated, truncated, _ = env.step(action_item)
 
             next_state = torch.from_numpy(next_state).to(device)
 
             reward = float(reward)
 
-            memory = Memory(tensor(eps), state, action, action_log_prob, reward, terminated, value, world_model_embed)
+            prev_action_embed = agent.action_embeds(action)
+            prev_reward_embed = agent.reward_embed * reward # from the xval paper, we know pre-norm transformers can handle scaled tokens https://arxiv.org/abs/2310.02989
+
+            memory = Memory(tensor(eps), state, action_item, action_log_prob, reward, terminated, value, world_model_embed)
 
             memories.append(memory)
 
@@ -735,7 +751,7 @@ def main(
             # take care of truncated by adding a non-learnable memory storing the next value for GAE
 
             if done and not terminated:
-                world_model_embed = state_to_world_model_embed(state, prev_action_embed)
+                world_model_embed = state_to_world_model_embed(state, prev_action_embed + prev_reward_embed)
 
                 next_value = temp_batch_dim(agent.ema_actor_critic.forward_eval)(world_model_embed, return_values = True)
 

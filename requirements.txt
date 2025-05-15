@@ -1,6 +1,7 @@
 adam-atan2-pytorch
 assoc-scan>=0.0.2
 box2d-py
+einx>=0.3.0
 einops>=0.8.0
 ema-pytorch>=0.7.3
 fire
