@@ -309,8 +309,9 @@ class PPO(Module):
             heads = 4,
             depth = 4
         ),
-        world_model_lr = 3e-4,
+        world_model_lr = 8e-4,
         world_model_batch_size = 8,
+        world_model_epochs = 10,
         world_model_max_grad_norm = 0.5,
         ema_kwargs: dict = dict(
             update_model_with_ema_every = 500
@@ -331,11 +332,11 @@ class PPO(Module):
 
         self.world_model = ContinuousTransformerWrapper(
             dim_in = state_dim,
-            dim_out = state_dim,
             max_seq_len = max_timesteps,
-            probabilistic = True,
+            probabilistic = False,
             attn_layers = Decoder(
                 dim = world_model_dim,
+                rotary_pos_emb = True,
                 **world_model
             )
         )
@@ -362,6 +363,7 @@ class PPO(Module):
         self.opt_world_model = AdoptAtan2(self.world_model.parameters(), lr = world_model_lr, betas = betas, cautious_factor = cautious_factor)
 
         self.world_model_batch_size = world_model_batch_size
+        self.world_model_epochs = world_model_epochs
         self.world_model_max_grad_norm = world_model_max_grad_norm
 
         self.ema_actor_critic.add_to_optimizer_post_step_hook(self.opt_actor_critic)
@@ -477,7 +479,7 @@ class PPO(Module):
 
         world_model.train()
 
-        for _ in range(self.epochs):
+        for _ in range(self.world_model_epochs):
             for states, episode_lens in world_model_dl:
 
                 with torch.no_grad():
@@ -507,7 +509,8 @@ class PPO(Module):
 
                 _, states, actions, old_log_probs, returns, old_values, world_model_embeds = batched_data
 
-                action_probs = self.actor_critic(world_model_embeds, return_actions = True)
+                action_probs, values = self.actor_critic(world_model_embeds, return_actions = True, return_values = True)
+
                 dist = Categorical(action_probs)
                 action_log_probs = dist.log_prob(actions)
                 entropy = dist.entropy()
