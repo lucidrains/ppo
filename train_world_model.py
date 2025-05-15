@@ -305,9 +305,9 @@ class PPO(Module):
         ema_decay,
         world_model_dim = 64,
         world_model: dict = dict(
-            attn_dim_head = 32,
+            attn_dim_head = 16,
             heads = 4,
-            depth = 4
+            depth = 2
         ),
         world_model_lr = 8e-4,
         world_model_batch_size = 8,
@@ -328,7 +328,10 @@ class PPO(Module):
         )
 
         self.world_model = None
+        self.world_model_dim = world_model_dim
         self.autoregressive_wrapper = None
+
+        self.action_embeds = nn.Embedding(num_actions, world_model_dim)
 
         self.world_model = ContinuousTransformerWrapper(
             dim_in = state_dim,
@@ -361,7 +364,7 @@ class PPO(Module):
 
         self.opt_actor_critic = AdoptAtan2(self.actor_critic.parameters(), lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
 
-        self.opt_world_model = AdoptAtan2(self.world_model.parameters(), lr = world_model_lr, betas = betas, cautious_factor = cautious_factor)
+        self.opt_world_model = AdoptAtan2([*self.world_model.parameters(), *self.action_embeds.parameters()], lr = world_model_lr, betas = betas, cautious_factor = cautious_factor)
 
         self.world_model_batch_size = world_model_batch_size
         self.world_model_epochs = world_model_epochs
@@ -445,7 +448,7 @@ class PPO(Module):
         episodes = tensor(episodes).to(device)
         data = (episodes, states, actions, old_log_probs, returns, old_values)
 
-        # take care of maybe world embeds
+        # world model embeds
 
         world_model_embeds = to_torch_tensor(world_model_embeds)
         data = (*data, world_model_embeds)
@@ -456,7 +459,7 @@ class PPO(Module):
 
         world_model = self.world_model
 
-        episodes, states, *_ = data
+        episodes, states, actions, *_ = data
         max_episode = episodes.amax().item()
 
         seq_arange = torch.arange(episodes.shape[0], device = episodes.device) + 1
@@ -469,25 +472,35 @@ class PPO(Module):
         episode_lens = cum_episode_lens[1:] - cum_episode_lens[:-1]
 
         states_per_episode = states.split(episode_lens.tolist(), dim = 0)
-
         states_per_episode = pad_sequence(states_per_episode)
 
-        # transformer world model is trained on all states per episode all at once
-        # will slowly incorporate rewards, actions etc
+        actions_per_episode = actions.split(episode_lens.tolist(), dim = 0)
+        actions_per_episode = pad_sequence(actions_per_episode)
 
-        world_model_dataset = TensorDataset(states_per_episode, episode_lens)
+        # transformer world model is trained on all states per episode all at once
+        # will slowly incorporate rewards and other ssl objectives
+
+        world_model_dataset = TensorDataset(states_per_episode, actions_per_episode, episode_lens)
         world_model_dl = DataLoader(world_model_dataset, batch_size = self.world_model_batch_size, shuffle = True)
 
         world_model.train()
 
         for _ in range(self.world_model_epochs):
-            for states, episode_lens in world_model_dl:
+            for states, actions, episode_lens in world_model_dl:
 
                 with torch.no_grad():
                     self.rsmnorm.eval()
                     states = self.rsmnorm(states)
 
-                loss = self.autoregressive_wrapper(states, lens = episode_lens)
+                action_embeds = self.action_embeds(actions[:, :-1])
+                action_embeds = F.pad(action_embeds, (0, 0, 1, -1), value = 0.)
+
+                loss = self.autoregressive_wrapper(
+                    states,
+                    sum_embeds = action_embeds,
+                    lens = episode_lens
+                )
+
                 loss.backward()
 
                 torch.nn.utils.clip_grad_norm_(world_model.parameters(), self.world_model_max_grad_norm)
@@ -593,7 +606,7 @@ def main(
     epochs = 2,
     seed = None,
     render = True,
-    render_every_eps = 100,
+    render_every_eps = 250,
     save_every = 1000,
     clear_videos = True,
     video_folder = './lunar-recording',
@@ -659,10 +672,11 @@ def main(
         state, info = env.reset(seed = seed)
         state = torch.from_numpy(state).to(device)
 
+        prev_action_embed = torch.zeros(agent.world_model_dim, device = device)
         world_model_cache = None
 
         @torch.no_grad()
-        def state_to_world_model_embed(state):
+        def state_to_world_model_embed(state, additional_embeds):
             nonlocal world_model_cache
 
             agent.rsmnorm.eval()
@@ -675,6 +689,7 @@ def main(
             world_model_embed, world_model_cache = world_model(
                 world_model_input,
                 cache = world_model_cache,
+                sum_embeds = additional_embeds,
                 return_embeddings = True,
                 return_intermediates = True
             )
@@ -685,7 +700,7 @@ def main(
         for timestep in range(max_timesteps):
             time += 1
             
-            world_model_embed = state_to_world_model_embed(state)
+            world_model_embed = state_to_world_model_embed(state, prev_action_embed)
 
             action_probs, value = temp_batch_dim(agent.ema_actor_critic.forward_eval)(
                 world_model_embed,
@@ -696,6 +711,8 @@ def main(
             dist = Categorical(action_probs)
             action = dist.sample()
             action_log_prob = dist.log_prob(action)
+
+            action_embed = agent.action_embeds(action)
             action = action.item()
 
             next_state, reward, terminated, truncated, _ = env.step(action)
@@ -718,7 +735,7 @@ def main(
             # take care of truncated by adding a non-learnable memory storing the next value for GAE
 
             if done and not terminated:
-                world_model_embed = state_to_world_model_embed(state)
+                world_model_embed = state_to_world_model_embed(state, action_embed)
 
                 next_value = temp_batch_dim(agent.ema_actor_critic.forward_eval)(world_model_embed, return_values = True)
 
