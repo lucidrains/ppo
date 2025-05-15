@@ -19,6 +19,9 @@ from torch.utils.data import TensorDataset, DataLoader
 from torch.distributions import Categorical
 from torch.utils._pytree import tree_map
 
+from torch.nn.utils.rnn import pad_sequence
+pad_sequence = partial(pad_sequence, batch_first = True)
+
 from einops import reduce, repeat, einsum, rearrange, pack
 
 from ema_pytorch import EMA
@@ -44,7 +47,7 @@ device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 # memory tuple
 
 Memory = namedtuple('Memory', [
-    'learnable',
+    'eps',
     'state',
     'action',
     'action_log_prob',
@@ -323,6 +326,9 @@ class PPO(Module):
             heads = 4,
             depth = 4
         ),
+        world_model_lr = 3e-4,
+        world_model_batch_size = 8,
+        world_model_max_grad_norm = 0.5,
         ema_kwargs: dict = dict(
             update_model_with_ema_every = 500
         ),
@@ -375,7 +381,10 @@ class PPO(Module):
         self.opt_actor_critic = AdoptAtan2(self.actor_critic.parameters(), lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
 
         if use_world_model:
-            self.opt_world_model = AdoptAtan2(self.world_model.parameters(), lr = lr, betas = betas, cautious_factor = cautious_factor)
+            self.opt_world_model = AdoptAtan2(self.world_model.parameters(), lr = world_model_lr, betas = betas, cautious_factor = cautious_factor)
+
+            self.world_model_batch_size = world_model_batch_size
+            self.world_model_max_grad_norm = world_model_max_grad_norm
 
         self.ema_actor_critic.add_to_optimizer_post_step_hook(self.opt_actor_critic)
 
@@ -413,7 +422,7 @@ class PPO(Module):
         # retrieve and prepare data from memory for training
 
         (
-            learnable,
+            episodes,
             states,
             actions,
             old_log_probs,
@@ -452,8 +461,8 @@ class PPO(Module):
 
         # prepare dataloader for policy phase training
 
-        learnable = tensor(learnable).to(device)
-        data = (states, actions, old_log_probs, returns, old_values)
+        episodes = tensor(episodes).to(device)
+        data = (episodes, states, actions, old_log_probs, returns, old_values)
 
         # take care of maybe world embeds
 
@@ -461,7 +470,47 @@ class PPO(Module):
             world_model_embeds = to_torch_tensor(world_model_embeds)
             data = (*data, world_model_embeds)
 
-        data = tuple(t[learnable] for t in data)
+        data = tuple(t[episodes >= 0] for t in data)
+
+        # learn the world model
+
+        if self.use_world_model:
+            world_model = self.world_model
+
+            episodes, states, *_ = data
+            max_episode = episodes.amax().item()
+
+            seq_arange = torch.arange(episodes.shape[0], device = episodes.device) + 1
+            episodes = F.pad(episodes, (0, 1), value = max_episode + 1)
+
+            boundary_mask = (episodes[1:] - episodes[:-1]).bool()
+            cum_episode_lens = seq_arange[boundary_mask]
+
+            cum_episode_lens = F.pad(cum_episode_lens, (1, 0), value = 0)
+            episode_lens = cum_episode_lens[1:] - cum_episode_lens[:-1]
+
+            states_per_episode = states.split(episode_lens.tolist(), dim = 0)
+
+            states_per_episode = pad_sequence(states_per_episode)
+
+            # transformer world model is trained on all states per episode all at once
+            # will slowly incorporate rewards, actions etc
+
+            world_model_dataset = TensorDataset(states_per_episode, episode_lens)
+            world_model_dl = DataLoader(world_model_dataset, batch_size = self.world_model_batch_size, shuffle = True)
+
+            world_model.train()
+
+            for _ in range(self.epochs):
+                for states, episode_lens in world_model_dl:
+
+                    loss = self.autoregressive_wrapper(states, lens = episode_lens)
+                    loss.backward()
+
+                    torch.nn.utils.clip_grad_norm_(world_model.parameters(), self.world_model_max_grad_norm)
+
+                    self.opt_world_model.step()
+                    self.opt_world_model.zero_grad()
 
         # learn the actor critic network
 
@@ -471,10 +520,12 @@ class PPO(Module):
 
         # policy phase training, similar to original PPO
 
+        self.actor_critic.train()
+
         for _ in range(self.epochs):
             for i, batched_data in enumerate(dl):
 
-                states, actions, old_log_probs, returns, old_values, *rest_data = batched_data
+                _, states, actions, old_log_probs, returns, old_values, *rest_data = batched_data
 
                 world_model_embeds = None
 
@@ -538,7 +589,7 @@ class PPO(Module):
 
         self.rsmnorm.train()
 
-        for states, *_ in dl:
+        for _, states, *_ in dl:
             self.rsmnorm(states)
 
 # main
@@ -628,6 +679,8 @@ def main(
 
     for eps in tqdm(range(num_episodes), desc = 'episodes'):
 
+        eps_tensor = tensor(eps)
+
         state, info = env.reset(seed = seed)
         state = torch.from_numpy(state).to(device)
 
@@ -671,7 +724,7 @@ def main(
 
             reward = float(reward)
 
-            memory = Memory(True, state, action, action_log_prob, reward, terminated, value, world_model_embed)
+            memory = Memory(tensor(eps), state, action, action_log_prob, reward, terminated, value, world_model_embed)
 
             memories.append(memory)
 
@@ -689,7 +742,7 @@ def main(
 
                 bootstrap_value_memory = memory._replace(
                     state = state,
-                    learnable = False,
+                    eps = tensor(-1),
                     is_boundary = True,
                     value = next_value
                 )
