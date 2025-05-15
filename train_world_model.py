@@ -313,6 +313,7 @@ class PPO(Module):
         world_model_lr = 8e-4,
         world_model_batch_size = 8,
         world_model_epochs = 10,
+        world_model_dropout = 0.25,
         world_model_max_grad_norm = 0.5,
         ema_kwargs: dict = dict(
             update_model_with_ema_every = 500
@@ -339,10 +340,12 @@ class PPO(Module):
             dim_in = state_dim,
             dim_out = state_dim,
             max_seq_len = max_timesteps,
-            probabilistic = False,
+            probabilistic = True,
             attn_layers = Decoder(
                 dim = world_model_dim,
                 rotary_pos_emb = True,
+                attn_dropout = world_model_dropout,
+                ff_dropout = world_model_dropout,
                 **world_model
             )
         )
@@ -370,7 +373,7 @@ class PPO(Module):
             *self.world_model.parameters(),
             *self.action_embeds.parameters(),
             self.reward_embed
-        ], lr = world_model_lr, betas = betas, cautious_factor = cautious_factor)
+        ], lr = world_model_lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
 
         self.world_model_batch_size = world_model_batch_size
         self.world_model_epochs = world_model_epochs
