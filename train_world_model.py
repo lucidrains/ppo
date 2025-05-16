@@ -16,7 +16,7 @@ from torch import nn, tensor, is_tensor, cat, stack
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
 from torch.utils.data import TensorDataset, DataLoader
-from torch.distributions import Categorical
+from torch.distributions import Categorical, Normal
 from torch.utils._pytree import tree_map
 
 from torch.nn.utils.rnn import pad_sequence
@@ -34,8 +34,7 @@ from hl_gauss_pytorch import HLGaussLoss
 
 from x_transformers import (
     Decoder,
-    ContinuousTransformerWrapper,
-    ContinuousAutoregressiveWrapper
+    ContinuousTransformerWrapper
 )
 
 from assoc_scan import AssocScan
@@ -56,7 +55,6 @@ Memory = namedtuple('Memory', [
     'reward',
     'is_boundary',
     'value',
-    'world_model_embed'
 ])
 
 # helpers
@@ -94,6 +92,34 @@ def temp_batch_dim(fn):
 
 # a wrapper to slowly absorb actor / critic / world model into one, will just call it OneModelWrapper
 
+class GaussianNLL(Module):
+    def forward(self, pred, target):
+        mean, var = pred
+        dist = Normal(mean, var)
+        return -dist.log_prob(target)
+
+class ContinuousAutoregressiveWrapper(Module):
+    def __init__(
+        self,
+        net
+    ):
+        super().__init__()
+        self.net = net
+        self.loss_fn = GaussianNLL()
+
+    def forward(
+        self,
+        x,
+        **kwargs
+    ):
+        inp, target = x, x[:, 1:]
+
+        pred, embed = self.net(inp, return_pred_and_embeddings = True, **kwargs)
+
+        loss = self.loss_fn(pred[..., :-1, :], target)
+
+        return loss, embed
+
 class OneModelWrapper(Module):
     def __init__(
         self,
@@ -127,6 +153,7 @@ class OneModelWrapper(Module):
         actions = None,
         next_actions = None,
         return_embeddings = False,
+        return_pred_and_embeddings = False,
         **kwargs
     ):
         sum_embeds = 0.
@@ -140,7 +167,7 @@ class OneModelWrapper(Module):
 
         embed = self.transformer(*args, **kwargs, sum_embeds = sum_embeds, return_embeddings = True)
 
-        if return_embeddings:
+        if return_embeddings and not return_pred_and_embeddings:
             return embed
 
         assert exists(next_actions), f'`next_actions` need to be passed in for state prediction'
@@ -151,7 +178,10 @@ class OneModelWrapper(Module):
         state_mean, state_log_var = self.to_pred(to_state_pred_input)
         state_pred = stack((state_mean, state_log_var.exp()))
 
-        return state_pred
+        if not return_pred_and_embeddings:
+            return state_pred
+
+        return state_pred, embed
 
 # RSM Norm (not to be confused with RMSNorm from transformers)
 # this was proposed by SimBa https://arxiv.org/abs/2410.09754
@@ -483,7 +513,6 @@ class PPO(Module):
             rewards,
             is_boundaries,
             values,
-            world_model_embeds
         ) = zip(*memories)
         
         actions = tensor(actions).to(device)
@@ -518,10 +547,9 @@ class PPO(Module):
         episodes = tensor(episodes).to(device)
         data = (episodes, states, actions, rewards, old_log_probs, returns, old_values)
 
-        # world model embeds
+        state_norm_ds = TensorDataset(states, rewards)
 
-        world_model_embeds = to_torch_tensor(world_model_embeds)
-        data = (*data, world_model_embeds)
+        # world model embeds
 
         data = tuple(t[episodes >= 0] for t in data)
 
@@ -529,7 +557,7 @@ class PPO(Module):
 
         world_model = self.world_model
 
-        episodes, states, actions,rewards, *_ = data
+        episodes, states, actions, rewards, old_log_probs, returns, old_values = data
         max_episode = episodes.amax().item()
 
         seq_arange = torch.arange(episodes.shape[0], device = episodes.device) + 1
@@ -550,18 +578,47 @@ class PPO(Module):
         rewards_per_episode = rewards.split(episode_lens.tolist(), dim = 0)
         rewards_per_episode = pad_sequence(rewards_per_episode)
 
+        old_log_probs_per_episode = old_log_probs.split(episode_lens.tolist(), dim = 0)
+        old_log_probs_per_episode = pad_sequence(old_log_probs_per_episode)
+
+        returns_per_episode = returns.split(episode_lens.tolist(), dim = 0)
+        returns_per_episode = pad_sequence(returns_per_episode)
+
+        old_values_per_episode = old_values.split(episode_lens.tolist(), dim = 0)
+        old_values_per_episode = pad_sequence(old_values_per_episode)
+
         # transformer world model is trained on all states per episode all at once
         # will slowly incorporate rewards and other ssl objectives
 
-        world_model_dataset = TensorDataset(states_per_episode, actions_per_episode, rewards_per_episode, episode_lens)
+        world_model_dataset = TensorDataset(
+            states_per_episode,
+            actions_per_episode,
+            rewards_per_episode,
+            old_log_probs_per_episode,
+            returns_per_episode,
+            old_values_per_episode,
+            episode_lens
+        )
+
         world_model_dl = DataLoader(world_model_dataset, batch_size = self.world_model_batch_size, shuffle = True)
 
+        self.actor_critic.train()
         world_model.train()
 
         for _ in range(self.world_model_epochs):
-            for states, actions, rewards, episode_lens in world_model_dl:
+            for (
+                states,
+                actions,
+                rewards,
+                old_log_probs,
+                returns,
+                old_values,
+                episode_lens
+             ) in world_model_dl:
 
-                actions = actions[:, :-1]
+                seq = torch.arange(states.shape[1], device = device)
+                mask = einx.less('n, b -> b n', seq, episode_lens)
+
                 prev_actions = F.pad(actions, (1, -1), value = -1)
 
                 rewards = F.pad(rewards, (1, -1), value = 0.)
@@ -572,34 +629,14 @@ class PPO(Module):
                     self.rsmnorm.eval()
                     states_with_rewards = self.rsmnorm(states_with_rewards)
 
-                loss = self.autoregressive_wrapper(
+                world_model_loss, world_model_embeds = self.autoregressive_wrapper(
                     states_with_rewards,
                     actions = prev_actions,
                     next_actions = actions, # prediction of the next state needs to be conditioned on the agent's chosen action on that state, and will make the world model interactable
-                    lens = episode_lens
+                    mask = mask
                 )
 
-                loss.backward()
-
-                torch.nn.utils.clip_grad_norm_(world_model.parameters(), self.world_model_max_grad_norm)
-
-                self.opt_world_model.step()
-                self.opt_world_model.zero_grad()
-
-        # learn the actor critic network
-
-        dataset = TensorDataset(*data)
-
-        dl = DataLoader(dataset, batch_size = self.minibatch_size, shuffle = True)
-
-        # policy phase training, similar to original PPO
-
-        self.actor_critic.train()
-
-        for _ in range(self.epochs):
-            for i, batched_data in enumerate(dl):
-
-                _, states, actions, _, old_log_probs, returns, old_values, world_model_embeds = batched_data
+                # update actor and critic
 
                 action_probs, values = self.actor_critic(world_model_embeds, return_actions = True, return_values = True)
 
@@ -618,8 +655,6 @@ class PPO(Module):
                 surr1 = ratios * advantages
                 surr2 = ratios.clamp(1 - self.eps_clip, 1 + self.eps_clip) * advantages
                 actor_loss = - torch.min(surr1, surr2) - self.beta_s * entropy
-
-                actor_loss = actor_loss.mean()
 
                 clip = self.value_clip
 
@@ -645,19 +680,26 @@ class PPO(Module):
                     torch.min(loss, clipped_loss)
                 )
 
-                critic_loss = critic_loss.mean()
+                actor_critic_loss = (actor_loss + critic_loss)[mask]
 
-                actor_critic_loss = actor_loss + critic_loss
-                actor_critic_loss.backward()
+                loss = world_model_loss.mean() + actor_critic_loss.mean()
+                loss.backward()
 
                 self.opt_actor_critic.step()
                 self.opt_actor_critic.zero_grad()
 
-        # update the state normalization with rsmnorm for 1 epoch after actor critic are updated
+                torch.nn.utils.clip_grad_norm_(world_model.parameters(), self.world_model_max_grad_norm)
+
+                self.opt_world_model.step()
+                self.opt_world_model.zero_grad()
+
+        # update the state normalization with rsmnorm for 1 epoch after actor + critic + world model are updated
+
+        state_norm_dl = DataLoader(state_norm_ds, batch_size = self.minibatch_size, shuffle = True)
 
         self.rsmnorm.train()
 
-        for _, states, _, rewards, *_ in dl:
+        for states, rewards in state_norm_dl:
             state_rewards, _ = pack((states, rewards), 'b *')
             self.rsmnorm(state_rewards)
 
@@ -808,7 +850,7 @@ def main(
             prev_action = action
             prev_reward = tensor(reward).to(device) # from the xval paper, we know pre-norm transformers can handle scaled tokens https://arxiv.org/abs/2310.02989
 
-            memory = Memory(tensor(eps), state, action_item, action_log_prob, reward, terminated, value, world_model_embed)
+            memory = Memory(tensor(eps), state, action_item, action_log_prob, reward, terminated, value)
 
             memories.append(memory)
 
