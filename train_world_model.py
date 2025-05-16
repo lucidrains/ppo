@@ -24,6 +24,7 @@ pad_sequence = partial(pad_sequence, batch_first = True)
 
 import einx
 from einops import reduce, repeat, einsum, rearrange, pack
+from einops.layers.torch import Rearrange
 
 from ema_pytorch import EMA
 
@@ -90,6 +91,65 @@ def temp_batch_dim(fn):
         return out
 
     return inner
+
+# a wrapper to slowly absorb actor / critic / world model into one, will just call it OneModelWrapper
+
+class OneModelWrapper(Module):
+    def __init__(
+        self,
+        transformer: Module,
+        num_actions,
+        dim_pred_state,
+    ):
+        super().__init__()
+        self.transformer = transformer
+        dim = transformer.attn_layers.dim
+
+        self.action_embeds = nn.Embedding(num_actions, dim)
+        self.reward_embed = nn.Parameter(torch.randn(dim) * 1e-5)
+
+        dim = transformer.attn_layers.dim
+
+        self.to_pred = nn.Sequential(
+            nn.Linear(dim, dim_pred_state * 2),
+            Rearrange('... (mean_var d) -> mean_var ... d', mean_var = 2)
+        )
+
+        # needed for autoregressive wrapper
+
+        self.max_seq_len = transformer.max_seq_len
+        self.probabilistic = transformer.probabilistic
+
+    def forward(
+        self,
+        *args,
+        actions = None,
+        rewards = None,
+        return_embeddings = False,
+        **kwargs
+    ):
+        sum_embeds = 0.
+
+        if exists(actions):
+            has_actions = actions >= 0.
+            actions = torch.where(has_actions, actions, 0)
+            action_embeds = self.action_embeds(actions)
+            action_embeds = einx.where('b n, b n d, ', has_actions, action_embeds, 0.)
+            sum_embeds = sum_embeds + action_embeds
+
+        if exists(rewards):
+            reward_embeds = einx.multiply('b n, d -> b n d', rewards, self.reward_embed)
+            sum_embeds = sum_embeds + reward_embeds
+
+        embed = self.transformer(*args, **kwargs, sum_embeds = sum_embeds, return_embeddings = True)
+
+        if return_embeddings:
+            return embed
+
+        state_mean, state_log_var = self.to_pred(embed)
+        state_pred = stack((state_mean, state_log_var.exp()))
+
+        return state_pred
 
 # RSM Norm (not to be confused with RMSNorm from transformers)
 # this was proposed by SimBa https://arxiv.org/abs/2410.09754
@@ -333,20 +393,21 @@ class PPO(Module):
         self.world_model_dim = world_model_dim
         self.autoregressive_wrapper = None
 
-        self.action_embeds = nn.Embedding(num_actions, world_model_dim)
-        self.reward_embed = nn.Parameter(torch.randn(world_model_dim) * 1e-5)
-
-        self.world_model = ContinuousTransformerWrapper(
-            dim_in = state_dim,
-            dim_out = state_dim,
-            max_seq_len = max_timesteps,
-            probabilistic = True,
-            attn_layers = Decoder(
-                dim = world_model_dim,
-                rotary_pos_emb = True,
-                attn_dropout = world_model_dropout,
-                ff_dropout = world_model_dropout,
-                **world_model
+        self.world_model = OneModelWrapper(
+            num_actions = num_actions,
+            dim_pred_state = state_dim,
+            transformer = ContinuousTransformerWrapper(
+                dim_in = state_dim,
+                dim_out = None,
+                max_seq_len = max_timesteps,
+                probabilistic = True,
+                attn_layers = Decoder(
+                    dim = world_model_dim,
+                    rotary_pos_emb = True,
+                    attn_dropout = world_model_dropout,
+                    ff_dropout = world_model_dropout,
+                    **world_model
+                )
             )
         )
 
@@ -369,11 +430,7 @@ class PPO(Module):
 
         self.opt_actor_critic = AdoptAtan2(self.actor_critic.parameters(), lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
 
-        self.opt_world_model = AdoptAtan2([
-            *self.world_model.parameters(),
-            *self.action_embeds.parameters(),
-            self.reward_embed
-        ], lr = world_model_lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
+        self.opt_world_model = AdoptAtan2(self.world_model.parameters(), lr = world_model_lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
 
         self.world_model_batch_size = world_model_batch_size
         self.world_model_epochs = world_model_epochs
@@ -504,15 +561,14 @@ class PPO(Module):
                     self.rsmnorm.eval()
                     states = self.rsmnorm(states)
 
-                action_embeds = self.action_embeds(actions[:, :-1])
-                action_embeds = F.pad(action_embeds, (0, 0, 1, -1), value = 0.)
+                actions = F.pad(actions[:, :-1], (1, -1), value = -1)
 
-                reward_embeds = einx.multiply('b n, d -> b n d', rewards[:, :-1], self.reward_embed)
-                reward_embeds = F.pad(reward_embeds, (0, 0, 1, -1), value = 0.)
+                rewards = F.pad(rewards[:, :-1], (1, -1), value = 0.)
 
                 loss = self.autoregressive_wrapper(
                     states,
-                    sum_embeds = action_embeds + reward_embeds,
+                    actions = actions,
+                    rewards = rewards,
                     lens = episode_lens
                 )
 
@@ -687,13 +743,13 @@ def main(
         state, info = env.reset(seed = seed)
         state = torch.from_numpy(state).to(device)
 
-        prev_action_embed = torch.zeros(agent.world_model_dim, device = device)
-        prev_reward_embed = 0.
+        prev_action = tensor(-1).to(device)
+        prev_reward = tensor(0.).to(device)
 
         world_model_cache = None
 
         @torch.no_grad()
-        def state_to_world_model_embed(state, additional_embeds):
+        def state_to_world_model_embed(state, action, reward):
             nonlocal world_model_cache
 
             agent.rsmnorm.eval()
@@ -702,11 +758,14 @@ def main(
             world_model.eval()
 
             world_model_input = rearrange(normed_state, 'd -> 1 1 d')
+            action = rearrange(action, ' -> 1 1')
+            reward = rearrange(reward, ' -> 1 1')
 
             world_model_embed, world_model_cache = world_model(
                 world_model_input,
                 cache = world_model_cache,
-                sum_embeds = additional_embeds,
+                actions = action,
+                rewards = reward,
                 return_embeddings = True,
                 return_intermediates = True
             )
@@ -717,7 +776,7 @@ def main(
         for timestep in range(max_timesteps):
             time += 1
             
-            world_model_embed = state_to_world_model_embed(state, prev_action_embed + prev_reward_embed)
+            world_model_embed = state_to_world_model_embed(state, prev_action, prev_reward)
 
             action_probs, value = temp_batch_dim(agent.ema_actor_critic.forward_eval)(
                 world_model_embed,
@@ -737,8 +796,8 @@ def main(
 
             reward = float(reward)
 
-            prev_action_embed = agent.action_embeds(action)
-            prev_reward_embed = agent.reward_embed * reward # from the xval paper, we know pre-norm transformers can handle scaled tokens https://arxiv.org/abs/2310.02989
+            prev_action = action
+            prev_reward = tensor(reward).to(device) # from the xval paper, we know pre-norm transformers can handle scaled tokens https://arxiv.org/abs/2310.02989
 
             memory = Memory(tensor(eps), state, action_item, action_log_prob, reward, terminated, value, world_model_embed)
 
@@ -754,7 +813,7 @@ def main(
             # take care of truncated by adding a non-learnable memory storing the next value for GAE
 
             if done and not terminated:
-                world_model_embed = state_to_world_model_embed(state, prev_action_embed + prev_reward_embed)
+                world_model_embed = state_to_world_model_embed(state, prev_action, prev_reward)
 
                 next_value = temp_batch_dim(agent.ema_actor_critic.forward_eval)(world_model_embed, return_values = True)
 
