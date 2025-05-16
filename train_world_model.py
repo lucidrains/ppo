@@ -547,8 +547,6 @@ class PPO(Module):
         episodes = tensor(episodes).to(device)
         data = (episodes, states, actions, rewards, old_log_probs, returns, old_values)
 
-        state_norm_ds = TensorDataset(states, rewards)
-
         # world model embeds
 
         data = tuple(t[episodes >= 0] for t in data)
@@ -568,24 +566,23 @@ class PPO(Module):
 
         cum_episode_lens = F.pad(cum_episode_lens, (1, 0), value = 0)
         episode_lens = cum_episode_lens[1:] - cum_episode_lens[:-1]
+        splits = episode_lens.tolist()
 
-        states_per_episode = states.split(episode_lens.tolist(), dim = 0)
-        states_per_episode = pad_sequence(states_per_episode)
-
-        actions_per_episode = actions.split(episode_lens.tolist(), dim = 0)
-        actions_per_episode = pad_sequence(actions_per_episode)
-
-        rewards_per_episode = rewards.split(episode_lens.tolist(), dim = 0)
-        rewards_per_episode = pad_sequence(rewards_per_episode)
-
-        old_log_probs_per_episode = old_log_probs.split(episode_lens.tolist(), dim = 0)
-        old_log_probs_per_episode = pad_sequence(old_log_probs_per_episode)
-
-        returns_per_episode = returns.split(episode_lens.tolist(), dim = 0)
-        returns_per_episode = pad_sequence(returns_per_episode)
-
-        old_values_per_episode = old_values.split(episode_lens.tolist(), dim = 0)
-        old_values_per_episode = pad_sequence(old_values_per_episode)
+        (
+            states_per_episode,
+            actions_per_episode,
+            rewards_per_episode,
+            old_log_probs_per_episode,
+            returns_per_episode,
+            old_values_per_episode
+        ) = tuple(pad_sequence(t.split(splits, dim = 0)) for t in (
+            states,
+            actions,
+            rewards,
+            old_log_probs,
+            returns,
+            old_values
+        ))
 
         # transformer world model is trained on all states per episode all at once
         # will slowly incorporate rewards and other ssl objectives
@@ -604,6 +601,9 @@ class PPO(Module):
 
         self.actor_critic.train()
         world_model.train()
+
+        rsmnorm_copy = deepcopy(self.rsmnorm) # learn the state normalization alongside in a copy of the state norm module, copy back at the end
+        rsmnorm_copy.train()
 
         for _ in range(self.world_model_epochs):
             for (
@@ -693,15 +693,9 @@ class PPO(Module):
                 self.opt_world_model.step()
                 self.opt_world_model.zero_grad()
 
-        # update the state normalization with rsmnorm for 1 epoch after actor + critic + world model are updated
+                rsmnorm_copy(states_with_rewards[mask])
 
-        state_norm_dl = DataLoader(state_norm_ds, batch_size = self.minibatch_size, shuffle = True)
-
-        self.rsmnorm.train()
-
-        for states, rewards in state_norm_dl:
-            state_rewards, _ = pack((states, rewards), 'b *')
-            self.rsmnorm(state_rewards)
+        self.rsmnorm.load_state_dict(rsmnorm_copy.state_dict())
 
 # main
 
