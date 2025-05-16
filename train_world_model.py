@@ -451,6 +451,8 @@ class PPO(Module):
 
         self.autoregressive_wrapper = ContinuousAutoregressiveWrapper(self.world_model)
 
+        self.frac_actor_critic_head_gradient = frac_actor_critic_head_gradient
+
         # state + reward normalization
 
         self.rsmnorm = RSMNorm(state_dim + 1)
@@ -642,7 +644,7 @@ class PPO(Module):
 
                 # update actor and critic
 
-                world_model_embeds = frac_gradient(world_model_embeds, frac_actor_critic_head_gradient) # what fraction of the gradient to pass back to the world model from the actor / critic head
+                world_model_embeds = frac_gradient(world_model_embeds, self.frac_actor_critic_head_gradient) # what fraction of the gradient to pass back to the world model from the actor / critic head
 
                 action_probs, values = self.actor_critic(world_model_embeds, return_actions = True, return_values = True)
 
