@@ -106,7 +106,6 @@ class OneModelWrapper(Module):
         dim = transformer.attn_layers.dim
 
         self.action_embeds = nn.Embedding(num_actions, dim)
-        self.reward_embed = nn.Parameter(torch.randn(dim) * 1e-5)
 
         dim = transformer.attn_layers.dim
 
@@ -126,7 +125,6 @@ class OneModelWrapper(Module):
         self,
         *args,
         actions = None,
-        rewards = None,
         next_actions = None,
         return_embeddings = False,
         **kwargs
@@ -139,10 +137,6 @@ class OneModelWrapper(Module):
             action_embeds = self.action_embeds(actions)
             action_embeds = einx.where('b n, b n d, ', has_actions, action_embeds, 0.)
             sum_embeds = sum_embeds + action_embeds
-
-        if exists(rewards):
-            reward_embeds = einx.multiply('b n, d -> b n d', rewards, self.reward_embed)
-            sum_embeds = sum_embeds + reward_embeds
 
         embed = self.transformer(*args, **kwargs, sum_embeds = sum_embeds, return_embeddings = True)
 
@@ -401,11 +395,13 @@ class PPO(Module):
         self.world_model_dim = world_model_dim
         self.autoregressive_wrapper = None
 
+        state_and_reward_dim = state_dim + 1
+
         self.world_model = OneModelWrapper(
             num_actions = num_actions,
-            dim_pred_state = state_dim,
+            dim_pred_state = state_and_reward_dim,
             transformer = ContinuousTransformerWrapper(
-                dim_in = state_dim,
+                dim_in = state_and_reward_dim,
                 dim_out = None,
                 max_seq_len = max_timesteps,
                 probabilistic = True,
@@ -421,9 +417,9 @@ class PPO(Module):
 
         self.autoregressive_wrapper = ContinuousAutoregressiveWrapper(self.world_model)
 
-        # weight tie rsmnorm
+        # state + reward normalization
 
-        self.rsmnorm = RSMNorm(state_dim)
+        self.rsmnorm = RSMNorm(state_dim + 1)
 
         # https://arxiv.org/abs/2403.03950
 
@@ -565,20 +561,21 @@ class PPO(Module):
         for _ in range(self.world_model_epochs):
             for states, actions, rewards, episode_lens in world_model_dl:
 
-                with torch.no_grad():
-                    self.rsmnorm.eval()
-                    states = self.rsmnorm(states)
-
                 actions = actions[:, :-1]
                 prev_actions = F.pad(actions, (1, -1), value = -1)
 
-                rewards = F.pad(rewards[:, :-1], (1, -1), value = 0.)
+                rewards = F.pad(rewards, (1, -1), value = 0.)
+
+                states_with_rewards, _ = pack((states, rewards), 'b n *')
+
+                with torch.no_grad():
+                    self.rsmnorm.eval()
+                    states_with_rewards = self.rsmnorm(states_with_rewards)
 
                 loss = self.autoregressive_wrapper(
-                    states,
+                    states_with_rewards,
                     actions = prev_actions,
                     next_actions = actions, # prediction of the next state needs to be conditioned on the agent's chosen action on that state, and will make the world model interactable
-                    rewards = rewards,
                     lens = episode_lens
                 )
 
@@ -660,8 +657,9 @@ class PPO(Module):
 
         self.rsmnorm.train()
 
-        for _, states, *_ in dl:
-            self.rsmnorm(states)
+        for _, states, _, rewards, *_ in dl:
+            state_rewards, _ = pack((states, rewards), 'b *')
+            self.rsmnorm(state_rewards)
 
 # main
 
@@ -762,8 +760,10 @@ def main(
         def state_to_world_model_embed(state, action, reward):
             nonlocal world_model_cache
 
+            state_with_reward = cat((state, rearrange(reward, '-> 1')), dim = -1)
+
             agent.rsmnorm.eval()
-            normed_state = agent.rsmnorm(state)
+            normed_state = agent.rsmnorm(state_with_reward)
 
             world_model.eval()
 
@@ -775,7 +775,6 @@ def main(
                 world_model_input,
                 cache = world_model_cache,
                 actions = action,
-                rewards = reward,
                 return_embeddings = True,
                 return_intermediates = True
             )
