@@ -111,6 +111,8 @@ class OneModelWrapper(Module):
         dim = transformer.attn_layers.dim
 
         self.to_pred = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.SiLU(),
             nn.Linear(dim, dim_pred_state * 2),
             Rearrange('... (mean_var d) -> mean_var ... d', mean_var = 2)
         )
@@ -125,6 +127,7 @@ class OneModelWrapper(Module):
         *args,
         actions = None,
         rewards = None,
+        next_actions = None,
         return_embeddings = False,
         **kwargs
     ):
@@ -146,7 +149,12 @@ class OneModelWrapper(Module):
         if return_embeddings:
             return embed
 
-        state_mean, state_log_var = self.to_pred(embed)
+        assert exists(next_actions), f'`next_actions` need to be passed in for state prediction'
+
+        next_action_embeds = self.action_embeds(next_actions)
+        to_state_pred_input = cat((embed, next_action_embeds), dim = -1)
+
+        state_mean, state_log_var = self.to_pred(to_state_pred_input)
         state_pred = stack((state_mean, state_log_var.exp()))
 
         return state_pred
@@ -561,13 +569,15 @@ class PPO(Module):
                     self.rsmnorm.eval()
                     states = self.rsmnorm(states)
 
-                actions = F.pad(actions[:, :-1], (1, -1), value = -1)
+                actions = actions[:, :-1]
+                prev_actions = F.pad(actions, (1, -1), value = -1)
 
                 rewards = F.pad(rewards[:, :-1], (1, -1), value = 0.)
 
                 loss = self.autoregressive_wrapper(
                     states,
-                    actions = actions,
+                    actions = prev_actions,
+                    next_actions = actions, # prediction of the next state needs to be conditioned on the agent's chosen action on that state, and will make the world model interactable
                     rewards = rewards,
                     lens = episode_lens
                 )
