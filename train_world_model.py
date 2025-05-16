@@ -72,6 +72,7 @@ def normalize(t, eps = 1e-5):
     return (t - t.mean()) / (t.std() + eps)
 
 def frac_gradient(t, frac = 1.):
+    assert 0 <= frac <= 1.
     return t.detach() * (1. - frac) + t * frac
 
 def log(t, eps = 1e-20):
@@ -81,7 +82,6 @@ def entropy(prob):
     return (-prob * log(prob)).sum()
 
 def temp_batch_dim(fn):
-
     @wraps(fn)
     def inner(*args, **kwargs):
         args, kwargs = tree_map(lambda t: rearrange(t, '... -> 1 ...') if is_tensor(t) else t, (args, kwargs))
@@ -94,34 +94,6 @@ def temp_batch_dim(fn):
     return inner
 
 # a wrapper to slowly absorb actor / critic / world model into one, will just call it OneModelWrapper
-
-class GaussianNLL(Module):
-    def forward(self, pred, target):
-        mean, var = pred
-        dist = Normal(mean, var)
-        return -dist.log_prob(target)
-
-class ContinuousAutoregressiveWrapper(Module):
-    def __init__(
-        self,
-        net
-    ):
-        super().__init__()
-        self.net = net
-        self.loss_fn = GaussianNLL()
-
-    def forward(
-        self,
-        x,
-        **kwargs
-    ):
-        inp, target = x, x[:, 1:]
-
-        pred, embed = self.net(inp, return_pred_and_embeddings = True, **kwargs)
-
-        loss = self.loss_fn(pred[..., :-1, :], target)
-
-        return loss, embed
 
 class OneModelWrapper(Module):
     def __init__(
@@ -144,11 +116,6 @@ class OneModelWrapper(Module):
             nn.Linear(dim, dim_pred_state * 2),
             Rearrange('... (mean_var d) -> mean_var ... d', mean_var = 2)
         )
-
-        # needed for autoregressive wrapper
-
-        self.max_seq_len = transformer.max_seq_len
-        self.probabilistic = transformer.probabilistic
 
     def forward(
         self,
@@ -425,9 +392,7 @@ class PPO(Module):
             critic_dim_pred = critic_pred_num_bins
         )
 
-        self.world_model = None
         self.world_model_dim = world_model_dim
-        self.autoregressive_wrapper = None
 
         state_and_reward_dim = state_dim + 1
 
@@ -448,8 +413,6 @@ class PPO(Module):
                 )
             )
         )
-
-        self.autoregressive_wrapper = ContinuousAutoregressiveWrapper(self.world_model)
 
         self.frac_actor_critic_head_gradient = frac_actor_critic_head_gradient
 
@@ -635,12 +598,16 @@ class PPO(Module):
                     self.rsmnorm.eval()
                     states_with_rewards = self.rsmnorm(states_with_rewards)
 
-                world_model_loss, world_model_embeds = self.autoregressive_wrapper(
+                state_and_reward_pred, world_model_embeds = world_model(
                     states_with_rewards,
+                    return_pred_and_embeddings = True,
                     actions = prev_actions,
                     next_actions = actions, # prediction of the next state needs to be conditioned on the agent's chosen action on that state, and will make the world model interactable
                     mask = mask
                 )
+
+                pred_mean, pred_var = state_and_reward_pred[..., :-1, :]
+                world_model_loss = F.gaussian_nll_loss(pred_mean, states_with_rewards[:, 1:], pred_var)
 
                 # update actor and critic
 
