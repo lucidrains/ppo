@@ -71,6 +71,9 @@ def divisible_by(num, den):
 def normalize(t, eps = 1e-5):
     return (t - t.mean()) / (t.std() + eps)
 
+def frac_gradient(t, frac = 1.):
+    return t.detach() * (1. - frac) + t * frac
+
 def log(t, eps = 1e-20):
     return t.clamp(min = eps).log()
 
@@ -407,6 +410,7 @@ class PPO(Module):
         world_model_epochs = 10,
         world_model_dropout = 0.25,
         world_model_max_grad_norm = 0.5,
+        frac_actor_critic_head_gradient = 0.25,
         ema_kwargs: dict = dict(
             update_model_with_ema_every = 500
         ),
@@ -637,6 +641,8 @@ class PPO(Module):
                 )
 
                 # update actor and critic
+
+                world_model_embeds = frac_gradient(world_model_embeds, frac_actor_critic_head_gradient) # what fraction of the gradient to pass back to the world model from the actor / critic head
 
                 action_probs, values = self.actor_critic(world_model_embeds, return_actions = True, return_values = True)
 
