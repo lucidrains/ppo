@@ -16,7 +16,7 @@ from torch import nn, tensor, is_tensor, cat, stack
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
 from torch.utils.data import TensorDataset, DataLoader
-from torch.distributions import Categorical, Normal
+from torch.distributions import Categorical
 from torch.utils._pytree import tree_map
 
 from torch.nn.utils.rnn import pad_sequence
@@ -100,7 +100,9 @@ class OneModelWrapper(Module):
         self,
         transformer: Module,
         num_actions,
+        critic_dim_pred,
         dim_pred_state,
+        frac_actor_critic_head_gradient = 0.5,
     ):
         super().__init__()
         self.transformer = transformer
@@ -117,13 +119,26 @@ class OneModelWrapper(Module):
             Rearrange('... (mean_var d) -> mean_var ... d', mean_var = 2)
         )
 
+        self.critic_head = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.SiLU(),
+            nn.Linear(dim * 2, critic_dim_pred)
+        )
+
+        self.action_head = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.SiLU(),
+            nn.Linear(dim * 2, num_actions),
+            nn.Softmax(dim = -1)
+        )
+
+        self.frac_actor_critic_head_gradient = frac_actor_critic_head_gradient
+
     def forward(
         self,
         *args,
         actions = None,
         next_actions = None,
-        return_embeddings = False,
-        return_pred_and_embeddings = False,
         **kwargs
     ):
         sum_embeds = 0.
@@ -135,23 +150,30 @@ class OneModelWrapper(Module):
             action_embeds = einx.where('b n, b n d, ', has_actions, action_embeds, 0.)
             sum_embeds = sum_embeds + action_embeds
 
-        embed = self.transformer(*args, **kwargs, sum_embeds = sum_embeds, return_embeddings = True)
+        embed, cache = self.transformer(*args, **kwargs, sum_embeds = sum_embeds, return_embeddings = True, return_intermediates = True)
 
-        if return_embeddings and not return_pred_and_embeddings:
-            return embed
+        # state prediction if `next_actions` passed in
 
-        assert exists(next_actions), f'`next_actions` need to be passed in for state prediction'
+        state_pred = None
 
-        next_action_embeds = self.action_embeds(next_actions)
-        to_state_pred_input = cat((embed, next_action_embeds), dim = -1)
+        if exists(next_actions):
+            next_action_embeds = self.action_embeds(next_actions)
+            to_state_pred_input = cat((embed, next_action_embeds), dim = -1)
 
-        state_mean, state_log_var = self.to_pred(to_state_pred_input)
-        state_pred = stack((state_mean, state_log_var.exp()))
+            state_mean, state_log_var = self.to_pred(to_state_pred_input)
+            state_pred = stack((state_mean, state_log_var.exp()))
 
-        if not return_pred_and_embeddings:
-            return state_pred
+        embed = frac_gradient(embed, self.frac_actor_critic_head_gradient) # what fraction of the gradient to pass back to the world model from the actor / critic head
 
-        return state_pred, embed
+        # actions
+
+        action_probs = self.action_head(embed)
+
+        # values
+
+        values = self.critic_head(embed)
+
+        return action_probs, values, state_pred, cache
 
 # RSM Norm (not to be confused with RMSNorm from transformers)
 # this was proposed by SimBa https://arxiv.org/abs/2410.09754
@@ -203,119 +225,6 @@ class RSMNorm(Module):
 
         return normed
 
-# SimBa - Kaist + SonyAI
-
-class ReluSquared(Module):
-    def forward(self, x):
-        return x.sign() * F.relu(x) ** 2
-
-class SimBa(Module):
-
-    def __init__(
-        self,
-        dim,
-        dim_hidden = None,
-        depth = 3,
-        dropout = 0.,
-        expansion_factor = 2,
-    ):
-        super().__init__()
-        """
-        following the design of SimBa https://arxiv.org/abs/2410.09754v1
-        """
-
-        dim_hidden = default(dim_hidden, dim * expansion_factor)
-
-        layers = []
-
-        self.proj_in = nn.Linear(dim, dim_hidden) if dim != dim_hidden else nn.Identity()
-
-        dim_inner = dim_hidden * expansion_factor
-
-        for ind in range(depth):
-
-            layer = nn.Sequential(
-                nn.RMSNorm(dim_hidden),
-                nn.Linear(dim_hidden, dim_inner),
-                ReluSquared(),
-                nn.Linear(dim_inner, dim_hidden),
-                nn.Dropout(dropout),
-            )
-
-            layers.append(layer)
-
-        # final layer out
-
-        self.layers = ModuleList(layers)
-
-    def forward(
-        self,
-        x
-    ):
-        x = self.proj_in(x)
-
-        for layer in self.layers:
-            x = layer(x) + x
-
-        return x
-
-# networks
-
-class ActorCritic(Module):
-    def __init__(
-        self,
-        input_dim,
-        hidden_dim,
-        num_actions,
-        critic_dim_pred,
-        mlp_depth = 4,
-        dropout = 0.1,
-        rsmnorm_input = True,  # use the RSMNorm for inputs proposed by KAIST + SonyAI
-    ):
-        super().__init__()
-
-        self.net = SimBa(
-            input_dim,
-            dim_hidden = hidden_dim * 2,
-            depth = mlp_depth,
-            dropout = dropout,
-        )
-
-        self.critic_head = nn.Sequential(
-            nn.RMSNorm(hidden_dim * 2),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            ReluSquared(),
-            nn.Linear(hidden_dim, critic_dim_pred)
-        )
-
-        self.action_head = nn.Sequential(
-            nn.RMSNorm(hidden_dim * 2),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            ReluSquared(),
-            nn.Linear(hidden_dim, num_actions)
-        )
-
-    def forward(
-        self,
-        inp,
-        return_actions = False,
-        return_values = False
-    ):
-        hidden = self.net(inp)
-
-        if not (return_actions or return_values):
-            return hidden
-
-        action_probs = self.action_head(hidden).softmax(dim = -1)
-        values = self.critic_head(hidden)
-
-        if return_actions and not return_values:
-            return action_probs
-        elif return_values and not return_actions:
-            return values
-
-        return action_probs, values
-
 # GAE
 
 def calc_gae(
@@ -350,7 +259,6 @@ class PPO(Module):
         self,
         state_dim,
         num_actions,
-        hidden_dim,
         critic_pred_num_bins,
         reward_range: tuple[float, float],
         epochs,
@@ -370,9 +278,9 @@ class PPO(Module):
         world_model: dict = dict(
             attn_dim_head = 16,
             heads = 4,
-            depth = 2
+            depth = 4
         ),
-        world_model_lr = 8e-4,
+        world_model_lr = 1e-3,
         world_model_batch_size = 8,
         world_model_epochs = 10,
         world_model_dropout = 0.25,
@@ -385,19 +293,13 @@ class PPO(Module):
     ):
         super().__init__()
 
-        self.actor_critic = ActorCritic(
-            world_model_dim,
-            hidden_dim,
-            num_actions,
-            critic_dim_pred = critic_pred_num_bins
-        )
-
         self.world_model_dim = world_model_dim
 
         state_and_reward_dim = state_dim + 1
 
         self.world_model = OneModelWrapper(
             num_actions = num_actions,
+            critic_dim_pred = critic_pred_num_bins,
             dim_pred_state = state_and_reward_dim,
             transformer = ContinuousTransformerWrapper(
                 dim_in = state_and_reward_dim,
@@ -429,9 +331,7 @@ class PPO(Module):
             clamp_to_range = True
         )
 
-        self.ema_actor_critic = EMA(self.actor_critic, beta = ema_decay, include_online_model = False, **ema_kwargs)
-
-        self.opt_actor_critic = AdoptAtan2(self.actor_critic.parameters(), lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
+        self.ema_world_model = EMA(self.world_model, beta = ema_decay, include_online_model = False, **ema_kwargs)
 
         self.opt_world_model = AdoptAtan2(self.world_model.parameters(), lr = world_model_lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
 
@@ -439,7 +339,7 @@ class PPO(Module):
         self.world_model_epochs = world_model_epochs
         self.world_model_max_grad_norm = world_model_max_grad_norm
 
-        self.ema_actor_critic.add_to_optimizer_post_step_hook(self.opt_actor_critic)
+        self.ema_world_model.add_to_optimizer_post_step_hook(self.opt_world_model)
 
         # learning hparams
 
@@ -458,7 +358,7 @@ class PPO(Module):
 
     def save(self):
         torch.save({
-            'actor_critic': self.actor_critic.state_dict(),
+            'model': self.world_model.state_dict(),
         }, str(self.save_path))
 
     def load(self):
@@ -467,7 +367,7 @@ class PPO(Module):
 
         data = torch.load(str(self.save_path), weights_only = True)
 
-        self.actor_critic.load_state_dict(data['actor_critic'])
+        self.world_model.load_state_dict(data['model'])
 
     def learn(self, memories):
         hl_gauss = self.critic_hl_gauss_loss
@@ -493,6 +393,7 @@ class PPO(Module):
         scalar_values = hl_gauss(stack(values))
 
         with torch.no_grad():
+
             calc_gae_from_values = partial(calc_gae,
                 rewards = rewards,
                 masks = masks,
@@ -568,7 +469,6 @@ class PPO(Module):
 
         world_model_dl = DataLoader(world_model_dataset, batch_size = self.world_model_batch_size, shuffle = True)
 
-        self.actor_critic.train()
         world_model.train()
 
         rsmnorm_copy = deepcopy(self.rsmnorm) # learn the state normalization alongside in a copy of the state norm module, copy back at the end
@@ -598,9 +498,8 @@ class PPO(Module):
                     self.rsmnorm.eval()
                     states_with_rewards = self.rsmnorm(states_with_rewards)
 
-                state_and_reward_pred, world_model_embeds = world_model(
+                action_probs, values, state_and_reward_pred, _ = world_model(
                     states_with_rewards,
-                    return_pred_and_embeddings = True,
                     actions = prev_actions,
                     next_actions = actions, # prediction of the next state needs to be conditioned on the agent's chosen action on that state, and will make the world model interactable
                     mask = mask
@@ -610,10 +509,6 @@ class PPO(Module):
                 world_model_loss = F.gaussian_nll_loss(pred_mean, states_with_rewards[:, 1:], pred_var)
 
                 # update actor and critic
-
-                world_model_embeds = frac_gradient(world_model_embeds, self.frac_actor_critic_head_gradient) # what fraction of the gradient to pass back to the world model from the actor / critic head
-
-                action_probs, values = self.actor_critic(world_model_embeds, return_actions = True, return_values = True)
 
                 dist = Categorical(action_probs)
                 action_log_probs = dist.log_prob(actions)
@@ -660,9 +555,6 @@ class PPO(Module):
                 loss = world_model_loss.mean() + actor_critic_loss.mean()
                 loss.backward()
 
-                self.opt_actor_critic.step()
-                self.opt_actor_critic.zero_grad()
-
                 torch.nn.utils.clip_grad_norm_(world_model.parameters(), self.world_model_max_grad_norm)
 
                 self.opt_world_model.step()
@@ -678,7 +570,6 @@ def main(
     env_name = 'LunarLander-v3',
     num_episodes = 50000,
     max_timesteps = 500,
-    hidden_dim = 64,
     critic_pred_num_bins = 100,
     reward_range = (-100, 100),
     minibatch_size = 64,
@@ -724,7 +615,6 @@ def main(
     agent = PPO(
         state_dim,
         num_actions,
-        hidden_dim,
         critic_pred_num_bins,
         reward_range,
         epochs,
@@ -753,7 +643,7 @@ def main(
     num_policy_updates = 0
 
     agent.eval()
-    world_model = agent.world_model
+    world_model = agent.ema_world_model
 
     for eps in tqdm(range(num_episodes), desc = 'episodes'):
 
@@ -768,10 +658,10 @@ def main(
         world_model_cache = None
 
         @torch.no_grad()
-        def state_to_world_model_embed(state, action, reward):
+        def state_to_pred_action_and_value(state, prev_action, prev_reward):
             nonlocal world_model_cache
 
-            state_with_reward = cat((state, rearrange(reward, '-> 1')), dim = -1)
+            state_with_reward = cat((state, rearrange(prev_reward, '-> 1')), dim = -1)
 
             agent.rsmnorm.eval()
             normed_state = agent.rsmnorm(state_with_reward)
@@ -779,30 +669,23 @@ def main(
             world_model.eval()
 
             world_model_input = rearrange(normed_state, 'd -> 1 1 d')
-            action = rearrange(action, ' -> 1 1')
-            reward = rearrange(reward, ' -> 1 1')
+            prev_action = rearrange(prev_action, ' -> 1 1')
+            prev_reward = rearrange(prev_reward, ' -> 1 1')
 
-            world_model_embed, world_model_cache = world_model(
+            action_probs, values, _, world_model_cache = world_model.forward_eval(
                 world_model_input,
                 cache = world_model_cache,
-                actions = action,
-                return_embeddings = True,
-                return_intermediates = True
+                actions = prev_action
             )
 
-            world_model_embed = rearrange(world_model_embed, '1 1 d -> d')
-            return world_model_embed
+            action_probs = rearrange(action_probs, '1 1 d -> d')
+            values = rearrange(values, '1 1 d -> d')
+            return action_probs, values
 
         for timestep in range(max_timesteps):
             time += 1
             
-            world_model_embed = state_to_world_model_embed(state, prev_action, prev_reward)
-
-            action_probs, value = temp_batch_dim(agent.ema_actor_critic.forward_eval)(
-                world_model_embed,
-                return_actions = True,
-                return_values = True
-            )
+            action_probs, value = state_to_pred_action_and_value(state, prev_action, prev_reward)
 
             dist = Categorical(action_probs)
             action = dist.sample()
@@ -833,9 +716,7 @@ def main(
             # take care of truncated by adding a non-learnable memory storing the next value for GAE
 
             if done and not terminated:
-                world_model_embed = state_to_world_model_embed(state, prev_action, prev_reward)
-
-                next_value = temp_batch_dim(agent.ema_actor_critic.forward_eval)(world_model_embed, return_values = True)
+                _, next_value, *_ = state_to_pred_action_and_value(state, prev_action, prev_reward)
 
                 bootstrap_value_memory = memory._replace(
                     state = state,
