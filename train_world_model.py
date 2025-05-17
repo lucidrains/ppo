@@ -55,6 +55,7 @@ Memory = namedtuple('Memory', [
     'reward',
     'is_boundary',
     'value',
+    'dones'
 ])
 
 # helpers
@@ -112,6 +113,11 @@ class OneModelWrapper(Module):
 
         dim = transformer.attn_layers.dim
 
+        self.to_dones = nn.Sequential(
+            nn.Linear(dim * 2, 2),
+            nn.Sigmoid()            
+        )
+
         self.to_pred = nn.Sequential(
             nn.Linear(dim * 2, dim),
             nn.SiLU(),
@@ -139,6 +145,7 @@ class OneModelWrapper(Module):
         *args,
         actions = None,
         next_actions = None,
+        return_pred_dones = False,
         **kwargs
     ):
         sum_embeds = 0.
@@ -152,16 +159,25 @@ class OneModelWrapper(Module):
 
         embed, cache = self.transformer(*args, **kwargs, sum_embeds = sum_embeds, return_embeddings = True, return_intermediates = True)
 
-        # state prediction if `next_actions` passed in
+        # if `next_actions` from agent passed in, use it to predict the next state + truncated / terminated signal
 
-        state_pred = None
-
+        embed_with_actions = None
         if exists(next_actions):
             next_action_embeds = self.action_embeds(next_actions)
-            to_state_pred_input = cat((embed, next_action_embeds), dim = -1)
+            embed_with_actions = cat((embed, next_action_embeds), dim = -1)
 
-            state_mean, state_log_var = self.to_pred(to_state_pred_input)
+        # predicting state and dones, based on agent's action
+
+        state_pred = None
+        dones = None
+
+        if exists(embed_with_actions):
+            state_mean, state_log_var = self.to_pred(embed_with_actions)
+
             state_pred = stack((state_mean, state_log_var.exp()))
+            dones = self.to_dones(embed_with_actions)
+
+        # actor critic heads living on top of transformer - basically approaching online decision transformer except critic learn discounted returns
 
         embed = frac_gradient(embed, self.frac_actor_critic_head_gradient) # what fraction of the gradient to pass back to the world model from the actor / critic head
 
@@ -173,7 +189,7 @@ class OneModelWrapper(Module):
 
         values = self.critic_head(embed)
 
-        return action_probs, values, state_pred, cache
+        return action_probs, values, state_pred, dones, cache
 
 # RSM Norm (not to be confused with RMSNorm from transformers)
 # this was proposed by SimBa https://arxiv.org/abs/2410.09754
@@ -201,6 +217,7 @@ class RSMNorm(Module):
         assert x.shape[-1] == self.dim, f'expected feature dimension of {self.dim} but received {x.shape[-1]}'
 
         time = self.step.item()
+
         mean = self.running_mean
         variance = self.running_variance
 
@@ -382,6 +399,7 @@ class PPO(Module):
             rewards,
             is_boundaries,
             values,
+            dones
         ) = zip(*memories)
         
         actions = tensor(actions).to(device)
@@ -411,11 +429,12 @@ class PPO(Module):
         states = to_torch_tensor(states)
         old_values = to_torch_tensor(values)
         old_log_probs = to_torch_tensor(old_log_probs)
+        dones = to_torch_tensor(dones)
 
         # prepare dataloader for policy phase training
 
         episodes = tensor(episodes).to(device)
-        data = (episodes, states, actions, rewards, old_log_probs, returns, old_values)
+        data = (episodes, states, actions, rewards, old_log_probs, returns, old_values, dones)
 
         # world model embeds
 
@@ -425,7 +444,7 @@ class PPO(Module):
 
         world_model = self.world_model
 
-        episodes, states, actions, rewards, old_log_probs, returns, old_values = data
+        episodes, states, actions, rewards, old_log_probs, returns, old_values, dones = data
         max_episode = episodes.amax().item()
 
         seq_arange = torch.arange(episodes.shape[0], device = episodes.device) + 1
@@ -444,14 +463,16 @@ class PPO(Module):
             rewards_per_episode,
             old_log_probs_per_episode,
             returns_per_episode,
-            old_values_per_episode
+            old_values_per_episode,
+            dones_per_episode
         ) = tuple(pad_sequence(t.split(splits, dim = 0)) for t in (
             states,
             actions,
             rewards,
             old_log_probs,
             returns,
-            old_values
+            old_values,
+            dones
         ))
 
         # transformer world model is trained on all states per episode all at once
@@ -464,6 +485,7 @@ class PPO(Module):
             old_log_probs_per_episode,
             returns_per_episode,
             old_values_per_episode,
+            dones_per_episode,
             episode_lens
         )
 
@@ -482,6 +504,7 @@ class PPO(Module):
                 old_log_probs,
                 returns,
                 old_values,
+                dones,
                 episode_lens
              ) in world_model_dl:
 
@@ -498,15 +521,24 @@ class PPO(Module):
                     self.rsmnorm.eval()
                     states_with_rewards = self.rsmnorm(states_with_rewards)
 
-                action_probs, values, state_and_reward_pred, _ = world_model(
+                action_probs, values, state_and_reward_pred, done_pred, _ = world_model(
                     states_with_rewards,
                     actions = prev_actions,
                     next_actions = actions, # prediction of the next state needs to be conditioned on the agent's chosen action on that state, and will make the world model interactable
-                    mask = mask
+                    mask = mask,
+                    return_pred_dones = True
                 )
 
+                ar_mask = mask[:, :-1]
+
                 pred_mean, pred_var = state_and_reward_pred[..., :-1, :]
-                world_model_loss = F.gaussian_nll_loss(pred_mean, states_with_rewards[:, 1:], pred_var)
+                world_model_loss = F.gaussian_nll_loss(pred_mean, states_with_rewards[:, 1:], pred_var, reduction = 'none')
+                world_model_loss = world_model_loss[ar_mask]
+
+                # predicting termination head
+
+                pred_done_loss = F.binary_cross_entropy(done_pred[:, :-1], dones[:, 1:].float(), reduction = 'none')
+                pred_done_loss = pred_done_loss[ar_mask]
 
                 # update actor and critic
 
@@ -672,7 +704,7 @@ def main(
             prev_action = rearrange(prev_action, ' -> 1 1')
             prev_reward = rearrange(prev_reward, ' -> 1 1')
 
-            action_probs, values, _, world_model_cache = world_model.forward_eval(
+            action_probs, values, _, _, world_model_cache = world_model.forward_eval(
                 world_model_input,
                 cache = world_model_cache,
                 actions = prev_action
@@ -702,7 +734,8 @@ def main(
             prev_action = action
             prev_reward = tensor(reward).to(device) # from the xval paper, we know pre-norm transformers can handle scaled tokens https://arxiv.org/abs/2310.02989
 
-            memory = Memory(tensor(eps), state, action_item, action_log_prob, reward, terminated, value)
+            dones_signal = tensor([terminated, truncated])
+            memory = Memory(tensor(eps), state, action_item, action_log_prob, reward, terminated, value, dones_signal)
 
             memories.append(memory)
 
