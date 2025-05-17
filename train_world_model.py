@@ -455,7 +455,7 @@ class PPO(Module):
         ))
 
         # transformer world model is trained on all states per episode all at once
-        # will slowly incorporate rewards and other ssl objectives
+        # will slowly incorporate other ssl objectives + regularizations from the transformer field
 
         world_model_dataset = TensorDataset(
             states_per_episode,
