@@ -291,23 +291,23 @@ class PPO(Module):
         eps_clip,
         value_clip,
         ema_decay,
-        world_model_dim = 64,
+        world_model_dim = 48,
         world_model: dict = dict(
             attn_dim_head = 16,
             heads = 4,
             depth = 4,
-            num_residual_streams = 2,
+            attn_gate_values = True,
             add_value_residual = True,
             learned_value_residual_mix = True
         ),
         world_model_lr = 1e-3,
-        world_model_batch_size = 8,
-        world_model_epochs = 10,
+        world_model_batch_size = 4,
+        world_model_epochs = 4,
         world_model_dropout = 0.25,
         world_model_max_grad_norm = 0.5,
-        frac_actor_critic_head_gradient = 0.25,
+        frac_actor_critic_head_gradient = 0.5,
         ema_kwargs: dict = dict(
-            update_model_with_ema_every = 500
+            update_model_with_ema_every = 1250
         ),
         save_path = './ppo.pt'
     ):
@@ -532,16 +532,14 @@ class PPO(Module):
                     return_pred_dones = True
                 )
 
-                ar_mask = mask[:, :-1]
-
-                pred_mean, pred_var = state_and_reward_pred[..., :-1, :]
+                pred_mean, pred_var = state_and_reward_pred[..., :-1, :] # todo: fix truncation scenario
                 world_model_loss = F.gaussian_nll_loss(pred_mean, states_with_rewards[:, 1:], pred_var, reduction = 'none')
-                world_model_loss = world_model_loss[ar_mask]
+                world_model_loss = world_model_loss[mask[:, :-1]]
 
                 # predicting termination head
 
-                pred_done_loss = F.binary_cross_entropy(done_pred[:, :-1], dones[:, 1:].float(), reduction = 'none')
-                pred_done_loss = pred_done_loss[ar_mask]
+                pred_done_loss = F.binary_cross_entropy(done_pred, dones.float(), reduction = 'none')
+                pred_done_loss = pred_done_loss[mask]
 
                 # update actor and critic
 
