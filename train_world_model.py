@@ -295,7 +295,10 @@ class PPO(Module):
         world_model: dict = dict(
             attn_dim_head = 16,
             heads = 4,
-            depth = 4
+            depth = 4,
+            num_residual_streams = 2,
+            add_value_residual = True,
+            learned_value_residual_mix = True
         ),
         world_model_lr = 1e-3,
         world_model_batch_size = 8,
