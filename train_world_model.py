@@ -244,6 +244,7 @@ class RSMNorm(Module):
 
 # GAE
 
+@torch.no_grad()
 def calc_gae(
     rewards,
     values,
@@ -256,7 +257,7 @@ def calc_gae(
     use_accelerated = default(use_accelerated, rewards.is_cuda)
 
     values = F.pad(values, (0, 1), value = 0.)
-    values, values_next = values[:-1], values[1:]
+    values, values_next = values[..., :-1], values[..., 1:]
 
     delta = rewards + gamma * values_next * masks - values
     gates = gamma * lam * masks
@@ -291,7 +292,7 @@ class PPO(Module):
         eps_clip,
         value_clip,
         ema_decay,
-        world_model_dim = 48,
+        hidden_dim = 48,
         world_model: dict = dict(
             attn_dim_head = 16,
             heads = 4,
@@ -300,11 +301,8 @@ class PPO(Module):
             add_value_residual = True,
             learned_value_residual_mix = True
         ),
-        world_model_lr = 1e-3,
-        world_model_batch_size = 4,
-        world_model_epochs = 4,
-        world_model_dropout = 0.25,
-        world_model_max_grad_norm = 0.5,
+        dropout = 0.25,
+        max_grad_norm = 0.5,
         frac_actor_critic_head_gradient = 0.5,
         ema_kwargs: dict = dict(
             update_model_with_ema_every = 1250
@@ -313,11 +311,11 @@ class PPO(Module):
     ):
         super().__init__()
 
-        self.world_model_dim = world_model_dim
+        self.model_dim = hidden_dim
 
         state_and_reward_dim = state_dim + 1
 
-        self.world_model = OneModelWrapper(
+        self.model = OneModelWrapper(
             num_actions = num_actions,
             critic_dim_pred = critic_pred_num_bins,
             dim_pred_state = state_and_reward_dim,
@@ -327,10 +325,10 @@ class PPO(Module):
                 max_seq_len = max_timesteps,
                 probabilistic = True,
                 attn_layers = Decoder(
-                    dim = world_model_dim,
+                    dim = hidden_dim,
                     rotary_pos_emb = True,
-                    attn_dropout = world_model_dropout,
-                    ff_dropout = world_model_dropout,
+                    attn_dropout = dropout,
+                    ff_dropout = dropout,
                     **world_model
                 )
             )
@@ -351,15 +349,13 @@ class PPO(Module):
             clamp_to_range = True
         )
 
-        self.ema_world_model = EMA(self.world_model, beta = ema_decay, include_online_model = False, **ema_kwargs)
+        self.ema_model = EMA(self.model, beta = ema_decay, include_online_model = False, **ema_kwargs)
 
-        self.opt_world_model = AdoptAtan2(self.world_model.parameters(), lr = world_model_lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
+        self.optimizer = AdoptAtan2(self.model.parameters(), lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
 
-        self.world_model_batch_size = world_model_batch_size
-        self.world_model_epochs = world_model_epochs
-        self.world_model_max_grad_norm = world_model_max_grad_norm
+        self.max_grad_norm = max_grad_norm
 
-        self.ema_world_model.add_to_optimizer_post_step_hook(self.opt_world_model)
+        self.ema_model.add_to_optimizer_post_step_hook(self.optimizer)
 
         # learning hparams
 
@@ -378,7 +374,7 @@ class PPO(Module):
 
     def save(self):
         torch.save({
-            'model': self.world_model.state_dict(),
+            'model': self.model.state_dict(),
         }, str(self.save_path))
 
     def load(self):
@@ -387,12 +383,24 @@ class PPO(Module):
 
         data = torch.load(str(self.save_path), weights_only = True)
 
-        self.world_model.load_state_dict(data['model'])
+        self.model.load_state_dict(data['model'])
 
-    def learn(self, memories):
+    def learn(self, memories, episode_lens):
+
+        model = self.model
         hl_gauss = self.critic_hl_gauss_loss
 
-        # retrieve and prepare data from memory for training
+        # retrieve and prepare data from memory for training - list[list[Memory]]
+
+        def stack_and_to_device(t):
+            return stack(t).to(device)
+
+        def stack_memories(episode_memories):
+            return tuple(map(stack_and_to_device, zip(*episode_memories)))
+
+        memories = map(stack_memories, memories)
+
+        episode_lens = episode_lens.to(device)
 
         (
             episodes,
@@ -403,103 +411,45 @@ class PPO(Module):
             is_boundaries,
             values,
             dones
-        ) = zip(*memories)
-        
-        actions = tensor(actions).to(device)
-        rewards = tensor(rewards).to(device)
-        masks = tensor([(1. - float(is_boundary)) for is_boundary in is_boundaries]).to(device)
+        ) = tuple(map(pad_sequence, zip(*memories)))
+
+        masks = ~is_boundaries
 
         # calculate generalized advantage estimate
 
-        scalar_values = hl_gauss(stack(values))
+        scalar_values = hl_gauss(values)
 
-        with torch.no_grad():
+        returns = calc_gae(
+            rewards = rewards,            
+            masks = masks,
+            lam = self.lam,
+            gamma = self.gamma,
+            values = scalar_values,
+            use_accelerated = False
+        )
 
-            calc_gae_from_values = partial(calc_gae,
-                rewards = rewards,
-                masks = masks,
-                lam = self.lam,
-                gamma = self.gamma,
-                use_accelerated = False
-            )
+        # transformer world model is trained on all states per episode all at once
+        # will slowly incorporate other ssl objectives + regularizations from the transformer field
 
-            returns = calc_gae_from_values(values = scalar_values)
-
-        # convert values to torch tensors
-
-        to_torch_tensor = lambda t: stack(t).to(device).detach()
-
-        states = to_torch_tensor(states)
-        old_values = to_torch_tensor(values)
-        old_log_probs = to_torch_tensor(old_log_probs)
-        dones = to_torch_tensor(dones)
-
-        # prepare dataloader for policy phase training
-
-        episodes = tensor(episodes).to(device)
-        data = (episodes, states, actions, rewards, old_log_probs, returns, old_values, dones)
-
-        # world model embeds
-
-        data = tuple(t[episodes >= 0] for t in data)
-
-        # learn the world model
-
-        world_model = self.world_model
-
-        episodes, states, actions, rewards, old_log_probs, returns, old_values, dones = data
-        max_episode = episodes.amax().item()
-
-        seq_arange = torch.arange(episodes.shape[0], device = episodes.device) + 1
-        episodes = F.pad(episodes, (0, 1), value = max_episode + 1)
-
-        boundary_mask = (episodes[1:] - episodes[:-1]).bool()
-        cum_episode_lens = seq_arange[boundary_mask]
-
-        cum_episode_lens = F.pad(cum_episode_lens, (1, 0), value = 0)
-        episode_lens = cum_episode_lens[1:] - cum_episode_lens[:-1]
-        splits = episode_lens.tolist()
-
-        (
-            states_per_episode,
-            actions_per_episode,
-            rewards_per_episode,
-            old_log_probs_per_episode,
-            returns_per_episode,
-            old_values_per_episode,
-            dones_per_episode
-        ) = tuple(pad_sequence(t.split(splits, dim = 0)) for t in (
+        dataset = TensorDataset(
             states,
             actions,
             rewards,
             old_log_probs,
             returns,
-            old_values,
-            dones
-        ))
-
-        # transformer world model is trained on all states per episode all at once
-        # will slowly incorporate other ssl objectives + regularizations from the transformer field
-
-        world_model_dataset = TensorDataset(
-            states_per_episode,
-            actions_per_episode,
-            rewards_per_episode,
-            old_log_probs_per_episode,
-            returns_per_episode,
-            old_values_per_episode,
-            dones_per_episode,
+            values,
+            dones,
             episode_lens
         )
 
-        world_model_dl = DataLoader(world_model_dataset, batch_size = self.world_model_batch_size, shuffle = True)
+        dl = DataLoader(dataset, batch_size = self.minibatch_size, shuffle = True)
 
-        world_model.train()
+        model.train()
 
         rsmnorm_copy = deepcopy(self.rsmnorm) # learn the state normalization alongside in a copy of the state norm module, copy back at the end
         rsmnorm_copy.train()
 
-        for _ in range(self.world_model_epochs):
+        for _ in range(self.epochs):
             for (
                 states,
                 actions,
@@ -509,7 +459,7 @@ class PPO(Module):
                 old_values,
                 dones,
                 episode_lens
-             ) in world_model_dl:
+             ) in dl:
 
                 seq = torch.arange(states.shape[1], device = device)
                 mask = einx.less('n, b -> b n', seq, episode_lens)
@@ -524,7 +474,7 @@ class PPO(Module):
                     self.rsmnorm.eval()
                     states_with_rewards = self.rsmnorm(states_with_rewards)
 
-                action_probs, values, state_and_reward_pred, done_pred, _ = world_model(
+                action_probs, values, state_and_reward_pred, done_pred, _ = model(
                     states_with_rewards,
                     actions = prev_actions,
                     next_actions = actions, # prediction of the next state needs to be conditioned on the agent's chosen action on that state, and will make the world model interactable
@@ -588,10 +538,10 @@ class PPO(Module):
                 loss = world_model_loss.mean() + actor_critic_loss.mean()
                 loss.backward()
 
-                torch.nn.utils.clip_grad_norm_(world_model.parameters(), self.world_model_max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), self.max_grad_norm)
 
-                self.opt_world_model.step()
-                self.opt_world_model.zero_grad()
+                self.optimizer.step()
+                self.optimizer.zero_grad()
 
                 rsmnorm_copy(states_with_rewards[mask])
 
@@ -605,7 +555,8 @@ def main(
     max_timesteps = 500,
     critic_pred_num_bins = 100,
     reward_range = (-100, 100),
-    minibatch_size = 64,
+    minibatch_size = 8,
+    update_episodes = 64,
     lr = 0.0008,
     betas = (0.9, 0.99),
     lam = 0.95,
@@ -615,17 +566,18 @@ def main(
     beta_s = .01,
     regen_reg_rate = 1e-4,
     cautious_factor = 0.1,
-    ema_decay = 0.9,
-    update_timesteps = 5000,
-    epochs = 2,
-    seed = None,
     render = True,
+    clear_videos = True,
+    epochs = 4,
+    ema_decay = 0.9,
+    seed = None,
     render_every_eps = 250,
     save_every = 1000,
-    clear_videos = True,
     video_folder = './lunar-recording',
     load = False,
 ):
+    assert divisible_by(update_episodes, minibatch_size)
+
     env = gym.make(env_name, render_mode = 'rgb_array')
 
     if render:
@@ -644,6 +596,7 @@ def main(
     num_actions = env.action_space.n
 
     memories = deque([])
+    episode_lens = []
 
     agent = PPO(
         state_dim,
@@ -676,9 +629,11 @@ def main(
     num_policy_updates = 0
 
     agent.eval()
-    world_model = agent.ema_world_model
+    model = agent.ema_model
 
     for eps in tqdm(range(num_episodes), desc = 'episodes'):
+
+        one_episode_memories = deque([])
 
         eps_tensor = tensor(eps)
 
@@ -699,14 +654,14 @@ def main(
             agent.rsmnorm.eval()
             normed_state = agent.rsmnorm(state_with_reward)
 
-            world_model.eval()
+            model.eval()
 
-            world_model_input = rearrange(normed_state, 'd -> 1 1 d')
+            normed_state = rearrange(normed_state, 'd -> 1 1 d')
             prev_action = rearrange(prev_action, ' -> 1 1')
             prev_reward = rearrange(prev_reward, ' -> 1 1')
 
-            action_probs, values, _, _, world_model_cache = world_model.forward_eval(
-                world_model_input,
+            action_probs, values, _, _, world_model_cache = model.forward_eval(
+                normed_state,
                 cache = world_model_cache,
                 actions = prev_action
             )
@@ -724,9 +679,7 @@ def main(
             action = dist.sample()
             action_log_prob = dist.log_prob(action)
 
-            action_item = action.item()
-
-            next_state, reward, terminated, truncated, _ = env.step(action_item)
+            next_state, reward, terminated, truncated, _ = env.step(action.item())
 
             next_state = torch.from_numpy(next_state).to(device)
 
@@ -736,16 +689,15 @@ def main(
             prev_reward = tensor(reward).to(device) # from the xval paper, we know pre-norm transformers can handle scaled tokens https://arxiv.org/abs/2310.02989
 
             dones_signal = tensor([terminated, truncated])
-            memory = Memory(tensor(eps), state, action_item, action_log_prob, reward, terminated, value, dones_signal)
+            memory = Memory(tensor(eps), state, action, action_log_prob, tensor(reward), tensor(terminated), value, dones_signal)
 
-            memories.append(memory)
+            one_episode_memories.append(memory)
 
             state = next_state
 
-            # determine if truncating, either from environment or learning phase of the agent
+            # determine if truncating or terminated
 
-            updating_agent = divisible_by(time, update_timesteps)
-            done = terminated or truncated or updating_agent
+            done = terminated or truncated
 
             # take care of truncated by adding a non-learnable memory storing the next value for GAE
 
@@ -755,23 +707,31 @@ def main(
                 bootstrap_value_memory = memory._replace(
                     state = state,
                     eps = tensor(-1),
-                    is_boundary = True,
+                    is_boundary = tensor(True),
                     value = next_value
                 )
 
                 memories.append(bootstrap_value_memory)
 
-            # updating of the agent
-
-            if updating_agent:
-                agent.learn(memories)
-                num_policy_updates += 1
-                memories.clear()
-
             # break if done
 
             if done:
+                episode_lens.append(time)
                 break
+
+        # add list[Memory] to all episode memories list[list[Memory]]
+
+        memories.append(one_episode_memories)
+
+        # updating of the agent
+
+        if divisible_by(len(memories), update_episodes):
+
+            agent.learn(memories, tensor(episode_lens))
+            num_policy_updates += 1
+
+            memories.clear()
+            episode_lens.clear()
 
         if divisible_by(eps, save_every):
             agent.save()
