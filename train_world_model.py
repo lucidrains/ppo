@@ -716,8 +716,9 @@ def main(
             # break if done
 
             if done:
-                episode_lens.append(time)
                 break
+
+        episode_lens.append(timestep + 1)
 
         # add list[Memory] to all episode memories list[list[Memory]]
 
