@@ -94,16 +94,20 @@ def temp_batch_dim(fn):
 
     return inner
 
-# a wrapper to slowly absorb actor / critic / world model into one, will just call it OneModelWrapper
+# world model + actor / critic in one
 
-class OneModelWrapper(Module):
+class WorldModelActorCritic(Module):
     def __init__(
         self,
         transformer: Module,
         num_actions,
         critic_dim_pred,
+        critic_min_max_value: tuple[float, float],
         dim_pred_state,
         frac_actor_critic_head_gradient = 0.5,
+        entropy_weight = 0.02,
+        eps_clip = 0.2,
+        value_clip = 0.4
     ):
         super().__init__()
         self.transformer = transformer
@@ -131,6 +135,15 @@ class OneModelWrapper(Module):
             nn.Linear(dim * 2, critic_dim_pred)
         )
 
+         # https://arxiv.org/abs/2403.03950
+
+        self.critic_hl_gauss_loss = HLGaussLoss(
+            min_value = critic_min_max_value[0],
+            max_value = critic_min_max_value[1],
+            num_bins = critic_dim_pred,
+            clamp_to_range = True
+        )
+
         self.action_head = nn.Sequential(
             nn.Linear(dim, dim * 2),
             nn.SiLU(),
@@ -139,6 +152,88 @@ class OneModelWrapper(Module):
         )
 
         self.frac_actor_critic_head_gradient = frac_actor_critic_head_gradient
+
+        # ppo loss related
+
+        self.eps_clip = eps_clip
+        self.entropy_weight = entropy_weight
+
+        # clipped value loss related
+
+        self.value_clip = value_clip
+
+    def compute_autoregressive_loss(
+        self,
+        pred,
+        real
+    ):
+        pred_mean, pred_var = pred[..., :-1, :] # todo: fix truncation scenario
+        return F.gaussian_nll_loss(pred_mean, real[:, 1:], pred_var, reduction = 'none')
+
+    def compute_done_loss(
+        self,
+        done_pred,
+        dones
+    ):
+        return F.binary_cross_entropy(done_pred, dones.float(), reduction = 'none')
+
+    def compute_actor_loss(
+        self,
+        action_probs,
+        actions,
+        old_log_probs,
+        returns,
+        old_values
+    ):
+        dist = Categorical(action_probs)
+        action_log_probs = dist.log_prob(actions)
+        entropy = dist.entropy()
+
+        scalar_old_values = self.critic_hl_gauss_loss(old_values)
+
+        # calculate clipped surrogate objective, classic PPO loss
+
+        ratios = (action_log_probs - old_log_probs).exp()
+
+        advantages = normalize(returns - scalar_old_values.detach())
+
+        surr1 = ratios * advantages
+        surr2 = ratios.clamp(1 - self.eps_clip, 1 + self.eps_clip) * advantages
+        actor_loss = - torch.min(surr1, surr2) - self.entropy_weight * entropy
+        return actor_loss
+
+    def compute_critic_loss(
+        self,
+        values,
+        returns,
+        old_values
+    ):
+        clip, hl_gauss = self.value_clip, self.critic_hl_gauss_loss
+
+        scalar_old_values = hl_gauss(old_values)
+        scalar_values = hl_gauss(values)
+
+        # using the proposal from https://www.authorea.com/users/855021/articles/1240083-on-analysis-of-clipped-critic-loss-in-proximal-policy-gradient
+
+        clipped_returns = returns.clamp(-clip, clip)
+
+        clipped_loss = hl_gauss(values, clipped_returns)
+        loss = hl_gauss(values, returns)
+
+        old_values_lo = scalar_old_values - clip
+        old_values_hi = scalar_old_values + clip
+
+        def is_between(mid, lo, hi):
+            return (lo < mid) & (mid < hi)
+
+        critic_loss = torch.where(
+            is_between(scalar_values, returns, old_values_lo) |
+            is_between(scalar_values, old_values_hi, returns),
+            0.,
+            torch.min(loss, clipped_loss)
+        )
+
+        return critic_loss
 
     def forward(
         self,
@@ -315,10 +410,14 @@ class PPO(Module):
 
         state_and_reward_dim = state_dim + 1
 
-        self.model = OneModelWrapper(
+        self.model = WorldModelActorCritic(
             num_actions = num_actions,
             critic_dim_pred = critic_pred_num_bins,
+            critic_min_max_value = reward_range,
             dim_pred_state = state_and_reward_dim,
+            entropy_weight = beta_s,
+            eps_clip = eps_clip,
+            value_clip = value_clip,
             transformer = ContinuousTransformerWrapper(
                 dim_in = state_and_reward_dim,
                 dim_out = None,
@@ -339,15 +438,6 @@ class PPO(Module):
         # state + reward normalization
 
         self.rsmnorm = RSMNorm(state_dim + 1)
-
-        # https://arxiv.org/abs/2403.03950
-
-        self.critic_hl_gauss_loss = HLGaussLoss(
-            min_value = reward_range[0],
-            max_value = reward_range[1],
-            num_bins = critic_pred_num_bins,
-            clamp_to_range = True
-        )
 
         self.ema_model = EMA(self.model, beta = ema_decay, include_online_model = False, **ema_kwargs)
 
@@ -388,7 +478,7 @@ class PPO(Module):
     def learn(self, memories, episode_lens):
 
         model = self.model
-        hl_gauss = self.critic_hl_gauss_loss
+        hl_gauss = self.model.critic_hl_gauss_loss
 
         # retrieve and prepare data from memory for training - list[list[Memory]]
 
@@ -474,7 +564,7 @@ class PPO(Module):
                     self.rsmnorm.eval()
                     states_with_rewards = self.rsmnorm(states_with_rewards)
 
-                action_probs, values, state_and_reward_pred, done_pred, _ = model(
+                action_probs, values, states_with_rewards_pred, done_pred, _ = model(
                     states_with_rewards,
                     actions = prev_actions,
                     next_actions = actions, # prediction of the next state needs to be conditioned on the agent's chosen action on that state, and will make the world model interactable
@@ -482,60 +572,41 @@ class PPO(Module):
                     return_pred_dones = True
                 )
 
-                pred_mean, pred_var = state_and_reward_pred[..., :-1, :] # todo: fix truncation scenario
-                world_model_loss = F.gaussian_nll_loss(pred_mean, states_with_rewards[:, 1:], pred_var, reduction = 'none')
+                # autoregressive loss for transformer world modeling - there's nothing better atm, even if deficient
+
+                world_model_loss = model.compute_autoregressive_loss(
+                    states_with_rewards_pred,
+                    states_with_rewards
+                )
+
                 world_model_loss = world_model_loss[mask[:, :-1]]
 
                 # predicting termination head
 
-                pred_done_loss = F.binary_cross_entropy(done_pred, dones.float(), reduction = 'none')
+                pred_done_loss = model.compute_done_loss(done_pred, dones)
                 pred_done_loss = pred_done_loss[mask]
 
                 # update actor and critic
 
-                dist = Categorical(action_probs)
-                action_log_probs = dist.log_prob(actions)
-                entropy = dist.entropy()
-
-                scalar_old_values = hl_gauss(old_values)
-
-                # calculate clipped surrogate objective, classic PPO loss
-
-                ratios = (action_log_probs - old_log_probs).exp()
-
-                advantages = normalize(returns - scalar_old_values.detach())
-
-                surr1 = ratios * advantages
-                surr2 = ratios.clamp(1 - self.eps_clip, 1 + self.eps_clip) * advantages
-                actor_loss = - torch.min(surr1, surr2) - self.beta_s * entropy
-
-                clip = self.value_clip
-
-                scalar_values = hl_gauss(values)
-
-                # using the proposal from https://www.authorea.com/users/855021/articles/1240083-on-analysis-of-clipped-critic-loss-in-proximal-policy-gradient
-
-                clipped_returns = returns.clamp(-clip, clip)
-
-                clipped_loss = hl_gauss(values, clipped_returns)
-                loss = hl_gauss(values, returns)
-
-                old_values_lo = scalar_old_values - clip
-                old_values_hi = scalar_old_values + clip
-
-                def is_between(mid, lo, hi):
-                    return (lo < mid) & (mid < hi)
-
-                critic_loss = torch.where(
-                    is_between(scalar_values, returns, old_values_lo) |
-                    is_between(scalar_values, old_values_hi, returns),
-                    0.,
-                    torch.min(loss, clipped_loss)
+                actor_loss = model.compute_actor_loss(
+                    action_probs,
+                    actions,
+                    old_log_probs,
+                    returns,
+                    old_values
                 )
+
+                critic_loss = model.compute_critic_loss(
+                    values,
+                    returns,
+                    old_values,
+                )
+
+                # add world modeling loss + ppo actor / critic loss
 
                 actor_critic_loss = (actor_loss + critic_loss)[mask]
 
-                loss = world_model_loss.mean() + actor_critic_loss.mean()
+                loss = world_model_loss.mean() + actor_critic_loss.mean() + pred_done_loss.mean()
                 loss.backward()
 
                 torch.nn.utils.clip_grad_norm_(model.parameters(), self.max_grad_norm)
