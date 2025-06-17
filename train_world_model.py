@@ -734,6 +734,7 @@ def main(
             action_probs, values, _, _, world_model_cache = model.forward_eval(
                 normed_state,
                 cache = world_model_cache,
+                input_not_include_cache = True,
                 actions = prev_action
             )
 
