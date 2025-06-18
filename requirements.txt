@@ -7,7 +7,7 @@ ema-pytorch>=0.7.3
 fire
 lion-pytorch
 hl-gauss-pytorch>=0.1.15
-hyper-connections>=0.0.6
+hyper-connections>=0.2.0
 gymnasium[box2d]>=1.0.0
 moviepy>=1.0.3
 numpy>=2.2.5
