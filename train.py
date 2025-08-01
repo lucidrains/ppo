@@ -571,7 +571,7 @@ class PPO(Module):
 
                     # using the proposal from https://www.authorea.com/users/855021/articles/1240083-on-analysis-of-clipped-critic-loss-in-proximal-policy-gradient
 
-                    clipped_returns = returns.clamp(-clip, clip)
+                    clipped_returns = returns.clamp(scalar_old_values - clip, scalar_old_values + clip)
 
                     clipped_loss = hl_gauss(values, clipped_returns)
                     loss = hl_gauss(values, returns)
