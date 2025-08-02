@@ -81,7 +81,7 @@ class RSMNorm(Module):
         # equation (3) in https://arxiv.org/abs/2410.09754
         super().__init__()
         self.dim = dim
-        self.eps = 1e-5
+        self.eps = eps
 
         self.register_buffer('step', tensor(1))
         self.register_buffer('running_mean', torch.zeros(dim))
@@ -372,6 +372,7 @@ class PPO(Module):
         eps_clip,
         value_clip,
         ema_decay,
+        use_spo = False,
         ema_kwargs: dict = dict(
             update_model_with_ema_every = 1000
         ),
@@ -434,6 +435,8 @@ class PPO(Module):
         self.spectral_entropy_reg = spectral_entropy_reg
         self.apply_spectral_entropy_every = apply_spectral_entropy_every
         self.spectral_entropy_reg_weight = spectral_entropy_reg_weight
+
+        self.use_spo = use_spo
 
         self.save_path = Path(save_path)
 
@@ -549,9 +552,18 @@ class PPO(Module):
                     post_advantages = normalize(post_returns - scalar_old_post_values.detach())
                     advantages = torch.max(advantages, post_advantages)
 
-                surr1 = ratios * advantages
-                surr2 = ratios.clamp(1 - self.eps_clip, 1 + self.eps_clip) * advantages
-                policy_loss = - torch.min(surr1, surr2) - self.beta_s * entropy
+                if self.use_spo:
+                    # Xie et al. https://arxiv.org/abs/2401.16025v9 line 14 of Algorithm 1
+                    policy_loss = -(
+                        ratios * advantages -
+                        (advantages.abs() * (ratios - 1.).square()) / (2 * self.eps_clip)
+                    )
+                else:
+                    surr1 = ratios * advantages
+                    surr2 = ratios.clamp(1 - self.eps_clip, 1 + self.eps_clip) * advantages
+                    policy_loss = - torch.min(surr1, surr2)
+
+                policy_loss = policy_loss - self.beta_s * entropy
 
                 policy_loss = policy_loss + simba_orthogonal_loss(self.actor)
 
@@ -573,8 +585,8 @@ class PPO(Module):
 
                     clipped_returns = returns.clamp(scalar_old_values - clip, scalar_old_values + clip)
 
-                    clipped_loss = hl_gauss(values, clipped_returns)
-                    loss = hl_gauss(values, returns)
+                    clipped_loss = hl_gauss(values, clipped_returns, reduction = 'none')
+                    loss = hl_gauss(values, returns, reduction = 'none')
 
                     old_values_lo = scalar_old_values - clip
                     old_values_hi = scalar_old_values + clip
@@ -616,8 +628,8 @@ def main(
     max_timesteps = 500,
     actor_hidden_dim = 64,
     critic_hidden_dim = 256,
-    critic_pred_num_bins = 100,
-    reward_range = (-100, 100),
+    critic_pred_num_bins = 250,
+    reward_range = (-100., 100.),
     minibatch_size = 64,
     lr = 0.0008,
     betas = (0.9, 0.99),
@@ -627,6 +639,7 @@ def main(
     value_clip = 0.4,
     beta_s = .01,
     regen_reg_rate = 1e-4,
+    use_spo = False,
     use_post_decision_critic = True,
     spectral_entropy_reg = False,
     apply_spectral_entropy_every = 4,
@@ -685,6 +698,7 @@ def main(
         eps_clip,
         value_clip,
         ema_decay,
+        use_spo
     ).to(device)
 
     if load:
@@ -699,7 +713,7 @@ def main(
 
     for eps in tqdm(range(num_episodes), desc = 'episodes'):
 
-        state, info = env.reset(seed = seed)
+        state, _ = env.reset(seed = seed)
         state = torch.from_numpy(state).to(device)
 
         for timestep in range(max_timesteps):

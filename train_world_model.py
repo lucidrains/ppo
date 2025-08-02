@@ -217,8 +217,8 @@ class WorldModelActorCritic(Module):
 
         clipped_returns = returns.clamp(scalar_old_values - clip, scalar_old_values + clip)
 
-        clipped_loss = hl_gauss(values, clipped_returns)
-        loss = hl_gauss(values, returns)
+        clipped_loss = hl_gauss(values, clipped_returns, reduction = 'none')
+        loss = hl_gauss(values, returns, reduction = 'none')
 
         old_values_lo = scalar_old_values - clip
         old_values_hi = scalar_old_values + clip
