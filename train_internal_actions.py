@@ -123,9 +123,11 @@ class RSMNorm(Module):
 class SoLU(Module):
     def __init__(
         self,
+        dim,
         softmax_segments = 3,
     ):
         super().__init__()
+        self.norm = nn.LayerNorm(dim, bias = False)
         self.softmax_segments = softmax_segments
 
     def forward(self, x, actions = None):
@@ -134,15 +136,17 @@ class SoLU(Module):
         prob = logits.softmax(dim = -1)
         prob = rearrange(prob, '... segments d -> ... (segments d)')
 
-        return x * prob, (None, None)
+        return self.norm(x * prob), (None, None)
 
 class GumbelSoLU(Module):
     def __init__(
         self,
+        dim,
         softmax_segments = 3,
     ):
         super().__init__()
         self.softmax_segments = softmax_segments
+        self.norm = nn.LayerNorm(dim, bias = False)
 
     def forward(self, x, actions = None):
 
@@ -157,7 +161,7 @@ class GumbelSoLU(Module):
             one_hot = one_hot + prob - prob.detach()
 
         one_hot = rearrange(one_hot, '... segments d -> ... (segments d)')
-        output = x * one_hot
+        output = self.norm(x * one_hot)
 
         return output, (logits, actions)
 
@@ -177,7 +181,7 @@ class FeedForward(Module):
             nn.Linear(dim, dim_inner),
         )
 
-        self.activation = GumbelSoLU(expansion_factor) if gumbel_sample else SoLU()
+        self.activation = GumbelSoLU(dim_inner, expansion_factor) if gumbel_sample else SoLU(dim_inner, expansion_factor)
 
         self.values = nn.Sequential(
             nn.Linear(dim_inner, dim),
@@ -268,7 +272,7 @@ class Actor(Module):
         state_dim,
         hidden_dim,
         num_actions,
-        mlp_depth = 2,
+        mlp_depth = 4,
         dropout = 0.1,
         rsmnorm_input = True  # use the RSMNorm for inputs proposed by KAIST + SonyAI
     ):
