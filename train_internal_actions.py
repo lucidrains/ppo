@@ -5,6 +5,7 @@ from pathlib import Path
 from shutil import rmtree
 from copy import deepcopy
 from functools import partial
+from itertools import zip_longest
 from collections import deque, namedtuple
 from random import randrange
 
@@ -26,8 +27,6 @@ from adam_atan2_pytorch.adopt_atan2 import AdoptAtan2
 
 from hl_gauss_pytorch import HLGaussLoss
 
-from hyper_connections import HyperConnections
-
 from assoc_scan import AssocScan
 
 import gymnasium as gym
@@ -46,6 +45,8 @@ Memory = namedtuple('Memory', [
     'reward',
     'is_boundary',
     'value',
+    'internal_actions',
+    'internal_action_logits'
 ])
 
 # helpers
@@ -204,15 +205,12 @@ class SimBa(Module):
         depth = 3,
         dropout = 0.,
         expansion_factor = 3,
-        num_residual_streams = 4,
         ff_solu_gumbel_sample = False
     ):
         super().__init__()
         """
         following the design of SimBa https://arxiv.org/abs/2410.09754v1
         """
-
-        self.num_residual_streams = num_residual_streams
 
         dim_hidden = default(dim_hidden, dim * expansion_factor)
 
@@ -222,15 +220,9 @@ class SimBa(Module):
 
         dim_inner = dim_hidden * expansion_factor
 
-        # hyper connections
-
-        init_hyper_conn, self.expand_stream, self.reduce_stream = HyperConnections.get_init_and_expand_reduce_stream_functions(1, num_fracs = num_residual_streams, disable = num_residual_streams == 1)
-
         for ind in range(depth):
 
             layer = FeedForward(dim_hidden, expansion_factor, gumbel_sample = ff_solu_gumbel_sample)
-
-            layer = init_hyper_conn(dim = dim_hidden, layer_index = ind, branch = layer)
             layers.append(layer)
 
         # final layer out
@@ -239,7 +231,11 @@ class SimBa(Module):
 
         self.final_norm = nn.RMSNorm(dim_hidden)
 
-    def forward(self, x):
+    def forward(
+        self,
+        x,
+        actions = None
+    ):
         no_batch = x.ndim == 1
 
         if no_batch:
@@ -247,16 +243,17 @@ class SimBa(Module):
 
         x = self.proj_in(x)
 
-        x = self.expand_stream(x)
-
         logits_and_actions = []
 
-        for layer in self.layers:
-            x, one_logits_and_actions = layer(x)
+        if not exists(actions):
+            actions = tuple()
+        else:
+            actions = actions.unbind(dim = 1)
+
+        for layer, layer_actions in zip_longest(self.layers, actions):
+            x, one_logits_and_actions = layer(x, layer_actions)
 
             logits_and_actions.append(one_logits_and_actions)
-
-        x = self.reduce_stream(x)
 
         out = self.final_norm(x)
 
@@ -294,15 +291,20 @@ class Actor(Module):
             nn.Linear(hidden_dim, num_actions)
         )
 
-    def forward(self, x):
+    def forward(
+        self,
+        x,
+        actions = None
+    ):
         with torch.no_grad():
             self.rsmnorm.eval()
             x = self.rsmnorm(x)
 
-        hidden, logits_and_actions = self.net(x)
+        hidden, logits_and_actions = self.net(x, actions = actions)
+
         action_probs = self.action_head(hidden).softmax(dim = -1)
 
-        return action_probs
+        return action_probs, logits_and_actions
 
 class Critic(Module):
     def __init__(
@@ -464,7 +466,9 @@ class PPO(Module):
             old_log_probs,
             rewards,
             is_boundaries,
-            values
+            values,
+            internal_actions,
+            internal_action_logits
         ) = zip(*memories)
         
         actions = [tensor(action) for action in actions]
@@ -494,10 +498,15 @@ class PPO(Module):
         old_values = to_torch_tensor(values)
         old_log_probs = to_torch_tensor(old_log_probs)        
 
+        # internal choices
+
+        internal_actions = to_torch_tensor(internal_actions)
+        old_internal_action_logits = to_torch_tensor(internal_action_logits)
+
         # prepare dataloader for policy phase training
 
         learnable = tensor(learnable).to(device)
-        data = (states, actions, old_log_probs, returns, old_values)
+        data = (states, actions, old_log_probs, returns, old_values, internal_actions)
         data = tuple(t[learnable] for t in data)
 
         dataset = TensorDataset(*data)
@@ -507,9 +516,10 @@ class PPO(Module):
         # policy phase training, similar to original PPO
 
         for _ in range(self.epochs):
-            for i, (states, actions, old_log_probs, returns, old_values) in enumerate(dl):
+            for i, (states, actions, old_log_probs, returns, old_values, internal_actions) in enumerate(dl):
 
-                action_probs = self.actor(states)
+                action_probs, (internal_action_logits, _) = self.actor(states, internal_actions)
+
                 dist = Categorical(action_probs)
                 action_log_probs = dist.log_prob(actions)
                 entropy = dist.entropy()
@@ -659,7 +669,7 @@ def main(
         for timestep in range(max_timesteps):
             time += 1
 
-            action_probs = agent.ema_actor.forward_eval(state)
+            action_probs, internals = agent.ema_actor.forward_eval(state)
             value = agent.ema_critic.forward_eval(state)
 
             dist = Categorical(action_probs)
@@ -673,7 +683,9 @@ def main(
 
             reward = float(reward)
 
-            memory = Memory(True, state, action, action_log_prob, reward, terminated, value)
+            internal_action_logits, internal_actions = tuple(stack(t) for t in zip(*internals))
+
+            memory = Memory(True, state, action, action_log_prob, reward, terminated, value, internal_actions, internal_action_logits)
 
             memories.append(memory)
 
