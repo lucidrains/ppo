@@ -218,8 +218,6 @@ class SimBa(Module):
 
         self.proj_in = nn.Linear(dim, dim_hidden)
 
-        dim_inner = dim_hidden * expansion_factor
-
         for ind in range(depth):
 
             layer = FeedForward(dim_hidden, expansion_factor, gumbel_sample = ff_solu_gumbel_sample)
@@ -390,6 +388,7 @@ class PPO(Module):
         eps_clip,
         value_clip,
         ema_decay,
+        internal_policy_loss_weight = 0.1,
         ema_kwargs: dict = dict(
             update_model_with_ema_every = 1000
         ),
@@ -437,6 +436,7 @@ class PPO(Module):
         self.eps_clip = eps_clip
         self.value_clip = value_clip
 
+        self.internal_policy_loss_weight = internal_policy_loss_weight
         self.save_path = Path(save_path)
 
     def save(self):
@@ -506,7 +506,7 @@ class PPO(Module):
         # prepare dataloader for policy phase training
 
         learnable = tensor(learnable).to(device)
-        data = (states, actions, old_log_probs, returns, old_values, internal_actions)
+        data = (states, actions, old_log_probs, returns, old_values, internal_actions, old_internal_action_logits)
         data = tuple(t[learnable] for t in data)
 
         dataset = TensorDataset(*data)
@@ -516,21 +516,35 @@ class PPO(Module):
         # policy phase training, similar to original PPO
 
         for _ in range(self.epochs):
-            for i, (states, actions, old_log_probs, returns, old_values, internal_actions) in enumerate(dl):
+            for i, (states, actions, old_log_probs, returns, old_values, internal_actions, old_internal_action_logits) in enumerate(dl):
 
-                action_probs, (internal_action_logits, _) = self.actor(states, internal_actions)
+                action_probs, internals = self.actor(states, internal_actions)
+                internal_action_logits = stack(tuple(t[0] for t in internals), dim = 1)
 
                 dist = Categorical(action_probs)
                 action_log_probs = dist.log_prob(actions)
                 entropy = dist.entropy()
 
-                scalar_old_values = hl_gauss(old_values)
+                internal_action_probs = internal_action_logits.softmax(dim = -1)
+                internal_dist = Categorical(internal_action_probs)
+                internal_log_probs = internal_dist.log_prob(internal_actions)
+                internal_entropy = internal_dist.entropy()
+
+                old_internal_action_probs = old_internal_action_logits.softmax(dim = -1)
+                old_internal_dist = Categorical(old_internal_action_probs)
+                old_internal_log_probs = old_internal_dist.log_prob(internal_actions)
+
+                action_log_probs, _ = pack([action_log_probs, internal_log_probs], 'b *')
+                old_log_probs, _ = pack([old_log_probs, old_internal_log_probs], 'b *')
+                entropy, _ = pack([entropy, internal_entropy], 'b * ')
 
                 # calculate clipped surrogate objective, classic PPO loss
 
                 ratios = (action_log_probs - old_log_probs).exp()
 
+                scalar_old_values = hl_gauss(old_values)
                 advantages = normalize(returns - scalar_old_values.detach())
+                advantages = rearrange(advantages, '... -> ... 1')
 
                 surr1 = ratios * advantages
                 surr2 = ratios.clamp(1 - self.eps_clip, 1 + self.eps_clip) * advantages
@@ -538,11 +552,18 @@ class PPO(Module):
 
                 policy_loss = policy_loss - self.beta_s * entropy
 
+                # weigh internal a bit less
+
+                main_loss_weight = torch.ones((1,), device = device)
+                loss_weight = F.pad(main_loss_weight, (0, policy_loss.shape[-1] - 1), value = self.internal_policy_loss_weight)
+
+                policy_loss = (policy_loss * loss_weight).sum(dim = -1)
+
                 update_network_(policy_loss, self.opt_actor)
 
-                clip = self.value_clip
-
                 # calculate clipped value loss and update value network separate from policy network
+
+                clip = self.value_clip
 
                 values = self.critic(states)
 
@@ -683,7 +704,7 @@ def main(
 
             reward = float(reward)
 
-            internal_action_logits, internal_actions = tuple(stack(t) for t in zip(*internals))
+            internal_action_logits, internal_actions = tuple(rearrange(stack(t), 'l 1 ... -> l ...') for t in zip(*internals))
 
             memory = Memory(True, state, action, action_log_prob, reward, terminated, value, internal_actions, internal_action_logits)
 
