@@ -373,6 +373,7 @@ class PPO(Module):
         value_clip,
         ema_decay,
         use_spo = False,
+        asymmetric_spo = False,
         ema_kwargs: dict = dict(
             update_model_with_ema_every = 1000
         ),
@@ -437,6 +438,7 @@ class PPO(Module):
         self.spectral_entropy_reg_weight = spectral_entropy_reg_weight
 
         self.use_spo = use_spo
+        self.asymmetric_spo = asymmetric_spo # https://arxiv.org/abs/2510.06062v1
 
         self.save_path = Path(save_path)
 
@@ -552,16 +554,25 @@ class PPO(Module):
                     post_advantages = normalize(post_returns - scalar_old_post_values.detach())
                     advantages = torch.max(advantages, post_advantages)
 
-                if self.use_spo:
+                if self.use_spo or self.asymmetric_spo:
                     # Xie et al. https://arxiv.org/abs/2401.16025v9 line 14 of Algorithm 1
-                    policy_loss = -(
+                    spo_policy_loss = -(
                         ratios * advantages -
                         (advantages.abs() * (ratios - 1.).square()) / (2 * self.eps_clip)
                     )
-                else:
+
+                if not self.use_spo or self.asymmetric_spo:
                     surr1 = ratios * advantages
                     surr2 = ratios.clamp(1 - self.eps_clip, 1 + self.eps_clip) * advantages
-                    policy_loss = - torch.min(surr1, surr2)
+                    ppo_policy_loss = - torch.min(surr1, surr2)
+
+                if self.asymmetric_spo:
+                    # https://arxiv.org/abs/2510.06062v1
+                    policy_loss = torch.where(advantages > 0, ppo_policy_loss, spo_policy_loss)
+                elif self.use_spo:
+                    policy_loss = spo_policy_loss
+                else:
+                    policy_loss = ppo_policy_loss
 
                 policy_loss = policy_loss - self.beta_s * entropy
 
@@ -640,6 +651,7 @@ def main(
     beta_s = .01,
     regen_reg_rate = 1e-4,
     use_spo = False,
+    asymmetric_spo = False,
     use_post_decision_critic = True,
     spectral_entropy_reg = False,
     apply_spectral_entropy_every = 4,
@@ -698,7 +710,8 @@ def main(
         eps_clip,
         value_clip,
         ema_decay,
-        use_spo
+        use_spo,
+        asymmetric_spo
     ).to(device)
 
     if load:
