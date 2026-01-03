@@ -38,19 +38,6 @@ from memmap_replay_buffer import ReplayBuffer
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-# memory tuple
-
-Memory = namedtuple('Memory', [
-    'learnable',
-    'state',
-    'action',
-    'action_log_prob',
-    'reward',
-    'is_boundary',
-    'value',
-    'past_action'
-])
-
 # helpers
 
 def exists(val):
