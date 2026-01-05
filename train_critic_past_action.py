@@ -26,7 +26,7 @@ from adam_atan2_pytorch.adopt_atan2 import AdoptAtan2
 
 from hl_gauss_pytorch import HLGaussLoss
 
-from hyper_connections import HyperConnections
+from hyper_connections import ManifoldConstrainedHyperConnections
 
 from assoc_scan import AssocScan
 
@@ -141,7 +141,7 @@ class SimBa(Module):
 
         # hyper connections
 
-        init_hyper_conn, self.expand_stream, self.reduce_stream = HyperConnections.get_init_and_expand_reduce_stream_functions(1, num_fracs = num_residual_streams, disable = num_residual_streams == 1)
+        init_hyper_conn, self.expand_stream, self.reduce_stream = ManifoldConstrainedHyperConnections.get_init_and_expand_reduce_stream_functions(1, num_fracs = num_residual_streams)
 
         for ind in range(depth):
 

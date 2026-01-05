@@ -8,7 +8,7 @@ fire
 lion-pytorch
 gymnasium[box2d]>=1.0.0
 hl-gauss-pytorch>=0.1.15
-hyper-connections>=0.2.0
+hyper-connections>=0.3.6
 memmmap-replay-buffer>=0.0.9
 moviepy>=1.0.3
 numpy>=2.2.5
