@@ -107,6 +107,26 @@ class RSMNorm(Module):
 
         return normed
 
+# gradient dropout
+
+class GradientDropout(Module):
+    def __init__(
+        self,
+        strength = 0. # increase for more dropout
+    ):
+        super().__init__()
+        self.strength = strength
+
+    def forward(self, x):
+        if not x.requires_grad or not self.training:
+            return x
+
+        logit = torch.randn_like(x)
+        logit = logit + self.strength
+        mask = logit.sigmoid()
+
+        return x * (1. - mask) + x.detach() * mask
+
 # SimBa - Kaist + SonyAI
 
 class ReluSquared(Module):
@@ -141,7 +161,7 @@ class SimBa(Module):
 
         # hyper connections
 
-        init_hyper_conn, self.expand_stream, self.reduce_stream = ManifoldConstrainedHyperConnections.get_init_and_expand_reduce_stream_functions(1, num_fracs = num_residual_streams)
+        init_hyper_conn, self.expand_stream, self.reduce_stream = ManifoldConstrainedHyperConnections.get_init_and_expand_reduce_stream_functions(1, num_fracs = num_residual_streams, sinkhorn_iters = 2)
 
         for ind in range(depth):
 
@@ -194,7 +214,7 @@ class Actor(Module):
         num_actions,
         mlp_depth = 2,
         dropout = 0.1,
-        rsmnorm_input = True  # use the RSMNorm for inputs proposed by KAIST + SonyAI
+        rsmnorm_input = True,  # use the RSMNorm for inputs proposed by KAIST + SonyAI
     ):
         super().__init__()
         self.rsmnorm = RSMNorm(state_dim) if rsmnorm_input else nn.Identity()
@@ -205,6 +225,8 @@ class Actor(Module):
             depth = mlp_depth,
             dropout = dropout
         )
+
+        self.grad_dropout = GradientDropout()
 
         self.action_head = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -218,6 +240,9 @@ class Actor(Module):
             x = self.rsmnorm(x)
 
         hidden = self.net(x)
+
+        hidden = self.grad_dropout(hidden)
+
         action_probs = self.action_head(hidden).softmax(dim = -1)
         return action_probs
 
@@ -242,6 +267,8 @@ class Critic(Module):
             dropout = dropout
         )
 
+        self.grad_dropout = GradientDropout()
+
         self.value_head = nn.Linear(hidden_dim, dim_pred)
 
     def forward(self, x, past_action):
@@ -252,6 +279,9 @@ class Critic(Module):
 
         x = torch.cat((x, past_action), dim = -1)
         hidden = self.net(x)
+
+        hidden = self.grad_dropout(hidden)
+
         value = self.value_head(hidden)
         return value
 
@@ -421,6 +451,9 @@ class PPO(Module):
         )
 
         # policy phase training, similar to original PPO
+
+        self.actor.train()
+        self.critic.train()
 
         for _ in range(self.epochs):
             for _, (states, actions, old_log_probs, returns, old_values, past_action) in enumerate(dl):
