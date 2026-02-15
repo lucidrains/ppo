@@ -228,10 +228,11 @@ class Actor(Module):
     ):
         super().__init__()
 
-        assert mlp_depth > 1, 'Actor mlp_depth must be greater than 1 to allow for a partitioned middle layer for evolution optimization'
+        self.evo_layer_index = evo_layer_index
 
-        self.evo_layer_index = default(evo_layer_index, mlp_depth // 2)
-        assert 0 <= self.evo_layer_index < mlp_depth
+        if exists(self.evo_layer_index):
+            assert mlp_depth > 1, 'Actor mlp_depth must be greater than 1 to allow for a partitioned middle layer for evolution optimization'
+            assert 0 <= self.evo_layer_index < mlp_depth
 
         self.rsmnorm = RSMNorm(state_dim) if rsmnorm_input else nn.Identity()
 
@@ -394,9 +395,12 @@ class PPO(Module):
 
         # opt partitioned actor
 
-        evo_layer = self.actor.net.layers[self.actor.evo_layer_index]
-        evo_layer_params = set(evo_layer.parameters())
-        ppo_actor_params = [p for p in self.actor.parameters() if p not in evo_layer_params]
+        if exists(self.actor.evo_layer_index):
+            evo_layer = self.actor.net.layers[self.actor.evo_layer_index]
+            evo_layer_params = set(evo_layer.parameters())
+            ppo_actor_params = [p for p in self.actor.parameters() if p not in evo_layer_params]
+        else:
+            ppo_actor_params = self.actor.parameters()
 
         self.opt_actor = AdoptAtan2(ppo_actor_params, lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
         self.opt_critic = AdoptAtan2(self.critic.parameters(), lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
@@ -649,6 +653,9 @@ def main(
     evo_pop_size = 64,
     evo_noise_scale = 1e-2,
 ):
+    if evo_every > 0 and not exists(evo_layer_index):
+        evo_layer_index = actor_mlp_depth // 2
+
     accelerator = Accelerator(cpu = cpu)
     device = accelerator.device
 
