@@ -13,7 +13,7 @@
 #   "memmap-replay-buffer",
 #   "moviepy",
 #   "hyper-connections",
-#   "x-evolution",
+#   "x-evolution>=0.1.30",
 #   "accelerate",
 #   "wandb",
 #   "fire",
@@ -627,9 +627,9 @@ def main(
     reward_range = (-300., 300.),
     cpu = False,
     use_past_actions = True,
-    evo_every = 10,
-    evo_generations = 5,
-    evo_pop_size = 32,
+    evo_every = 5,
+    evo_generations = 2,
+    evo_pop_size = 64,
     evo_noise_scale = 1e-2,
 ):
     accelerator = Accelerator(cpu = cpu)
@@ -815,10 +815,9 @@ def main(
                         ))
 
                     if exists(evo_strategy) and divisible_by(num_policy_updates, evo_every):
-                        evo_strategy.forward()
-                        
-                        # sync the ema actor with the evolved actor weights
-                        agent.ema_actor.copy_params_from_model_to_ema()
+                        for _ in range(evo_generations):
+                            evo_strategy.forward(num_generations = 1)
+                            agent.ema_actor.update()
 
                 # break if done
 
