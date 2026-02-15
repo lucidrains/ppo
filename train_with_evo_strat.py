@@ -627,8 +627,8 @@ def main(
     reward_range = (-300., 300.),
     cpu = False,
     use_past_actions = True,
-    evo_every = 5,
-    evo_generations = 2,
+    evo_every = 2,
+    evo_generations = 5,
     evo_pop_size = 64,
     evo_noise_scale = 1e-2,
 ):
