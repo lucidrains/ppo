@@ -59,6 +59,8 @@ import gymnasium as gym
 
 from memmap_replay_buffer import ReplayBuffer
 
+from x_evolution import EvoStrategy
+
 # constants (removed manual device logic, handled by Accelerator)
 
 # helpers
@@ -75,9 +77,13 @@ def divisible_by(num, den):
 def normalize(t, eps = 1e-5):
     return (t - t.mean()) / (t.std() + eps)
 
-def update_network_(loss, optimizer):
+def update_network_(loss, optimizer, clip_grad_norm = 1.0):
     optimizer.zero_grad()
     loss.mean().backward()
+
+    if exists(clip_grad_norm):
+        nn.utils.clip_grad_norm_(optimizer.param_groups[0]['params'], clip_grad_norm)
+
     optimizer.step()
 
 # RSM Norm (not to be confused with RMSNorm from transformers)
@@ -130,26 +136,6 @@ class RSMNorm(Module):
 
         return normed
 
-# gradient dropout
-
-class GradientDropout(Module):
-    def __init__(
-        self,
-        strength = 0. # increase for more dropout
-    ):
-        super().__init__()
-        self.strength = strength
-
-    def forward(self, x):
-        if not x.requires_grad or not self.training:
-            return x
-
-        logit = torch.randn_like(x)
-        logit = logit + self.strength
-        mask = logit.sigmoid()
-
-        return x * (1. - mask) + x.detach() * mask
-
 # SimBa - Kaist + SonyAI
 
 class ReluSquared(Module):
@@ -165,7 +151,7 @@ class SimBa(Module):
         depth = 3,
         dropout = 0.,
         expansion_factor = 2,
-        num_residual_streams = 4
+        num_residual_streams = 1
     ):
         super().__init__()
         """
@@ -246,10 +232,11 @@ class Actor(Module):
             state_dim,
             dim_hidden = hidden_dim * 2,
             depth = mlp_depth,
-            dropout = dropout
+            dropout = dropout,
+            num_residual_streams = 1
         )
 
-        self.grad_dropout = GradientDropout()
+
 
         self.action_head = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -264,7 +251,7 @@ class Actor(Module):
 
         hidden = self.net(x)
 
-        hidden = self.grad_dropout(hidden)
+
 
         action_probs = self.action_head(hidden).softmax(dim = -1)
         return action_probs
@@ -279,18 +266,22 @@ class Critic(Module):
         mlp_depth = 6, # recent paper has findings that show scaling critic is more important than scaling actor
         dropout = 0.1,
         rsmnorm_input = True,
+        use_past_actions = True,
     ):
         super().__init__()
         self.rsmnorm = RSMNorm(state_dim) if rsmnorm_input else nn.Identity()
 
+        self.use_past_actions = use_past_actions
+
         self.net = SimBa(
-            state_dim + num_actions,
+            state_dim + (num_actions if use_past_actions else 0),
             dim_hidden = hidden_dim,
             depth = mlp_depth,
-            dropout = dropout
+            dropout = dropout,
+            num_residual_streams = 1
         )
 
-        self.grad_dropout = GradientDropout()
+
 
         self.value_head = nn.Linear(hidden_dim, dim_pred)
 
@@ -300,10 +291,12 @@ class Critic(Module):
             self.rsmnorm.eval()
             x = self.rsmnorm(x)
 
-        x = torch.cat((x, past_action), dim = -1)
+        if self.use_past_actions:
+            x = torch.cat((x, past_action), dim = -1)
+
         hidden = self.net(x)
 
-        hidden = self.grad_dropout(hidden)
+
 
         value = self.value_head(hidden)
         return value
@@ -361,6 +354,7 @@ class PPO(Module):
         ema_decay,
         use_spo = False,
         asymmetric_spo = False,
+        use_past_actions = True,
         ema_kwargs: dict = dict(
             update_model_with_ema_every = 1000
         ),
@@ -370,7 +364,7 @@ class PPO(Module):
 
         self.actor = Actor(state_dim, actor_hidden_dim, num_actions)
 
-        self.critic = Critic(state_dim, critic_hidden_dim, num_actions, dim_pred = critic_pred_num_bins)
+        self.critic = Critic(state_dim, critic_hidden_dim, num_actions, dim_pred = critic_pred_num_bins, use_past_actions = use_past_actions)
 
         # weight tie rsmnorm
 
@@ -534,6 +528,12 @@ class PPO(Module):
                 policy_losses.append(policy_loss.mean().item())
                 entropies.append(entropy.mean().item())
 
+                if torch.isnan(policy_loss).any():
+                    print(f'policy loss is nan')
+                    print(f'ratios: {ratios}')
+                    print(f'advantages: {advantages}')
+                    raise ValueError('NaN in policy loss')
+
                 update_network_(policy_loss, self.opt_actor)
 
                 clip = self.value_clip
@@ -567,6 +567,10 @@ class PPO(Module):
 
                     value_loss = value_loss.mean()
                     value_losses.append(value_loss.item())
+
+                    if torch.isnan(value_loss).any():
+                        print(f'value loss is nan')
+                        raise ValueError('NaN in value loss')
 
                     update_network_(value_loss, opt_critic)
 
@@ -622,6 +626,11 @@ def main(
     wandb_run_name = None,
     reward_range = (-300., 300.),
     cpu = False,
+    use_past_actions = True,
+    evo_every = 10,
+    evo_generations = 5,
+    evo_pop_size = 32,
+    evo_noise_scale = 1e-2,
 ):
     accelerator = Accelerator(cpu = cpu)
     device = accelerator.device
@@ -685,7 +694,8 @@ def main(
         value_clip,
         ema_decay,
         use_spo,
-        asymmetric_spo
+        asymmetric_spo,
+        use_past_actions = use_past_actions,
     ).to(device)
 
     if load:
@@ -697,6 +707,39 @@ def main(
 
     time = 0
     num_policy_updates = 0
+
+    # evolution strategy
+
+    evo_strategy = None
+
+    if evo_every > 0:
+        def evo_environment(model):
+            state, _ = env.reset()
+            state = torch.from_numpy(state).to(device)
+            cumulative_reward = 0
+            past_action = torch.zeros(num_actions).to(device)
+
+            for _ in range(max_timesteps):
+                action_probs = model(state)
+                dist = Categorical(action_probs)
+                action = dist.sample()
+                next_state, reward, terminated, truncated, _ = env.step(action.item())
+                cumulative_reward += reward
+                if terminated or truncated:
+                    break
+                state = torch.from_numpy(next_state).to(device)
+                past_action = F.one_hot(action, num_classes = num_actions)
+
+            return cumulative_reward
+
+        evo_strategy = EvoStrategy(
+            agent.actor,
+            environment = evo_environment,
+            num_generations = evo_generations,
+            noise_population_size = evo_pop_size,
+            noise_scale = evo_noise_scale,
+            accelerator = accelerator
+        )
 
     for eps in tqdm(range(num_episodes), desc = 'episodes'):
 
@@ -770,6 +813,12 @@ def main(
                             **metrics,
                             num_policy_updates = num_policy_updates
                         ))
+
+                    if exists(evo_strategy) and divisible_by(num_policy_updates, evo_every):
+                        evo_strategy.forward()
+                        
+                        # sync the ema actor with the evolved actor weights
+                        agent.ema_actor.copy_params_from_model_to_ema()
 
                 # break if done
 
