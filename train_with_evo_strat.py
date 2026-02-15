@@ -222,10 +222,17 @@ class Actor(Module):
         hidden_dim,
         num_actions,
         mlp_depth = 2,
+        evo_layer_index = None,
         dropout = 0.1,
         rsmnorm_input = True,  # use the RSMNorm for inputs proposed by KAIST + SonyAI
     ):
         super().__init__()
+
+        assert mlp_depth > 1, 'Actor mlp_depth must be greater than 1 to allow for a partitioned middle layer for evolution optimization'
+
+        self.evo_layer_index = default(evo_layer_index, mlp_depth // 2)
+        assert 0 <= self.evo_layer_index < mlp_depth
+
         self.rsmnorm = RSMNorm(state_dim) if rsmnorm_input else nn.Identity()
 
         self.net = SimBa(
@@ -338,6 +345,8 @@ class PPO(Module):
         num_actions,
         actor_hidden_dim,
         critic_hidden_dim,
+        actor_mlp_depth,
+        evo_layer_index,
         critic_pred_num_bins,
         reward_range: tuple[float, float],
         epochs,
@@ -362,7 +371,7 @@ class PPO(Module):
     ):
         super().__init__()
 
-        self.actor = Actor(state_dim, actor_hidden_dim, num_actions)
+        self.actor = Actor(state_dim, actor_hidden_dim, num_actions, mlp_depth = actor_mlp_depth, evo_layer_index = evo_layer_index)
 
         self.critic = Critic(state_dim, critic_hidden_dim, num_actions, dim_pred = critic_pred_num_bins, use_past_actions = use_past_actions)
 
@@ -383,7 +392,13 @@ class PPO(Module):
         self.ema_actor = EMA(self.actor, beta = ema_decay, include_online_model = False, **ema_kwargs)
         self.ema_critic = EMA(self.critic, beta = ema_decay, include_online_model = False, **ema_kwargs)
 
-        self.opt_actor = AdoptAtan2(self.actor.parameters(), lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
+        # opt partitioned actor
+
+        evo_layer = self.actor.net.layers[self.actor.evo_layer_index]
+        evo_layer_params = set(evo_layer.parameters())
+        ppo_actor_params = [p for p in self.actor.parameters() if p not in evo_layer_params]
+
+        self.opt_actor = AdoptAtan2(ppo_actor_params, lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
         self.opt_critic = AdoptAtan2(self.critic.parameters(), lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
 
         self.ema_actor.add_to_optimizer_post_step_hook(self.opt_actor)
@@ -627,6 +642,8 @@ def main(
     reward_range = (-300., 300.),
     cpu = False,
     use_past_actions = True,
+    actor_mlp_depth = 3,
+    evo_layer_index = None,
     evo_every = 2,
     evo_generations = 5,
     evo_pop_size = 64,
@@ -679,6 +696,8 @@ def main(
         num_actions,
         actor_hidden_dim,
         critic_hidden_dim,
+        actor_mlp_depth,
+        evo_layer_index,
         critic_pred_num_bins,
         reward_range,
         epochs,
@@ -735,6 +754,7 @@ def main(
         evo_strategy = EvoStrategy(
             agent.actor,
             environment = evo_environment,
+            params_to_optimize = agent.actor.net.layers[agent.actor.evo_layer_index],
             num_generations = evo_generations,
             noise_population_size = evo_pop_size,
             noise_scale = evo_noise_scale,
