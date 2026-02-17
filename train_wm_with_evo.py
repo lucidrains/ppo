@@ -741,7 +741,7 @@ def main(
     if evo_every > 0:
         def evo_environment(model):
             state, _ = env.reset()
-            state = torch.from_numpy(state).to(device)
+            state = torch.from_numpy(state).to(device).float()
             cumulative_reward = 0
             prev_action = torch.tensor(-1, device = device)
             prev_reward = torch.tensor(0., dtype = torch.float32, device = device)
@@ -771,11 +771,11 @@ def main(
                 cumulative_reward += reward
                 if terminated or truncated:
                     break
-                state = torch.from_numpy(next_state).to(device)
+                state = torch.from_numpy(next_state).to(device).float()
                 prev_action = action
                 prev_reward = torch.tensor(reward, dtype = torch.float32, device = device)
 
-            return cumulative_reward
+            return float(cumulative_reward)
 
         evo_strategy = EvoStrategy(
             agent.model,
@@ -795,7 +795,7 @@ def main(
         one_episode_memories = deque([])
 
         state, info = env.reset(seed = seed)
-        state = torch.from_numpy(state).to(device)
+        state = torch.from_numpy(state).to(device).float()
 
         prev_action = torch.tensor(-1, device = device)
         prev_reward = torch.tensor(0., dtype = torch.float32, device = device)
@@ -839,7 +839,7 @@ def main(
 
             next_state, reward, terminated, truncated, _ = env.step(action.item())
 
-            next_state = torch.from_numpy(next_state).to(device)
+            next_state = torch.from_numpy(next_state).to(device).float()
 
             reward = float(reward)
             cumulative_reward += reward
