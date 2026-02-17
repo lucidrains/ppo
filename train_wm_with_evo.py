@@ -898,7 +898,7 @@ def main(
                 ))
 
             if exists(evo_strategy) and divisible_by(num_policy_updates, evo_every):
-                for _ in range(evo_generations):
+                for _ in tqdm(range(evo_generations), desc = 'evolution generations'):
                     rewards = evo_strategy.forward(num_generations = 1)
                     agent.ema_model.update()
 
