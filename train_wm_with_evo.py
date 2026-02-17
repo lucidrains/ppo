@@ -564,13 +564,13 @@ class PPO(Module):
                 mask = einx.less('n, b -> b n', seq, episode_lens)
 
                 prev_actions = F.pad(actions, (1, -1), value = -1)
-                rewards = F.pad(rewards, (1, -1), value = 0.)
+                rewards_pad = F.pad(rewards, (1, -1), value = 0.)
 
-                states_with_rewards, _ = pack((states, rewards), 'b n *')
+                raw_states_with_rewards, _ = pack((states, rewards_pad), 'b n *')
 
                 with torch.no_grad():
                     self.rsmnorm.eval()
-                    states_with_rewards = self.rsmnorm(states_with_rewards)
+                    states_with_rewards = self.rsmnorm(raw_states_with_rewards)
 
                 action_probs, values, states_with_rewards_pred, done_pred, _ = model(
                     states_with_rewards,
@@ -620,7 +620,8 @@ class PPO(Module):
                 self.optimizer.step()
                 self.optimizer.zero_grad()
 
-                rsmnorm_copy(states_with_rewards[mask])
+                rsmnorm_copy.train()
+                rsmnorm_copy(raw_states_with_rewards[mask])
 
                 all_metrics.append(dict(
                     world_model_loss = world_model_loss.item(),
@@ -642,7 +643,7 @@ class PPO(Module):
 def main(
     env_name = 'LunarLander-v3',
     num_episodes = 50000,
-    max_timesteps = 500,
+    max_timesteps = 400,
     critic_pred_num_bins = 100,
     reward_range = (-100, 100),
     minibatch_size = 8,
@@ -670,8 +671,8 @@ def main(
     wandb_run_name = None,
     cpu = False,
     evo_every = 2,
-    evo_generations = 5,
-    evo_pop_size = 64,
+    evo_generations = 2,
+    evo_pop_size = 32,
     evo_noise_scale = 1e-2,
     evo_layer_index = None
 ):
