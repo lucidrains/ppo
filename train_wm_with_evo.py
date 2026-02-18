@@ -410,7 +410,7 @@ class PPO(Module):
         ema_decay,
         hidden_dim = 32,
         backbone_depth = 1,
-        actor_depth = 1,
+        actor_depth = 2,
         critic_depth = 1,
         world_model: dict = dict(
             attn_dim_head = 16,
