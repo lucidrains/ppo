@@ -12,11 +12,12 @@
 #   "gymnasium[box2d]",
 #   "pygame",
 #   "moviepy",
-#   "x-transformers",
+#   "x-transformers>=2.16.1",
 #   "x-evolution>=0.1.30",
 #   "accelerate",
 #   "wandb",
 #   "fire",
+#   "memmap-replay-buffer",
 # ]
 # ///
 
@@ -62,6 +63,7 @@ from x_transformers import (
 )
 
 from x_evolution import EvoStrategy
+from memmap_replay_buffer import ReplayBuffer
 
 from assoc_scan import AssocScan
 
@@ -106,7 +108,9 @@ def log(t, eps = 1e-20):
 class WorldModelActorCritic(Module):
     def __init__(
         self,
-        transformer: Module,
+        backbone_transformer: Module,
+        actor_transformer: Module,
+        critic_transformer: Module,
         num_actions,
         critic_dim_pred,
         critic_min_max_value: tuple[float, float],
@@ -117,8 +121,11 @@ class WorldModelActorCritic(Module):
         value_clip = 0.4
     ):
         super().__init__()
-        self.transformer = transformer
-        dim = transformer.attn_layers.dim
+        self.backbone_transformer = backbone_transformer
+        self.actor_transformer = actor_transformer
+        self.critic_transformer = critic_transformer
+
+        dim = backbone_transformer.attn_layers.dim
 
         self.action_embeds = nn.Embedding(num_actions, dim)
 
@@ -135,6 +142,7 @@ class WorldModelActorCritic(Module):
         )
 
         self.critic_head = nn.Sequential(
+            nn.LayerNorm(dim),
             nn.Linear(dim, dim * 2),
             nn.SiLU(),
             nn.Linear(dim * 2, critic_dim_pred)
@@ -150,6 +158,7 @@ class WorldModelActorCritic(Module):
         )
 
         self.action_head = nn.Sequential(
+            nn.LayerNorm(dim),
             nn.Linear(dim, dim * 2),
             nn.SiLU(),
             nn.Linear(dim * 2, num_actions),
@@ -246,6 +255,8 @@ class WorldModelActorCritic(Module):
         actions = None,
         next_actions = None,
         return_pred_dones = False,
+        cache = None,
+        mask = None,
         **kwargs
     ):
         sum_embeds = 0.
@@ -257,7 +268,13 @@ class WorldModelActorCritic(Module):
             action_embeds = einx.where('b n, b n d, ', has_actions, action_embeds, 0.)
             sum_embeds = sum_embeds + action_embeds
 
-        embed, cache = self.transformer(*args, **kwargs, sum_embeds = sum_embeds, return_embeddings = True, return_intermediates = True)
+        # handle multi-cache
+
+        backbone_cache = actor_cache = critic_cache = None
+        if exists(cache):
+            backbone_cache, actor_cache, critic_cache = cache
+
+        embed, backbone_cache = self.backbone_transformer(*args, **kwargs, sum_embeds = sum_embeds, return_embeddings = True, return_intermediates = True, cache = backbone_cache)
 
         # if `next_actions` from agent passed in, use it to predict the next state + truncated / terminated signal
 
@@ -277,19 +294,24 @@ class WorldModelActorCritic(Module):
             state_pred = stack((state_mean, state_log_var.exp()))
             dones = self.to_dones(embed_with_actions)
 
-        # actor critic heads living on top of transformer - basically approaching online decision transformer except critic learn discounted returns
+        # branches
 
         embed = frac_gradient(embed, self.frac_actor_critic_head_gradient) # what fraction of the gradient to pass back to the world model from the actor / critic head
 
+        actor_embed, actor_cache = self.actor_transformer(embed, mask = mask, cache = actor_cache, return_hiddens = True)
+        critic_embed, critic_cache = self.critic_transformer(embed, mask = mask, cache = critic_cache, return_hiddens = True)
+
         # actions
 
-        action_probs = self.action_head(embed)
+        action_probs = self.action_head(actor_embed)
 
         # values
 
-        values = self.critic_head(embed)
+        values = self.critic_head(critic_embed)
 
-        return action_probs, values, state_pred, dones, cache
+        new_cache = (backbone_cache, actor_cache, critic_cache)
+
+        return action_probs, values, state_pred, dones, new_cache
 
 # RSM Norm
 
@@ -386,11 +408,13 @@ class PPO(Module):
         eps_clip,
         value_clip,
         ema_decay,
-        hidden_dim = 48,
+        hidden_dim = 32,
+        backbone_depth = 1,
+        actor_depth = 1,
+        critic_depth = 1,
         world_model: dict = dict(
             attn_dim_head = 16,
             heads = 4,
-            depth = 4,
             attn_gate_values = True,
             add_value_residual = True,
             learned_value_residual_mix = True
@@ -410,27 +434,46 @@ class PPO(Module):
 
         state_and_reward_dim = state_dim + 1
 
+        branch_kwargs = {k: v for k, v in world_model.items() if k != 'depth'}
+
         self.model = WorldModelActorCritic(
-            num_actions = num_actions,
-            critic_dim_pred = critic_pred_num_bins,
-            critic_min_max_value = reward_range,
-            dim_pred_state = state_and_reward_dim,
-            entropy_weight = beta_s,
-            eps_clip = eps_clip,
-            value_clip = value_clip,
-            transformer = ContinuousTransformerWrapper(
+            backbone_transformer = ContinuousTransformerWrapper(
                 dim_in = state_and_reward_dim,
                 dim_out = None,
                 max_seq_len = max_timesteps,
                 probabilistic = True,
                 attn_layers = Decoder(
                     dim = hidden_dim,
-                    rotary_pos_emb = True,
+                    depth = backbone_depth,
+                    polar_pos_emb = True,
                     attn_dropout = dropout,
                     ff_dropout = dropout,
-                    **world_model
+                    **branch_kwargs
                 )
-            )
+            ),
+            actor_transformer = Decoder(
+                dim = hidden_dim,
+                depth = actor_depth,
+                polar_pos_emb = True,
+                attn_dropout = dropout,
+                ff_dropout = dropout,
+                **branch_kwargs
+            ),
+            critic_transformer = Decoder(
+                dim = hidden_dim,
+                depth = critic_depth,
+                polar_pos_emb = True,
+                attn_dropout = dropout,
+                ff_dropout = dropout,
+                **branch_kwargs
+            ),
+            num_actions = num_actions,
+            critic_dim_pred = critic_pred_num_bins,
+            critic_min_max_value = reward_range,
+            dim_pred_state = state_and_reward_dim,
+            entropy_weight = beta_s,
+            eps_clip = eps_clip,
+            value_clip = value_clip
         )
 
         self.frac_actor_critic_head_gradient = frac_actor_critic_head_gradient
@@ -443,9 +486,15 @@ class PPO(Module):
 
         # evolution optimization
 
-        self.evo_layer_index = evo_layer_index
+        self.evo_layer_index = default(evo_layer_index, 0)
+        
         if exists(self.evo_layer_index):
-            evo_layer = self.model.transformer.attn_layers.layers[self.evo_layer_index]
+            # evo layer now acts on the actor transformer layers
+            
+            num_actor_layers = len(self.model.actor_transformer.layers)
+            self.evo_layer_index = min(self.evo_layer_index, num_actor_layers - 1)
+
+            evo_layer = self.model.actor_transformer.layers[self.evo_layer_index]
             evo_layer_params = set(evo_layer.parameters())
             ppo_params = [p for p in self.model.parameters() if p not in evo_layer_params]
         else:
@@ -485,33 +534,28 @@ class PPO(Module):
         if 'rsmnorm' in data:
             self.rsmnorm.load_state_dict(data['rsmnorm'])
 
-    def learn(self, memories, episode_lens, device):
+    def learn(self, replay_buffer, device):
 
         model = self.model
         hl_gauss = self.model.critic_hl_gauss_loss
 
-        # retrieve and prepare data from memory for training - list[list[Memory]]
+        # retrieve and prepare data from buffer for training
+        
+        data = replay_buffer.get_all_data()
+        num_episodes = replay_buffer.num_episodes
 
-        def stack_and_to_device(t):
-            return stack(t).to(device)
+        def to_device(t):
+            return t.to(device)
 
-        def stack_memories(episode_memories):
-            return tuple(map(stack_and_to_device, zip(*episode_memories)))
-
-        memories = map(stack_memories, memories)
-
-        episode_lens = episode_lens.to(device)
-
-        (
-            episodes,
-            states,
-            actions,
-            old_log_probs,
-            rewards,
-            is_boundaries,
-            values,
-            dones
-        ) = tuple(map(pad_sequence, zip(*memories)))
+        states = to_device(data['state'][:num_episodes])
+        actions = to_device(data['action'][:num_episodes])
+        old_log_probs = to_device(data['action_log_prob'][:num_episodes])
+        rewards = to_device(data['reward'][:num_episodes])
+        is_boundaries = to_device(data['is_boundary'][:num_episodes])
+        values = to_device(data['value'][:num_episodes])
+        dones = to_device(data['dones'][:num_episodes])
+        
+        episode_lens = torch.from_numpy(replay_buffer.meta_data['episode_lens'][:num_episodes]).to(device)
 
         masks = ~is_boundaries
 
@@ -644,8 +688,8 @@ def main(
     env_name = 'LunarLander-v3',
     num_episodes = 50000,
     max_timesteps = 400,
-    critic_pred_num_bins = 100,
-    reward_range = (-100, 100),
+    critic_pred_num_bins = 600,
+    reward_range = (-300, 300),
     minibatch_size = 8,
     update_episodes = 64,
     lr = 0.0008,
@@ -662,7 +706,7 @@ def main(
     epochs = 4,
     ema_decay = 0.9,
     seed = None,
-    render_every_eps = 250,
+    render_every_eps = 100,
     save_every = 1000,
     video_folder = './lunar-recording',
     load = False,
@@ -670,7 +714,12 @@ def main(
     wandb_project = 'ppo-wm-evo',
     wandb_run_name = None,
     cpu = False,
-    evo_every = 2,
+    hidden_dim = 32,
+    backbone_depth = 1,
+    actor_depth = 1,
+    critic_depth = 1,
+    dropout = 0.1,
+    evo_every = 0,
     evo_generations = 2,
     evo_pop_size = 32,
     evo_noise_scale = 1e-2,
@@ -704,6 +753,23 @@ def main(
     if not exists(evo_layer_index):
         evo_layer_index = 2 # middle of 4 layers
 
+    replay_buffer = ReplayBuffer(
+        './replay-buffer',
+        max_episodes = update_episodes * 2,
+        max_timesteps = max_timesteps + 1,
+        fields = dict(
+            state = ('float', (state_dim,)),
+            action = 'int',
+            action_log_prob = 'float',
+            reward = 'float',
+            is_boundary = 'bool',
+            value = ('float', (critic_pred_num_bins,)),
+            dones = ('float', (2,))
+        ),
+        circular = True,
+        overwrite = True
+    )
+
     agent = PPO(
         state_dim,
         num_actions,
@@ -722,6 +788,11 @@ def main(
         eps_clip,
         value_clip,
         ema_decay,
+        hidden_dim = hidden_dim,
+        backbone_depth = backbone_depth,
+        actor_depth = actor_depth,
+        critic_depth = critic_depth,
+        dropout = dropout,
         evo_layer_index = evo_layer_index
     ).to(device)
 
@@ -781,7 +852,7 @@ def main(
         evo_strategy = EvoStrategy(
             agent.model,
             environment = evo_environment,
-            params_to_optimize = agent.model.transformer.attn_layers.layers[evo_layer_index],
+            params_to_optimize = agent.model.actor_transformer.layers[agent.evo_layer_index],
             num_generations = evo_generations,
             noise_population_size = evo_pop_size,
             noise_scale = evo_noise_scale,
@@ -789,9 +860,10 @@ def main(
         )
 
     memories = deque([])
-    episode_lens = []
 
-    for eps in tqdm(range(num_episodes), desc = 'episodes'):
+    pbar = tqdm(range(num_episodes), desc = 'episodes')
+
+    for eps in pbar:
 
         one_episode_memories = deque([])
 
@@ -849,9 +921,15 @@ def main(
             prev_reward = torch.tensor(reward, dtype = torch.float32, device = device)
 
             dones_signal = torch.tensor([terminated, truncated], dtype = torch.float32)
-            memory = Memory(torch.tensor(eps), state, action, action_log_prob, torch.tensor(reward, dtype = torch.float32), torch.tensor(terminated), value, dones_signal)
-
-            one_episode_memories.append(memory)
+            one_episode_memories.append(dict(
+                state = state,
+                action = action,
+                action_log_prob = action_log_prob,
+                reward = torch.tensor(reward, dtype = torch.float32),
+                is_boundary = torch.tensor(terminated),
+                value = value,
+                dones = dones_signal
+            ))
 
             state = next_state
 
@@ -860,20 +938,27 @@ def main(
             if done and not terminated:
                 _, next_value, *_ = state_to_pred_action_and_value(state, prev_action, prev_reward)
 
-                bootstrap_value_memory = memory._replace(
+                one_episode_memories.append(dict(
                     state = state,
-                    eps = torch.tensor(-1),
+                    action = torch.tensor(-1),
+                    action_log_prob = torch.tensor(0.),
+                    reward = torch.tensor(0.),
                     is_boundary = torch.tensor(True),
-                    value = next_value
-                )
-
-                one_episode_memories.append(bootstrap_value_memory)
+                    value = next_value,
+                    dones = torch.zeros(2)
+                ))
 
             if done:
                 break
 
-        episode_lens.append(timestep + 1)
-        memories.append(one_episode_memories)
+        # store episode to replay buffer
+
+        def list_dict_to_dict_list(ld):
+            return {k: stack([d[k] for d in ld]) for k in ld[0]}
+
+        replay_buffer.store_episode(**list_dict_to_dict_list(one_episode_memories))
+
+        pbar.set_postfix(reward = cumulative_reward, steps = timestep + 1)
 
         if use_wandb:
             wandb.log(dict(
@@ -887,9 +972,9 @@ def main(
                 latest_video = max(videos, key = lambda p: p.stat().st_mtime)
                 wandb.log(dict(video = wandb.Video(str(latest_video), format = "mp4")))
 
-        if divisible_by(len(memories), update_episodes):
+        if divisible_by(eps + 1, update_episodes):
 
-            metrics = agent.learn(memories, torch.tensor(episode_lens), device)
+            metrics = agent.learn(replay_buffer, device)
             num_policy_updates += 1
 
             if use_wandb:
@@ -908,9 +993,6 @@ def main(
                             evo_reward_mean = rewards.mean().item(),
                             evo_reward_max = rewards.max().item()
                         ))
-
-            memories.clear()
-            episode_lens.clear()
 
         if divisible_by(eps, save_every):
             agent.save()
