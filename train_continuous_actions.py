@@ -33,7 +33,9 @@ from torch import nn, tensor, cat, stack
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
 from torch.utils.data import TensorDataset, DataLoader
-from torch.distributions import Categorical, Beta
+from torch.distributions import Categorical, Beta, Normal, Kumaraswamy
+from torch.distributions.utils import broadcast_all
+from numbers import Number
 
 from einops import reduce, repeat, einsum, rearrange, pack
 
@@ -73,6 +75,7 @@ def update_network_(loss, optimizer):
     optimizer.zero_grad()
     loss.mean().backward()
     optimizer.step()
+
 
 # RSM Norm (not to be confused with RMSNorm from transformers)
 # this was proposed by SimBa https://arxiv.org/abs/2410.09754
@@ -229,11 +232,13 @@ class Actor(Module):
         state_dim,
         hidden_dim,
         action_dim,
+        distribution = 'kumaraswamy',
         mlp_depth = 2,
         dropout = 0.1,
         rsmnorm_input = True,  # use the RSMNorm for inputs proposed by KAIST + SonyAI
     ):
         super().__init__()
+        self.distribution = distribution
         self.rsmnorm = RSMNorm(state_dim) if rsmnorm_input else nn.Identity()
 
         self.net = SimBa(
@@ -260,11 +265,17 @@ class Actor(Module):
 
         hidden = self.grad_dropout(hidden)
 
-        alpha_beta = self.action_head(hidden)
-        alpha_beta = F.softplus(alpha_beta) + 1.0
+        out = self.action_head(hidden)
 
-        alpha, beta = alpha_beta.chunk(2, dim = -1)
-        return alpha, beta
+        if self.distribution.lower() == 'gaussian':
+            loc, scale = out.chunk(2, dim = -1)
+            loc = torch.tanh(loc) # bind loc to [-1, 1]
+            scale = F.softplus(scale) + 1e-3
+            return loc, scale
+        else:
+            alpha_beta = F.softplus(out) + 1.0
+            alpha, beta = alpha_beta.chunk(2, dim = -1)
+            return alpha, beta
 
 class Critic(Module):
     def __init__(
@@ -343,6 +354,7 @@ class PPO(Module):
         actor_hidden_dim,
         critic_hidden_dim,
         critic_pred_num_bins,
+        distribution,
         reward_range: tuple[float, float],
         epochs,
         minibatch_size,
@@ -364,8 +376,9 @@ class PPO(Module):
         save_path = './ppo.pt'
     ):
         super().__init__()
+        self.distribution = distribution.lower()
 
-        self.actor = Actor(state_dim, actor_hidden_dim, action_dim)
+        self.actor = Actor(state_dim, actor_hidden_dim, action_dim, distribution = distribution)
 
         self.critic = Critic(state_dim, critic_hidden_dim, action_dim, dim_pred = critic_pred_num_bins)
 
@@ -478,8 +491,14 @@ class PPO(Module):
         for _ in range(self.epochs):
             for _, (states, actions, old_log_probs, returns, old_values, past_action) in enumerate(dl):
 
-                alpha, beta = self.actor(states)
-                dist = Beta(alpha, beta)
+                param1, param2 = self.actor(states)
+                if self.distribution == 'gaussian':
+                    dist = Normal(param1, param2)
+                elif self.distribution == 'beta':
+                    dist = Beta(param1, param2)
+                elif self.distribution == 'kumaraswamy':
+                    dist = Kumaraswamy(param1, param2)
+
                 action_log_probs = dist.log_prob(actions).sum(dim = -1)
                 entropy = dist.entropy().sum(dim = -1)
 
@@ -568,6 +587,7 @@ def main(
     update_timesteps = 5000,
     buffer_episodes = 40,
     critic_pred_num_bins = 250,
+    distribution = 'kumaraswamy',
     reward_range = (-100., 100.),
     minibatch_size = 64,
     lr = 0.0008,
@@ -589,7 +609,9 @@ def main(
     save_every = 1000,
     clear_videos = True,
     video_folder = './lunar-recording',
-    load = False
+    load = False,
+    rolling_window_size = 100,
+    stop_at_reward = None
 ):
     if env_name == 'LunarLander-v3':
         env = gym.make(env_name, render_mode = 'rgb_array', continuous = True)
@@ -636,6 +658,7 @@ def main(
         actor_hidden_dim,
         critic_hidden_dim,
         critic_pred_num_bins,
+        distribution,
         reward_range,
         epochs,
         minibatch_size,
@@ -663,10 +686,10 @@ def main(
     time = 0
     num_policy_updates = 0
 
-    rolling_reward = deque(maxlen = 100)
-    rolling_steps = deque(maxlen = 100)
+    rolling_reward = deque(maxlen = rolling_window_size)
+    rolling_steps = deque(maxlen = rolling_window_size)
 
-    pbar = tqdm(range(num_episodes), desc = 'episodes')
+    pbar = tqdm(range(num_episodes), desc = f'episodes ({distribution})')
     for eps in pbar:
 
         state, _ = env.reset(seed = seed)
@@ -681,14 +704,22 @@ def main(
             for timestep in range(max_timesteps):
                 time += 1
 
-                alpha, beta = agent.ema_actor.forward_eval(state)
-                value = agent.ema_critic.forward_eval(state, past_action)
+                param1, param2 = agent.ema_actor.forward_eval(state)
 
-                dist = Beta(alpha, beta)
+                if agent.distribution == 'gaussian':
+                    dist = Normal(param1, param2)
+                elif agent.distribution == 'beta':
+                    dist = Beta(param1, param2)
+                elif agent.distribution == 'kumaraswamy':
+                    dist = Kumaraswamy(param1, param2)
+
                 action = dist.sample()
                 action_log_prob = dist.log_prob(action).sum(dim = -1)
                 
-                env_action = action * 2.0 - 1.0
+                if agent.distribution == 'gaussian':
+                    env_action = action.clamp(-1., 1.)
+                else:
+                    env_action = action * 2.0 - 1.0
                 env_action_item = env_action.cpu().numpy()
 
                 next_state, reward, terminated, truncated, _ = env.step(env_action_item)
@@ -699,6 +730,8 @@ def main(
                 reward = float(reward)
                 eps_reward += reward
                 eps_steps += 1
+
+                value = agent.ema_critic.forward_eval(state, past_action)
 
                 memory = memories.store(
                     learnable = True,
@@ -755,6 +788,10 @@ def main(
 
         if divisible_by(eps, save_every):
             agent.save()
+
+        if exists(stop_at_reward) and len(rolling_reward) >= rolling_window_size and np.mean(rolling_reward) >= stop_at_reward:
+            print(f"Rolling reward reached {stop_at_reward}, stopping training.")
+            break
 
 if __name__ == '__main__':
     fire.Fire(main)
