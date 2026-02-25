@@ -132,3 +132,13 @@ $ python train.py
     note    = {under review}
 }
 ```
+
+```bibtex
+@inproceedings{Seitzer2022Pitfalls,
+    title   = {On the Pitfalls of Heteroscedastic Uncertainty Estimation with Probabilistic Neural Networks},
+    author  = {Maximilian Seitzer and Abdul-Saboor Sheikh and Georg Martius},
+    booktitle = {International Conference on Learning Representations},
+    year    = {2022},
+    url     = {https://openreview.net/forum?id=9O_xF9y7A-}
+}
+```
