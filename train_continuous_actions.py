@@ -269,12 +269,12 @@ class Actor(Module):
 
         if self.distribution.lower() == 'gaussian':
             loc, scale = out.chunk(2, dim = -1)
-            loc = torch.tanh(loc) # bind loc to [-1, 1]
             scale = F.softplus(scale) + 1e-3
             return loc, scale
         else:
-            alpha_beta = F.softplus(out) + 1.0
-            alpha, beta = alpha_beta.chunk(2, dim = -1)
+            alpha, beta = out.chunk(2, dim = -1)
+            alpha = F.softplus(alpha) + 1.0
+            beta = F.softplus(beta) + 1.0
             return alpha, beta
 
 class Critic(Module):

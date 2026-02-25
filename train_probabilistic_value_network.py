@@ -343,7 +343,6 @@ class PPO(Module):
         asymmetric_spo = False,
         downweight_advantages_with_value_uncertainty = False,
         use_relative_value_uncertainty = False,
-        use_ratio_based_critic_loss = False,
         beta = 0.,
         eps = 1e-6,
         ema_kwargs: dict = dict(
@@ -389,7 +388,6 @@ class PPO(Module):
 
         self.downweight_advantages_with_value_uncertainty = downweight_advantages_with_value_uncertainty
         self.use_relative_value_uncertainty = use_relative_value_uncertainty
-        self.use_ratio_based_critic_loss = use_ratio_based_critic_loss
         self.beta = beta
         self.eps = eps
 
@@ -516,13 +514,6 @@ class PPO(Module):
 
                     log_prob = dist.log_prob(returns)
 
-                    if self.use_ratio_based_critic_loss:
-                        # ratio-based NLL loss (non-negative)
-                        # proposed by u/EngineersAreYourPals in "Have I discovered a SOTA probabilistic value head loss?"
-                        # https://www.reddit.com/r/reinforcementlearning/comments/1qjedp5/have_i_discovered_a_sota_probabilistic_value_head/
-
-                        log_prob = log_prob - dist.log_prob(mean).detach()
-
                     if self.beta > 0:
                         # Beta-NLL (Seitzer et al. 2022)
                         # weight the NLL loss by (variance)^beta to mitigate the effect of outliers
@@ -574,7 +565,6 @@ def main(
     video_folder = './probabilistic-value-recording-uncertainty',
     downweight_advantages_with_value_uncertainty = True,
     use_relative_value_uncertainty = True,
-    use_ratio_based_critic_loss = False,
     beta = 0.,
     uncertainty_exploration_bonus_weight = 0.,
     eps = 1e-6,
@@ -643,7 +633,6 @@ def main(
         asymmetric_spo,
         downweight_advantages_with_value_uncertainty,
         use_relative_value_uncertainty,
-        use_ratio_based_critic_loss,
         beta = beta,
         eps = eps
     ).to(device)
