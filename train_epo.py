@@ -5,7 +5,6 @@
 #   "ema-pytorch",
 #   "adam-atan2-pytorch",
 #   "hl-gauss-pytorch",
-#   "hyper-connections",
 #   "assoc-scan",
 #   "gymnasium[box2d,other]",
 #   "moviepy",
@@ -29,6 +28,8 @@ from shutil import rmtree
 from collections import deque
 from functools import partial
 
+from tqdm import tqdm
+
 from accelerate import Accelerator
 
 from torch import nn, tensor
@@ -40,11 +41,9 @@ from einops import reduce, rearrange, pack, unpack
 from ema_pytorch import EMA
 from adam_atan2_pytorch.adopt_atan2 import AdoptAtan2
 from hl_gauss_pytorch import HLGaussLoss
-from hyper_connections import ManifoldConstrainedHyperConnections
 from assoc_scan import AssocScan
 from memmap_replay_buffer import ReplayBuffer
 from evolutionary_policy_optimization import LatentGenePool
-from tqdm import tqdm
 
 # helpers
 
@@ -60,9 +59,13 @@ def divisible_by(num, den):
 def normalize(t, eps = 1e-5):
     return (t - t.mean()) / (t.std() + eps)
 
-def update_network_(loss, optimizer):
+def update_network_(loss, optimizer, network, max_grad_norm = None):
     optimizer.zero_grad()
     loss.mean().backward()
+
+    if exists(max_grad_norm):
+        torch.nn.utils.clip_grad_norm_(network.parameters(), max_grad_norm)
+
     optimizer.step()
 
 # SimBa - Kaist + SonyAI
@@ -79,29 +82,22 @@ class SimBa(Module):
         dim_hidden = None,
         depth = 3,
         dropout = 0.,
-        expansion_factor = 2,
-        num_residual_streams = 4
+        expansion_factor = 2
     ):
         super().__init__()
         """
         following the design of SimBa https://arxiv.org/abs/2410.09754v1
         """
 
-        self.num_residual_streams = num_residual_streams
-
         dim_hidden = default(dim_hidden, dim * expansion_factor)
-
-        layers = []
 
         self.proj_in = nn.Linear(dim, dim_hidden)
 
         dim_inner = dim_hidden * expansion_factor
 
-        # hyper connections
+        self.layers = ModuleList([])
 
-        init_hyper_conn, self.expand_stream, self.reduce_stream = ManifoldConstrainedHyperConnections.get_init_and_expand_reduce_stream_functions(1, num_fracs = num_residual_streams, sinkhorn_iters = 2)
-
-        for ind in range(depth):
+        for _ in range(depth):
 
             layer = nn.Sequential(
                 nn.RMSNorm(dim_hidden),
@@ -111,12 +107,9 @@ class SimBa(Module):
                 nn.Dropout(dropout),
             )
 
-            layer = init_hyper_conn(dim = dim_hidden, layer_index = ind, branch = layer)
-            layers.append(layer)
+            self.layers.append(layer)
 
         # final layer out
-
-        self.layers = ModuleList(layers)
 
         self.final_norm = nn.RMSNorm(dim_hidden)
 
@@ -128,12 +121,8 @@ class SimBa(Module):
 
         x = self.proj_in(x)
 
-        x = self.expand_stream(x)
-
         for layer in self.layers:
-            x = layer(x)
-
-        x = self.reduce_stream(x)
+            x = layer(x) + x
 
         out = self.final_norm(x)
 
@@ -266,6 +255,7 @@ class PPO(Module):
         eps_clip,
         value_clip,
         ema_decay,
+        max_grad_norm = 0.5,
         ema_kwargs: dict = dict(
             update_model_with_ema_every = 1000
         ),
@@ -307,6 +297,7 @@ class PPO(Module):
 
         self.eps_clip = eps_clip
         self.value_clip = value_clip
+        self.max_grad_norm = max_grad_norm
 
         self.save_path = Path(save_path)
 
@@ -383,7 +374,7 @@ class PPO(Module):
 
                 policy_loss = (policy_loss - self.beta_s * entropy).mean()
 
-                update_network_(policy_loss, self.opt_actor)
+                update_network_(policy_loss, self.opt_actor, self.actor, max_grad_norm = self.max_grad_norm)
 
                 # update critic
 
@@ -407,7 +398,7 @@ class PPO(Module):
 
                 value_loss = value_loss.mean()
 
-                update_network_(value_loss, self.opt_critic)
+                update_network_(value_loss, self.opt_critic, self.critic, max_grad_norm = self.max_grad_norm)
 
                 total_policy_loss += policy_loss.item()
                 total_value_loss += value_loss.item()
@@ -432,7 +423,7 @@ def main(
     critic_pred_num_bins = 250,
     reward_range = (-300., 300.),
     minibatch_size = 64,
-    lr = 0.0008,
+    lr = 3e-4,
     betas = (0.9, 0.99),
     lam = 0.95,
     gamma = 0.99,
@@ -449,7 +440,6 @@ def main(
     frac_natural_selected = 0.5,
     seed = None,
     render = True,
-    render_every_eps = 250,
     save_every = 1000,
     clear_videos = True,
     video_folder = './lunar-recording',
@@ -457,6 +447,8 @@ def main(
     memory_path = None,
     rolling_window_size = 100,
     stop_at_reward = None,
+    max_grad_norm = 0.5,
+    ga_weight_latest_fitness_more = True,
     use_wandb = False,
     wandb_project = 'epo',
     cpu = False
@@ -472,6 +464,7 @@ def main(
     accelerator.init_trackers(wandb_project)
 
     device = accelerator.device
+    torch.autograd.set_detect_anomaly(True)
 
     env = gym.vector.AsyncVectorEnv([make_env() for _ in range(num_envs)])
 
@@ -543,7 +536,8 @@ def main(
         cautious_factor,
         eps_clip,
         value_clip,
-        ema_decay
+        ema_decay,
+        max_grad_norm = max_grad_norm
     ).to(device)
 
     if load:
@@ -754,7 +748,18 @@ def main(
             can_update_ga = not is_evo or latent_counts.min() >= min_episodes_per_latent
 
             if can_update_ga:
-                fitness = tensor([np.mean(f).astype(np.float32) for f in latent_fitnesses], device = device) if is_evo else None
+                if ga_weight_latest_fitness_more:
+                    fitnesses = []
+                    for f in latent_fitnesses:
+                        if len(f) <= 1:
+                            fitnesses.append(np.mean(f))
+                            continue
+                        w = np.arange(1, len(f) + 1)
+                        weighted_mean = np.sum(np.array(f) * w) / np.sum(w)
+                        fitnesses.append(weighted_mean)
+                    fitness = tensor(fitnesses, dtype = torch.float32, device = device)
+                else:
+                    fitness = tensor([np.mean(f).astype(np.float32) for f in latent_fitnesses], device = device)
 
                 # logging fitness
 
