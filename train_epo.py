@@ -543,6 +543,10 @@ def main(
     if load:
         agent.load()
 
+    # seeds
+
+    base_seed = default(seed, np.random.randint(0, 1000000))
+
     if exists(seed):
         torch.manual_seed(seed)
         np.random.seed(seed)
@@ -554,7 +558,8 @@ def main(
     latent_fitnesses = [[] for _ in range(num_latents)] if is_evo else None
 
     # initialize environment
-    states, _ = env.reset(seed = seed)
+
+    states, _ = env.reset(seed = base_seed)
     states = torch.from_numpy(states).to(device)
 
     past_actions = torch.zeros(num_envs, num_actions).to(device)
