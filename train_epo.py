@@ -36,7 +36,7 @@ from torch.nn import Module, ModuleList
 import torch.nn.functional as F
 from torch.distributions import Categorical
 
-from einops import reduce, rearrange
+from einops import reduce, rearrange, pack, unpack
 from ema_pytorch import EMA
 from adam_atan2_pytorch.adopt_atan2 import AdoptAtan2
 from hl_gauss_pytorch import HLGaussLoss
@@ -69,7 +69,7 @@ def update_network_(loss, optimizer):
 
 class ReluSquared(Module):
     def forward(self, x):
-        return x.sign() * F.relu(x) ** 2
+        return F.relu(x) ** 2
 
 class SimBa(Module):
 
@@ -224,6 +224,10 @@ def calc_gae(
     assert values.shape[-1] == rewards.shape[-1]
     use_accelerated = default(use_accelerated, rewards.is_cuda)
 
+    rewards, ps = pack([rewards], '* n')
+    values, _ = pack([values], '* n')
+    masks, _ = pack([masks], '* n')
+
     values = F.pad(values, (0, 1), value = 0.)
 
     values, values_next = values[..., :-1], values[..., 1:]
@@ -235,7 +239,8 @@ def calc_gae(
 
     gae = scan(gates, delta)
 
-    return gae + values
+    ret = gae + values
+    return unpack(ret, ps, '* n')[0]
 
 # agent
 
@@ -323,32 +328,6 @@ class PPO(Module):
     def learn(self, memories: ReplayBuffer, device = None):
 
         hl_gauss = self.critic_hl_gauss_loss
-
-        # calculate generalized advantage estimate
-
-        dl = memories.dataloader(
-            batch_size = 4,
-            return_indices = True,
-            to_named_tuple = ('_index', 'is_boundary', 'value', 'reward'),
-            device = device
-        )
-
-        for indices, is_boundaries, values, rewards in dl:
-            with torch.no_grad():
-                masks = (1. - is_boundaries.float())
-                scalar_values = hl_gauss(values)
-
-                returns = calc_gae(
-                    rewards = rewards,
-                    masks = masks,
-                    lam = self.lam,
-                    gamma = self.gamma,
-                    values = scalar_values,
-                    use_accelerated = False
-                )
-
-                memories.data['returns'][indices.cpu(), :returns.shape[-1]] = returns.cpu().numpy()
-                memories.flush()
 
         # get data
 
@@ -447,7 +426,7 @@ def main(
     critic_hidden_dim = 256,
     num_latents = 8,
     dim_latent = 32,
-    update_timesteps = 8192,
+    at_least_timesteps_per_update = 8192,
     num_envs = 8,
     buffer_episodes = 20,
     critic_pred_num_bins = 250,
@@ -602,118 +581,150 @@ def main(
     rolling_reward = deque(maxlen = rolling_window_size)
     rolling_steps = deque(maxlen = rolling_window_size)
 
+    # collector per env
+
+    collectors = [[] for _ in range(num_envs)]
+
     pbar = tqdm(desc = 'timesteps')
-    
-    # determine how many full rollouts of max_timesteps to collect per update
-    num_rollouts_per_update = max(1, update_timesteps // (num_envs * max_timesteps))
 
     # main loop
 
     while time < num_episodes * max_timesteps:
 
-        for _ in range(num_rollouts_per_update):
-            with memories.batched_episode(batch_size = num_envs):
-                for _ in range(max_timesteps):
-                    time += num_envs
-                    pbar.update(num_envs)
+        timesteps_since_update = 0
+        envs_done_since_last_update = torch.zeros(num_envs, dtype = torch.bool, device = device)
 
+        while timesteps_since_update < at_least_timesteps_per_update or not envs_done_since_last_update.all():
+            pbar.update(num_envs)
+            time += num_envs
+            timesteps_since_update += num_envs
+
+            with torch.no_grad():
+                action_probs = agent.ema_actor.forward_eval(states, latent = latents)
+                dist = Categorical(action_probs)
+
+                actions = dist.sample()
+                action_log_probs = dist.log_prob(actions)
+
+                values = agent.ema_critic.forward_eval(states, past_actions, latent = latents)
+
+            env_actions = actions.cpu().numpy()
+
+            next_states, rewards, terminateds, truncateds, _ = env.step(env_actions)
+
+            rewards = torch.from_numpy(rewards).float().to(device)
+            next_states = torch.from_numpy(next_states).to(device)
+
+            eps_rewards += rewards
+            eps_steps += 1
+
+            # store in local collectors
+
+            for i in range(num_envs):
+                collectors[i].append(dict(
+                    learnable = True,
+                    state = states[i],
+                    action = actions[i],
+                    action_log_prob = action_log_probs[i],
+                    reward = rewards[i],
+                    is_boundary = terminateds[i],
+                    value = values[i],
+                    past_action = past_actions[i],
+                    latent = latents[i] if exists(latents) else None
+                ))
+
+            states = next_states
+            past_actions = F.one_hot(actions, num_classes = num_actions).float()
+
+            # check for completions
+
+            for i in range(num_envs):
+                done = terminateds[i] or truncateds[i]
+
+                if not done:
+                    continue
+
+                envs_done_since_last_update[i] = True
+
+                # calculate GAE and store
+
+                collector = collectors[i]
+                ep_len = len(collector)
+
+                ep_rewards = torch.stack([c['reward'] for c in collector])
+                ep_values = torch.stack([c['value'] for c in collector])
+                ep_masks = torch.ones_like(ep_rewards)
+
+                # hl_gauss converts the bin-based values to scalar values
+                hl_gauss = agent.critic_hl_gauss_loss
+                scalar_ep_values = hl_gauss(ep_values)
+
+                next_value = 0.
+
+                if truncateds[i]:
                     with torch.no_grad():
-                        action_probs = agent.ema_actor.forward_eval(states, latent = latents)
-                        dist = Categorical(action_probs)
+                        next_value = hl_gauss(agent.ema_critic.forward_eval(states[i], past_actions[i], latent = latents[i] if exists(latents) else None)).item()
 
-                        actions = dist.sample()
-                        action_log_probs = dist.log_prob(actions)
+                ep_returns = calc_gae(ep_rewards, scalar_ep_values, ep_masks, lam = lam, gamma = gamma, use_accelerated = False)
 
-                        values = agent.ema_critic.forward_eval(states, past_actions, latent = latents)
+                if truncateds[i]:
+                    # simple gae bootstrap adjustment for truncation
+                    # return = reward + gamma * next_value
+                    # add the discounted next value
+                    ep_returns += (gamma ** torch.arange(ep_len, device = device).flip(0)) * next_value
 
-                    env_actions = actions.cpu().numpy()
+                # store in memories
 
-                    next_states, rewards, terminateds, truncateds, _ = env.step(env_actions)
+                ep_data = {}
 
-                    rewards = torch.from_numpy(rewards).float().to(device)
-                    next_states = torch.from_numpy(next_states).to(device)
+                for key in collector[0].keys():
+                    if key == 'latent' and not is_evo:
+                        continue
 
-                    eps_rewards += rewards
-                    eps_steps += 1
+                    entries = [c[key] for c in collector]
 
-                    # store in memories
+                    if not torch.is_tensor(entries[0]):
+                        entries = [tensor(e, device = device) for e in entries]
 
-                    store_kwargs = dict(
-                        learnable = torch.full((num_envs,), True, device = device),
-                        state = states,
-                        action = actions,
-                        action_log_prob = action_log_probs,
-                        reward = rewards,
-                        is_boundary = torch.from_numpy(terminateds).to(device),
-                        value = values.squeeze(-1),
-                        past_action = past_actions
-                    )
+                    ep_data[key] = torch.stack(entries)
 
-                    if dim_latent > 0:
-                        store_kwargs['latent'] = latents
+                ep_data['returns'] = ep_returns
 
-                    memories.store_batch(**store_kwargs)
+                memories.store_episode(**ep_data)
 
-                    states = next_states
-                    past_actions = F.one_hot(actions, num_classes = num_actions).float()
+                # reset collector and env state
 
-                    # check for completions
+                collectors[i] = []
+                past_actions[i] = 0.
 
-                    for i in range(num_envs):
-                        done = terminateds[i] or truncateds[i]
+                # update fitness
 
-                        if not done:
-                            continue
+                if is_evo:
+                    latent_id = env_latent_ids[i].item()
+                    latent_fitnesses[latent_id].append(eps_rewards[i].item())
 
-                        # update fitness
+                # record for rolling statistics
 
-                        if is_evo:
-                            latent_id = env_latent_ids[i].item()
-                            latent_fitnesses[latent_id].append(eps_rewards[i].item())
+                rolling_reward.append(eps_rewards[i].item())
+                rolling_steps.append(eps_steps[i].item())
 
-                        # record for rolling statistics
+                eps_rewards[i] = 0.
+                eps_steps[i] = 0.
 
-                        rolling_reward.append(eps_rewards[i].item())
-                        rolling_steps.append(eps_steps[i].item())
+                # systematic new latent
 
-                        eps_rewards[i] = 0.
-                        eps_steps[i] = 0.
+                if is_evo:
+                    new_latent_id = latent_id_to_sample
+                    env_latent_ids[i] = new_latent_id
+                    latents[i] = latent_pool(new_latent_id)
 
-                        # systematic new latent
+                    latent_id_to_sample = (latent_id_to_sample + 1) % num_latents
 
-                        if is_evo:
-                            new_latent_id = latent_id_to_sample
-                            env_latent_ids[i] = new_latent_id
-                            latents[i] = latent_pool(new_latent_id)
-
-                            latent_id_to_sample = (latent_id_to_sample + 1) % num_latents
-
-                    if len(rolling_reward) > 0:
-                        pbar.set_postfix(
-                            reward = f'{np.mean(rolling_reward):.2f}',
-                            steps = f'{np.mean(rolling_steps):.1f}'
-                        )
-
-                # store bootstrap values for all envs at the end of collection block
-
-                with torch.no_grad():
-                    next_values = agent.ema_critic.forward_eval(states, past_actions, latent = latents)
-
-                store_kwargs = dict(
-                    learnable = torch.full((num_envs,), False, device = device),
-                    state = states,
-                    action = actions, # dummy
-                    action_log_prob = action_log_probs, # dummy
-                    reward = torch.zeros(num_envs, device = device), # dummy
-                    is_boundary = torch.full((num_envs,), True, device = device),
-                    value = next_values.squeeze(-1),
-                    past_action = past_actions # dummy
+            if len(rolling_reward) > 0:
+                pbar.set_postfix(
+                    reward = f'{np.mean(rolling_reward):.2f}',
+                    steps = f'{np.mean(rolling_steps):.1f}'
                 )
-
-                if dim_latent > 0:
-                    store_kwargs['latent'] = latents
-
-                memories.store_batch(**store_kwargs)
 
         # updating of the agent
 
@@ -808,7 +819,7 @@ def main(
 
                     latent_fitnesses = [[] for _ in range(num_latents)]
 
-        if divisible_by(num_policy_updates, save_every // update_timesteps + 1):
+        if divisible_by(num_policy_updates, save_every // at_least_timesteps_per_update + 1):
             agent.save()
 
         if exists(stop_at_reward) and len(rolling_reward) >= rolling_window_size and np.mean(rolling_reward) >= stop_at_reward:
