@@ -142,3 +142,13 @@ $ python train.py
     url     = {https://openreview.net/forum?id=9O_xF9y7A-}
 }
 ```
+
+```bibtex
+@inproceedings{Wang2025EvolutionaryPO,
+    title   = {Evolutionary Policy Optimization},
+    author  = {Jianren Wang and Yifan Su and Abhinav Gupta and Deepak Pathak},
+    booktitle = {Advances in Neural Information Processing Systems},
+    year    = {2025},
+    url     = {https://arxiv.org/abs/2503.19037}
+}
+```
