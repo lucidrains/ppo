@@ -419,7 +419,7 @@ def main(
     dim_latent = 32,
     at_least_timesteps_per_update = 8192,
     num_envs = 8,
-    buffer_episodes = 20,
+    buffer_episodes = 40,
     critic_pred_num_bins = 250,
     reward_range = (-300., 300.),
     minibatch_size = 64,
@@ -438,6 +438,8 @@ def main(
     min_episodes_per_latent = 2,
     frac_tournaments = 0.5,
     frac_natural_selected = 0.5,
+    num_islands = 1,
+    migrate_every = 2,
     seed = None,
     render = True,
     save_every = 1000,
@@ -484,8 +486,11 @@ def main(
     if is_evo:
         latent_pool = LatentGenePool(
             num_latents = num_latents,
+            num_islands = num_islands,
             dim_latent = dim_latent,
             l2norm_latent = True,
+            migrate_every = migrate_every,
+            apply_genetic_algorithm_every = 1,
             frac_tournaments = frac_tournaments,
             frac_natural_selected = frac_natural_selected
         ).to(device)
