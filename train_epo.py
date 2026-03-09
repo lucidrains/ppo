@@ -568,7 +568,7 @@ def main(
     states = torch.from_numpy(states).to(device)
 
     past_actions = torch.zeros(num_envs, num_actions).to(device)
-    
+
     # assign latents to each env initially, cycling through them
     env_latent_ids = None
     latents = None

@@ -477,7 +477,7 @@ class PPO(Module):
             values,
             post_values
         ) = zip(*memories)
-        
+
         actions = [tensor(action) for action in actions]
         masks = [(1. - float(is_boundary)) for is_boundary in is_boundaries]
 
@@ -509,7 +509,7 @@ class PPO(Module):
         states = to_torch_tensor(states)
         actions = to_torch_tensor(actions)
         old_values = to_torch_tensor(values)
-        old_log_probs = to_torch_tensor(old_log_probs)        
+        old_log_probs = to_torch_tensor(old_log_probs)
 
         if use_post_decision:
             old_post_values = to_torch_tensor(post_values)

@@ -696,7 +696,7 @@ def main(
         state = torch.from_numpy(state).to(device)
 
         past_action = torch.zeros(action_dim).to(device)
-        
+
         eps_reward = 0.
         eps_steps = 0
 
@@ -715,7 +715,7 @@ def main(
 
                 action = dist.sample()
                 action_log_prob = dist.log_prob(action).sum(dim = -1)
-                
+
                 if agent.distribution == 'gaussian':
                     env_action = action.clamp(-1., 1.)
                 else:

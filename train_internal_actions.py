@@ -6,7 +6,7 @@ from shutil import rmtree
 from copy import deepcopy
 from functools import partial
 from itertools import zip_longest
-from collections import deque, namedtuple
+from collections import deque
 from random import randrange
 
 import numpy as np
@@ -31,23 +31,11 @@ from assoc_scan import AssocScan
 
 import gymnasium as gym
 
+from memmap_replay_buffer import ReplayBuffer
+
 # constants
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-# memory tuple
-
-Memory = namedtuple('Memory', [
-    'learnable',
-    'state',
-    'action',
-    'action_log_prob',
-    'reward',
-    'is_boundary',
-    'value',
-    'internal_actions',
-    'internal_action_logits'
-])
 
 # helpers
 
@@ -61,7 +49,7 @@ def divisible_by(num, den):
     return (num % den) == 0
 
 def normalize(t, eps = 1e-5):
-    return (t - t.mean()) / (t.std() + eps)
+    return (t - t.mean()) / t.std(unbiased = False).clamp(min = eps)
 
 def update_network_(loss, optimizer):
     optimizer.zero_grad()
@@ -153,17 +141,20 @@ class GumbelSoLU(Module):
         logits = rearrange(x, '... (segments d) -> ... segments d', segments = self.softmax_segments)
 
         if not exists(actions):
-            one_hot = F.gumbel_softmax(logits, hard = True, dim = -1)
-            actions = one_hot.argmax(dim = -1)
-        else:
-            prob = logits.softmax(dim = -1)
-            one_hot = F.one_hot(actions, prob.shape[-1]).float()
-            one_hot = one_hot + prob - prob.detach()
+            if self.training:
+                dist = torch.distributions.Categorical(logits = logits)
+                actions = dist.sample()
+            else:
+                actions = logits.argmax(dim = -1)
 
+        prob = logits.softmax(dim = -1)
+        one_hot = F.one_hot(actions.long(), prob.shape[-1]).float()
+
+        # straight through estimator
+        one_hot = one_hot + prob - prob.detach()
         one_hot = rearrange(one_hot, '... segments d -> ... (segments d)')
-        output = self.norm(x * one_hot)
 
-        return output, (logits, actions)
+        return self.norm(x * one_hot), (logits, actions)
 
 class FeedForward(Module):
     def __init__(
@@ -171,17 +162,23 @@ class FeedForward(Module):
         dim,
         expansion_factor,
         gumbel_sample = False,
-        dropout = 0.
+        dropout = 0.,
+        softmax_segments = 3
     ):
         super().__init__()
         dim_inner = int(dim * expansion_factor)
 
-        self.keys = nn.Sequential(
+        self.proj_gelu = nn.Sequential(
             nn.RMSNorm(dim),
             nn.Linear(dim, dim_inner),
         )
 
-        self.activation = GumbelSoLU(dim_inner, expansion_factor) if gumbel_sample else SoLU(dim_inner, expansion_factor)
+        self.proj_solu = nn.Sequential(
+            nn.RMSNorm(dim),
+            nn.Linear(dim, dim_inner),
+        )
+
+        self.activation = GumbelSoLU(dim_inner, softmax_segments) if gumbel_sample else SoLU(dim_inner, softmax_segments)
 
         self.values = nn.Sequential(
             nn.Linear(dim_inner, dim),
@@ -193,15 +190,17 @@ class FeedForward(Module):
         queries,
         actions = None
     ):
-        
-        sim = self.keys(queries)
 
-        attn, logits_and_actions = self.activation(sim, actions)
+        sim = self.proj_gelu(queries)
+        sim2 = self.proj_solu(queries)
+
+        attn, logits_and_actions = self.activation(sim2, actions)
+
+        attn = F.gelu(sim) + attn
 
         return self.values(attn), logits_and_actions
 
 class SimBa(Module):
-
     def __init__(
         self,
         dim,
@@ -209,7 +208,9 @@ class SimBa(Module):
         depth = 3,
         dropout = 0.,
         expansion_factor = 3,
-        ff_solu_gumbel_sample = False
+        ff_solu_gumbel_sample = False,
+        num_internal_actions = 4,
+        internal_action_dim = 3
     ):
         super().__init__()
         """
@@ -224,7 +225,7 @@ class SimBa(Module):
 
         for ind in range(depth):
 
-            layer = FeedForward(dim_hidden, expansion_factor, gumbel_sample = ff_solu_gumbel_sample)
+            layer = FeedForward(dim_hidden, expansion_factor, gumbel_sample = ff_solu_gumbel_sample, softmax_segments = internal_action_dim)
             layers.append(layer)
 
         # final layer out
@@ -272,9 +273,11 @@ class Actor(Module):
         state_dim,
         hidden_dim,
         num_actions,
-        mlp_depth = 4,
+        mlp_depth = 6,
         dropout = 0.1,
-        rsmnorm_input = True  # use the RSMNorm for inputs proposed by KAIST + SonyAI
+        rsmnorm_input = True,
+        num_internal_actions = 4,
+        internal_action_dim = 3
     ):
         super().__init__()
         self.rsmnorm = RSMNorm(state_dim) if rsmnorm_input else nn.Identity()
@@ -284,7 +287,9 @@ class Actor(Module):
             dim_hidden = hidden_dim * 2,
             depth = mlp_depth,
             dropout = dropout,
-            ff_solu_gumbel_sample = True
+            ff_solu_gumbel_sample = True,
+            num_internal_actions = num_internal_actions,
+            internal_action_dim = internal_action_dim
         )
 
         self.action_head = nn.Sequential(
@@ -304,9 +309,9 @@ class Actor(Module):
 
         hidden, logits_and_actions = self.net(x, actions = actions)
 
-        action_probs = self.action_head(hidden).softmax(dim = -1)
+        action_logits = self.action_head(hidden)
 
-        return action_probs, logits_and_actions
+        return action_logits, logits_and_actions
 
 class Critic(Module):
     def __init__(
@@ -316,7 +321,9 @@ class Critic(Module):
         dim_pred = 1,
         mlp_depth = 6, # recent paper has findings that show scaling critic is more important than scaling actor
         dropout = 0.1,
-        rsmnorm_input = True
+        rsmnorm_input = True,
+        num_internal_actions = 4,
+        internal_action_dim = 3
     ):
         super().__init__()
         self.rsmnorm = RSMNorm(state_dim) if rsmnorm_input else nn.Identity()
@@ -326,7 +333,9 @@ class Critic(Module):
             dim_hidden = hidden_dim,
             depth = mlp_depth,
             dropout = dropout,
-            ff_solu_gumbel_sample = False
+            ff_solu_gumbel_sample = False,
+            num_internal_actions = num_internal_actions,
+            internal_action_dim = internal_action_dim
         )
 
         self.value_head = nn.Linear(hidden_dim, dim_pred)
@@ -356,7 +365,7 @@ def calc_gae(
     use_accelerated = default(use_accelerated, rewards.is_cuda)
 
     values = F.pad(values, (0, 1), value = 0.)
-    values, values_next = values[:-1], values[1:]
+    values, values_next = values[..., :-1], values[..., 1:]
 
     delta = rewards + gamma * values_next * masks - values
     gates = gamma * lam * masks
@@ -382,6 +391,7 @@ class PPO(Module):
         reward_range: tuple[float, float],
         epochs,
         minibatch_size,
+        gae_batch_size,
         lr,
         betas,
         lam,
@@ -393,6 +403,8 @@ class PPO(Module):
         value_clip,
         ema_decay,
         internal_policy_loss_weight = 0.1,
+        num_internal_actions = 4,
+        internal_action_dim = 3,
         ema_kwargs: dict = dict(
             update_model_with_ema_every = 1000
         ),
@@ -400,9 +412,9 @@ class PPO(Module):
     ):
         super().__init__()
 
-        self.actor = Actor(state_dim, actor_hidden_dim, num_actions)
+        self.actor = Actor(state_dim, actor_hidden_dim, num_actions, mlp_depth=num_internal_actions, internal_action_dim=internal_action_dim)
 
-        self.critic = Critic(state_dim, critic_hidden_dim, dim_pred = critic_pred_num_bins)
+        self.critic = Critic(state_dim, critic_hidden_dim, dim_pred = critic_pred_num_bins, mlp_depth=num_internal_actions, internal_action_dim=internal_action_dim)
 
         # weight tie rsmnorm
 
@@ -430,6 +442,7 @@ class PPO(Module):
         # learning hparams
 
         self.minibatch_size = minibatch_size
+        self.gae_batch_size = gae_batch_size
 
         self.epochs = epochs
 
@@ -458,84 +471,75 @@ class PPO(Module):
         self.actor.load_state_dict(data['actor'])
         self.critic.load_state_dict(data['critic'])
 
-    def learn(self, memories):
+    def learn(self, memories: ReplayBuffer, device = device):
         hl_gauss = self.critic_hl_gauss_loss
 
-        # retrieve and prepare data from memory for training
-
-        (
-            learnable,
-            states,
-            actions,
-            old_log_probs,
-            rewards,
-            is_boundaries,
-            values,
-            internal_actions,
-            internal_action_logits
-        ) = zip(*memories)
-        
-        actions = [tensor(action) for action in actions]
-        masks = [(1. - float(is_boundary)) for is_boundary in is_boundaries]
-
         # calculate generalized advantage estimate
+        # Since this is a circular buffer, we compute GAE for all valid trajectories.
+        # This is very fast when done periodically (e.g. every 5000 steps) rather than every timestep.
 
-        scalar_values = hl_gauss(stack(values))
+        dl = memories.dataloader(
+            batch_size = self.gae_batch_size,
+            return_indices = True,
+            to_named_tuple = ('_index', 'is_boundary', 'value', 'reward'),
+            device = device
+        )
 
-        with torch.no_grad():
-            calc_gae_from_values = partial(calc_gae,
-                rewards = tensor(rewards).to(device),
-                masks = tensor(masks).to(device),
-                lam = self.lam,
-                gamma = self.gamma,
-                use_accelerated = False
-            )
+        for indices, is_boundaries, values, rewards in dl:
+            with torch.no_grad():
+                masks = (1. - is_boundaries.float())
+                scalar_values = hl_gauss(values.to(device))
 
-            returns = calc_gae_from_values(values = scalar_values)
+                returns = calc_gae(
+                    rewards = rewards,
+                    masks = masks,
+                    lam = self.lam,
+                    gamma = self.gamma,
+                    values = scalar_values.cpu(),
+                    use_accelerated = False
+                )
 
-        # convert values to torch tensors
+                memories.data['returns'][indices, :returns.shape[-1]] = returns.cpu().numpy()
+        memories.flush()
 
-        to_torch_tensor = lambda t: stack(t).to(device).detach()
+        # get data
 
-        states = to_torch_tensor(states)
-        actions = to_torch_tensor(actions)
-        old_values = to_torch_tensor(values)
-        old_log_probs = to_torch_tensor(old_log_probs)        
+        dl = memories.dataloader(
+            batch_size = self.minibatch_size,
+            shuffle = True,
+            filter_fields = dict(
+                learnable = True
+            ),
+            to_named_tuple = ('state', 'action', 'action_log_prob', 'returns', 'value', 'internal_actions', 'internal_action_logits'),
+            timestep_level = True,
+            device = device
+        )
 
-        # internal choices
+        rsmnorm_copy = deepcopy(self.rsmnorm)
+        rsmnorm_copy.train()
 
-        internal_actions = to_torch_tensor(internal_actions)
-        old_internal_action_logits = to_torch_tensor(internal_action_logits)
+        self.actor.train()
+        self.critic.train()
 
-        # prepare dataloader for policy phase training
-
-        learnable = tensor(learnable).to(device)
-        data = (states, actions, old_log_probs, returns, old_values, internal_actions, old_internal_action_logits)
-        data = tuple(t[learnable] for t in data)
-
-        dataset = TensorDataset(*data)
-
-        dl = DataLoader(dataset, batch_size = self.minibatch_size, shuffle = True)
+        torch.autograd.set_detect_anomaly(True)
 
         # policy phase training, similar to original PPO
 
         for _ in range(self.epochs):
             for i, (states, actions, old_log_probs, returns, old_values, internal_actions, old_internal_action_logits) in enumerate(dl):
 
-                action_probs, internals = self.actor(states, internal_actions)
+                action_logits, internals = self.actor(states, internal_actions)
                 internal_action_logits = stack(tuple(t[0] for t in internals), dim = 1)
 
-                dist = Categorical(action_probs)
+                dist = Categorical(logits = action_logits)
                 action_log_probs = dist.log_prob(actions)
                 entropy = dist.entropy()
 
-                internal_action_probs = internal_action_logits.softmax(dim = -1)
-                internal_dist = Categorical(internal_action_probs)
+                internal_dist = Categorical(logits = internal_action_logits)
                 internal_log_probs = internal_dist.log_prob(internal_actions)
                 internal_entropy = internal_dist.entropy()
 
-                old_internal_action_probs = old_internal_action_logits.softmax(dim = -1)
-                old_internal_dist = Categorical(old_internal_action_probs)
+                old_internal_dist = Categorical(logits = old_internal_action_logits)
                 old_internal_log_probs = old_internal_dist.log_prob(internal_actions)
 
                 action_log_probs, _ = pack([action_log_probs, internal_log_probs], 'b *')
@@ -613,8 +617,12 @@ def main(
     actor_hidden_dim = 64,
     critic_hidden_dim = 256,
     critic_pred_num_bins = 250,
-    reward_range = (-100., 100.),
+    reward_range = (-3., 3.),
+    reward_norm = 100.,
+    update_episodes = 50,
+    buffer_episodes = 100,
     minibatch_size = 64,
+    gae_batch_size = 32,
     lr = 0.0008,
     betas = (0.9, 0.99),
     lam = 0.95,
@@ -625,8 +633,9 @@ def main(
     regen_reg_rate = 1e-4,
     cautious_factor = 0.1,
     ema_decay = 0.9,
-    update_timesteps = 5000,
     epochs = 2,
+    num_internal_actions = 4,
+    internal_action_dim = 3,
     seed = None,
     render = True,
     render_every_eps = 250,
@@ -652,7 +661,25 @@ def main(
     state_dim = env.observation_space.shape[0]
     num_actions = env.action_space.n
 
-    memories = deque([])
+    memories = ReplayBuffer(
+        './lunar-lander-memories/internal-actions',
+        max_episodes = buffer_episodes,
+        max_timesteps = max_timesteps + 1,
+        fields = dict(
+            learnable = 'bool',
+            state = ('float', state_dim),
+            action = 'int',
+            action_log_prob = 'float',
+            reward = 'float',
+            is_boundary = 'bool',
+            value = ('float', critic_pred_num_bins),
+            returns = 'float',
+            internal_actions = ('int', (num_internal_actions, internal_action_dim)),
+            internal_action_logits = ('float', (num_internal_actions, internal_action_dim, actor_hidden_dim * 2))
+        ),
+        circular = True,
+        overwrite = True
+    )
 
     agent = PPO(
         state_dim,
@@ -663,6 +690,7 @@ def main(
         reward_range,
         epochs,
         minibatch_size,
+        gae_batch_size,
         lr,
         betas,
         lam,
@@ -673,6 +701,8 @@ def main(
         eps_clip,
         value_clip,
         ema_decay,
+        num_internal_actions = num_internal_actions,
+        internal_action_dim = internal_action_dim
 
     ).to(device)
 
@@ -686,68 +716,98 @@ def main(
     time = 0
     num_policy_updates = 0
 
-    for eps in tqdm(range(num_episodes), desc = 'episodes'):
+    running_rewards = deque(maxlen = 100)
+    running_steps = deque(maxlen = 100)
 
+    pbar = tqdm(range(num_episodes), desc = 'episodes')
+
+    for eps in pbar:
         state, _ = env.reset(seed = seed)
         state = torch.from_numpy(state).to(device)
 
-        for timestep in range(max_timesteps):
-            time += 1
+        cum_reward = 0.
+        steps = 0
 
-            action_probs, internals = agent.ema_actor.forward_eval(state)
-            value = agent.ema_critic.forward_eval(state)
+        with memories.one_episode():
+            for timestep in range(max_timesteps):
+                time += 1
+                steps += 1
 
-            dist = Categorical(action_probs)
-            action = dist.sample()
-            action_log_prob = dist.log_prob(action)
-            action = action.item()
+                with torch.no_grad():
+                    action_logits, internals = agent.ema_actor.forward_eval(state)
+                    value = agent.ema_critic.forward_eval(state)
 
-            next_state, reward, terminated, truncated, _ = env.step(action)
+                dist = Categorical(logits = action_logits)
+                action = dist.sample()
+                action_log_prob = dist.log_prob(action)
+                action = action.item()
 
-            next_state = torch.from_numpy(next_state).to(device)
+                next_state, reward, terminated, truncated, _ = env.step(action)
 
-            reward = float(reward)
+                next_state = torch.from_numpy(next_state).to(device)
 
-            internal_action_logits, internal_actions = tuple(rearrange(stack(t), 'l 1 ... -> l ...') for t in zip(*internals))
+                reward = float(reward)
+                cum_reward += reward
 
-            memory = Memory(True, state, action, action_log_prob, reward, terminated, value, internal_actions, internal_action_logits)
+                normalized_reward = reward / reward_norm
 
-            memories.append(memory)
+                internal_action_logits, internal_actions = tuple(rearrange(stack(t), 'l 1 ... -> l ...') for t in zip(*internals))
 
-            state = next_state
-
-            # determine if truncating, either from environment or learning phase of the agent
-
-            updating_agent = divisible_by(time, update_timesteps)
-            done = terminated or truncated or updating_agent
-
-            # take care of truncated by adding a non-learnable memory storing the next value for GAE
-
-            if done and not terminated:
-                next_value = agent.ema_critic.forward_eval(state)
-
-                bootstrap_value_memory = memory._replace(
-                    state = state,
-                    learnable = False,
-                    is_boundary = True,
-                    value = next_value,
+                memories.store(
+                    learnable = True,
+                    state = state.cpu(),
+                    action = action,
+                    action_log_prob = action_log_prob.item(),
+                    reward = normalized_reward,
+                    is_boundary = terminated,
+                    value = value.cpu(),
+                    internal_actions = internal_actions.cpu(),
+                    internal_action_logits = internal_action_logits.cpu()
                 )
 
-                memories.append(bootstrap_value_memory)
+                state = next_state
 
-            # updating of the agent
+                # determine if truncating, either from environment or learning phase of the agent
 
-            if updating_agent:
-                agent.learn(memories)
-                num_policy_updates += 1
-                memories.clear()
+                done = terminated or truncated
 
-            # break if done
+                # take care of truncated by adding a non-learnable memory storing the next value for GAE
 
-            if done:
-                break
+                if done and not terminated:
+                    if memories.timestep_index < memories.max_timesteps:
+                        next_value = agent.ema_critic.forward_eval(state)
 
-        if divisible_by(eps, save_every):
+                        memories.store(
+                            learnable = False,
+                            state = state.cpu(),
+                            action = action, # dummy
+                            action_log_prob = action_log_prob.item(), # dummy
+                            reward = 0.,
+                            is_boundary = True,
+                            value = next_value.cpu(),
+                            internal_actions = internal_actions.cpu(), # dummy
+                            internal_action_logits = internal_action_logits.cpu() # dummy
+                        )
+
+                # break if done
+
+                if done:
+                    running_rewards.append(cum_reward)
+                    running_steps.append(steps)
+                    avg_reward = sum(running_rewards) / len(running_rewards)
+                    avg_steps = sum(running_steps) / len(running_steps)
+                    pbar.set_postfix(reward = round(avg_reward, 2), steps = round(avg_steps, 2))
+                    break
+
+        # updating of the agent
+
+        updating_agent = divisible_by(eps + 1, update_episodes)
+
+        if updating_agent:
+            agent.learn(memories)
+            num_policy_updates += 1
+
+        if divisible_by(eps, save_every) and eps > 0:
             agent.save()
 
 if __name__ == '__main__':

@@ -267,7 +267,7 @@ class Critic(Module):
         )
 
         self.value_head = nn.Linear(hidden_dim, 2)
-        
+
         self.min_log_var = min_log_var
         self.max_log_var = max_log_var
 
@@ -281,7 +281,7 @@ class Critic(Module):
         hidden = self.net(x)
 
         out = self.value_head(hidden)
-        
+
         mean, log_var = out.chunk(2, dim = -1)
 
         # log_var is clamped for stability
@@ -473,7 +473,7 @@ class PPO(Module):
                     uncertainty = old_value_stds.detach()
                     if self.use_relative_value_uncertainty:
                         uncertainty = uncertainty / (old_values.abs().detach() + self.eps)
-                    
+
                     factor = 2 * torch.sigmoid(-uncertainty)
                     advantages = advantages * factor
 
@@ -509,7 +509,7 @@ class PPO(Module):
                     mean, std = critic(states, past_action)
 
                     dist = Normal(mean, std)
-                    
+
                     # negative log likelihood of simple gaussian
 
                     log_prob = dist.log_prob(returns)
@@ -661,7 +661,7 @@ def main(
     eps_steps = np.zeros(num_envs)
 
     pbar = tqdm(total = num_episodes, desc = 'episodes')
-    
+
     while total_eps < num_episodes:
 
         with memories.batched_episode(batch_size = num_envs):
@@ -674,7 +674,7 @@ def main(
                 dist = Categorical(action_probs)
                 actions = dist.sample()
                 action_log_probs = dist.log_prob(actions)
-                
+
                 next_states, environment_rewards, terminateds, truncateds, infos = env.step(actions.cpu().numpy())
 
                 rewards = torch.from_numpy(environment_rewards).float()
@@ -737,7 +737,7 @@ def main(
                     # but only if we have space in the buffer for one more step
                     if memories.timestep_index < max_timesteps:
                         next_means, next_stds = agent.ema_critic.forward_eval(states, past_actions)
-                        
+
                         memories.store_batch(
                             learnable = torch.zeros(num_envs, dtype = torch.bool),
                             state = states,

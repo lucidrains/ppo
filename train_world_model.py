@@ -119,7 +119,7 @@ class WorldModelActorCritic(Module):
 
         self.to_dones = nn.Sequential(
             nn.Linear(dim * 2, 2),
-            nn.Sigmoid()            
+            nn.Sigmoid()
         )
 
         self.to_pred = nn.Sequential(
@@ -510,7 +510,7 @@ class PPO(Module):
         scalar_values = hl_gauss(values)
 
         returns = calc_gae(
-            rewards = rewards,            
+            rewards = rewards,
             masks = masks,
             lam = self.lam,
             gamma = self.gamma,
@@ -744,7 +744,7 @@ def main(
 
         for timestep in range(max_timesteps):
             time += 1
-            
+
             action_probs, value = state_to_pred_action_and_value(state, prev_action, prev_reward)
 
             dist = Categorical(action_probs)

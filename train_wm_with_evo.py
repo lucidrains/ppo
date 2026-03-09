@@ -131,7 +131,7 @@ class WorldModelActorCritic(Module):
 
         self.to_dones = nn.Sequential(
             nn.Linear(dim * 2, 2),
-            nn.Sigmoid()            
+            nn.Sigmoid()
         )
 
         self.to_pred = nn.Sequential(
@@ -487,10 +487,10 @@ class PPO(Module):
         # evolution optimization
 
         self.evo_layer_index = default(evo_layer_index, 0)
-        
+
         if exists(self.evo_layer_index):
             # evo layer now acts on the actor transformer layers
-            
+
             num_actor_layers = len(self.model.actor_transformer.layers)
             self.evo_layer_index = min(self.evo_layer_index, num_actor_layers - 1)
 
@@ -540,7 +540,7 @@ class PPO(Module):
         hl_gauss = self.model.critic_hl_gauss_loss
 
         # retrieve and prepare data from buffer for training
-        
+
         data = replay_buffer.get_all_data()
         num_episodes = replay_buffer.num_episodes
 
@@ -554,7 +554,7 @@ class PPO(Module):
         is_boundaries = to_device(data['is_boundary'][:num_episodes])
         values = to_device(data['value'][:num_episodes])
         dones = to_device(data['dones'][:num_episodes])
-        
+
         episode_lens = torch.from_numpy(replay_buffer.meta_data['episode_lens'][:num_episodes]).to(device)
 
         masks = ~is_boundaries
@@ -564,7 +564,7 @@ class PPO(Module):
         scalar_values = hl_gauss(values)
 
         returns = calc_gae(
-            rewards = rewards,            
+            rewards = rewards,
             masks = masks,
             lam = self.lam,
             gamma = self.gamma,
@@ -903,7 +903,7 @@ def main(
 
         for timestep in range(max_timesteps):
             time += 1
-            
+
             action_probs, value = state_to_pred_action_and_value(state, prev_action, prev_reward)
 
             dist = Categorical(action_probs)
