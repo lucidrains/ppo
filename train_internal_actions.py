@@ -1,11 +1,12 @@
 from __future__ import annotations
+import re
 
 import fire
 from pathlib import Path
 from shutil import rmtree
 from copy import deepcopy
 from functools import partial
-from itertools import zip_longest
+from itertools import zip_longest, cycle
 from collections import deque
 from random import randrange
 
@@ -37,8 +38,6 @@ from memmap_replay_buffer import ReplayBuffer
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-# helpers
-
 def exists(val):
     return val is not None
 
@@ -55,6 +54,19 @@ def update_network_(loss, optimizer):
     optimizer.zero_grad()
     loss.mean().backward()
     optimizer.step()
+
+# phase schedule parsing
+
+def parse_string_schedule(schedule_str):
+    matches = re.findall(r'(\d+)\s*(both|inner|outer)', schedule_str.lower())
+    if not matches:
+        raise ValueError(f"Could not parse phase schedule string: {schedule_str}")
+    return [(phase, int(duration)) for duration, phase in matches]
+
+def get_phase_generator(schedule):
+    for phase, duration in cycle(schedule):
+        for _ in range(duration):
+            yield phase
 
 # RSM Norm (not to be confused with RMSNorm from transformers)
 # this was proposed by SimBa https://arxiv.org/abs/2410.09754
@@ -471,7 +483,7 @@ class PPO(Module):
         self.actor.load_state_dict(data['actor'])
         self.critic.load_state_dict(data['critic'])
 
-    def learn(self, memories: ReplayBuffer, device = device):
+    def learn(self, memories: ReplayBuffer, *, phase = 'both', device = device):
         hl_gauss = self.critic_hl_gauss_loss
 
         # calculate generalized advantage estimate
@@ -562,8 +574,19 @@ class PPO(Module):
 
                 # weigh internal a bit less
 
-                main_loss_weight = torch.ones((1,), device = device)
-                loss_weight = F.pad(main_loss_weight, (0, policy_loss.shape[-1] - 1), value = self.internal_policy_loss_weight)
+                if phase == 'outer':
+                    main_loss_weight = torch.ones((1,), device = device)
+                    internal_loss_weight = 0.
+                elif phase == 'inner':
+                    main_loss_weight = torch.zeros((1,), device = device)
+                    internal_loss_weight = self.internal_policy_loss_weight
+                elif phase == 'both':
+                    main_loss_weight = torch.ones((1,), device = device)
+                    internal_loss_weight = self.internal_policy_loss_weight
+                else:
+                    raise ValueError(f'unknown phase {phase}')
+
+                loss_weight = F.pad(main_loss_weight, (0, policy_loss.shape[-1] - 1), value = internal_loss_weight)
 
                 policy_loss = (policy_loss * loss_weight).sum(dim = -1)
 
@@ -612,7 +635,7 @@ class PPO(Module):
 
 def main(
     env_name = 'LunarLander-v3',
-    num_episodes = 50000,
+    phase_schedule = "250both,50inner,50outer",
     max_timesteps = 500,
     actor_hidden_dim = 64,
     critic_hidden_dim = 256,
@@ -719,9 +742,30 @@ def main(
     running_rewards = deque(maxlen = 100)
     running_steps = deque(maxlen = 100)
 
+    if isinstance(phase_schedule, str):
+        phase_schedule_tuples = parse_string_schedule(phase_schedule)
+    else:
+        phase_schedule_tuples = phase_schedule
+
+    num_episodes = sum(duration for phase, duration in phase_schedule_tuples)
+
+    # the generator cycle is applied to the literal list
+    phase_generator = get_phase_generator(phase_schedule_tuples)
+    
+    curr_phase = None
+    phase_update_count = 0
+
     pbar = tqdm(range(num_episodes), desc = 'episodes')
 
     for eps in pbar:
+        next_phase = next(phase_generator)
+
+        if next_phase != curr_phase:
+            print(f'\n[Phase Change] Now switching to optimization phase: {next_phase}')
+            curr_phase = next_phase
+            phase_update_count = 0
+            pbar.set_description(f'episodes (phase: {curr_phase})')
+
         state, _ = env.reset(seed = seed)
         state = torch.from_numpy(state).to(device)
 
@@ -796,7 +840,7 @@ def main(
                     running_steps.append(steps)
                     avg_reward = sum(running_rewards) / len(running_rewards)
                     avg_steps = sum(running_steps) / len(running_steps)
-                    pbar.set_postfix(reward = round(avg_reward, 2), steps = round(avg_steps, 2))
+                    pbar.set_postfix({'reward': round(avg_reward, 2), 'phase_updates': phase_update_count, 'steps': round(avg_steps, 2)})
                     break
 
         # updating of the agent
@@ -804,8 +848,9 @@ def main(
         updating_agent = divisible_by(eps + 1, update_episodes)
 
         if updating_agent:
-            agent.learn(memories)
+            agent.learn(memories, phase = curr_phase)
             num_policy_updates += 1
+            phase_update_count += 1
 
         if divisible_by(eps, save_every) and eps > 0:
             agent.save()
