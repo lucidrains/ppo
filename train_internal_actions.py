@@ -751,7 +751,7 @@ def main(
 
     # the generator cycle is applied to the literal list
     phase_generator = get_phase_generator(phase_schedule_tuples)
-    
+
     curr_phase = None
     phase_update_count = 0
 

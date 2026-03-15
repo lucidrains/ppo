@@ -243,7 +243,8 @@ class SimBa(Module):
         expansion_factor = 3,
         ff_solu_gumbel_sample = False,
         num_internal_actions = 4,
-        internal_action_dim = 3
+        internal_action_dim = 3,
+        num_time_embeds = 8
     ):
         super().__init__()
         """
@@ -251,6 +252,10 @@ class SimBa(Module):
         """
 
         dim_hidden = default(dim_hidden, dim * expansion_factor)
+
+        self.num_time_embeds = num_time_embeds
+        self.time_emb = nn.Embedding(num_time_embeds, dim_hidden)
+
 
         layers = []
 
@@ -270,7 +275,8 @@ class SimBa(Module):
     def forward(
         self,
         x,
-        actions = None
+        actions = None,
+        time_embed_index = None
     ):
         no_batch = x.ndim == 1
 
@@ -278,6 +284,11 @@ class SimBa(Module):
             x = rearrange(x, '... -> 1 ...')
 
         x = self.proj_in(x)
+
+        if exists(time_embed_index):
+            assert (time_embed_index < self.num_time_embeds).all(), 'time indices passed in must be never greater than or equal to num time embeds'
+            time_emb = self.time_emb(time_embed_index)
+            x = x + time_emb
 
         logits_and_actions = []
 
@@ -310,7 +321,8 @@ class Actor(Module):
         dropout = 0.1,
         rsmnorm_input = True,
         num_internal_actions = 4,
-        internal_action_dim = 3
+        internal_action_dim = 3,
+        num_time_embeds = 8
     ):
         super().__init__()
         self.rsmnorm = RSMNorm(state_dim) if rsmnorm_input else nn.Identity()
@@ -322,7 +334,8 @@ class Actor(Module):
             dropout = dropout,
             ff_solu_gumbel_sample = True,
             num_internal_actions = num_internal_actions,
-            internal_action_dim = internal_action_dim
+            internal_action_dim = internal_action_dim,
+            num_time_embeds = num_time_embeds
         )
 
         self.action_head = nn.Sequential(
@@ -334,16 +347,17 @@ class Actor(Module):
     def forward(
         self,
         x,
-        actions = None
+        actions = None,
+        time_embed_index = None
     ):
         with torch.no_grad():
             self.rsmnorm.eval()
             x = self.rsmnorm(x)
 
-        hidden, logits_and_actions = self.net(x, actions = actions)
+        hidden, logits_and_actions = self.net(x, actions = actions, time_embed_index = time_embed_index)
 
         action_logits = self.action_head(hidden)
-        
+
         mean, log_var = action_logits.chunk(2, dim = -1)
         std = (0.5 * softclamp(log_var, 5.)).exp()
 
@@ -359,7 +373,8 @@ class Critic(Module):
         dropout = 0.1,
         rsmnorm_input = True,
         num_internal_actions = 4,
-        internal_action_dim = 3
+        internal_action_dim = 3,
+        num_time_embeds = 8
     ):
         super().__init__()
         self.rsmnorm = RSMNorm(state_dim) if rsmnorm_input else nn.Identity()
@@ -371,18 +386,19 @@ class Critic(Module):
             dropout = dropout,
             ff_solu_gumbel_sample = False,
             num_internal_actions = num_internal_actions,
-            internal_action_dim = internal_action_dim
+            internal_action_dim = internal_action_dim,
+            num_time_embeds = num_time_embeds
         )
 
         self.value_head = nn.Linear(hidden_dim, dim_pred)
 
-    def forward(self, x):
+    def forward(self, x, time_embed_index = None):
 
         with torch.no_grad():
             self.rsmnorm.eval()
             x = self.rsmnorm(x)
 
-        hidden, _ = self.net(x)
+        hidden, _ = self.net(x, time_embed_index = time_embed_index)
 
         value = self.value_head(hidden)
         return value
@@ -441,6 +457,7 @@ class PPO(Module):
         internal_policy_loss_weight = 0.1,
         num_internal_actions = 4,
         internal_action_dim = 3,
+        num_time_embeds = 8,
         ema_kwargs: dict = dict(
             update_model_with_ema_every = 1000
         ),
@@ -448,9 +465,9 @@ class PPO(Module):
     ):
         super().__init__()
 
-        self.actor = Actor(state_dim, actor_hidden_dim, action_dim, mlp_depth=num_internal_actions, internal_action_dim=internal_action_dim)
+        self.actor = Actor(state_dim, actor_hidden_dim, action_dim, mlp_depth=num_internal_actions, internal_action_dim=internal_action_dim, num_time_embeds=num_time_embeds)
 
-        self.critic = Critic(state_dim, critic_hidden_dim, dim_pred = critic_pred_num_bins, mlp_depth=num_internal_actions, internal_action_dim=internal_action_dim)
+        self.critic = Critic(state_dim, critic_hidden_dim, dim_pred = critic_pred_num_bins, mlp_depth=num_internal_actions, internal_action_dim=internal_action_dim, num_time_embeds=num_time_embeds)
 
         # weight tie rsmnorm
 
@@ -546,7 +563,17 @@ class PPO(Module):
             filter_fields = dict(
                 learnable = True
             ),
-            to_named_tuple = ('state', 'action', 'action_log_prob', 'returns', 'value', 'internal_actions', 'internal_action_logits'),
+            to_named_tuple = (
+                'state',
+                'action',
+                'action_log_prob',
+                'returns',
+                'value',
+                'internal_actions',
+                'internal_action_logits',
+                'time_embed_index',
+                'is_internal_action_sampled'
+            ),
             timestep_level = True,
             device = device
         )
@@ -562,9 +589,19 @@ class PPO(Module):
         # policy phase training, similar to original PPO
 
         for _ in range(self.epochs):
-            for i, (states, actions, old_log_probs, returns, old_values, internal_actions, old_internal_action_logits) in enumerate(dl):
+            for i, (
+                states,
+                actions,
+                old_log_probs,
+                returns,
+                old_values,
+                internal_actions,
+                old_internal_action_logits,
+                time_embed_indices,
+                is_internal_action_sampled
+            ) in enumerate(dl):
 
-                mean, std, internals = self.actor(states, internal_actions)
+                mean, std, internals = self.actor(states, internal_actions, time_embed_index = time_embed_indices)
                 internal_action_logits = stack(tuple(t[0] for t in internals), dim = 1)
 
                 dist = Normal(mean, std)
@@ -610,7 +647,19 @@ class PPO(Module):
                 else:
                     raise ValueError(f'unknown phase {phase}')
 
-                loss_weight = F.pad(main_loss_weight, (0, policy_loss.shape[-1] - 1), value = internal_loss_weight)
+                batch_size = states.shape[0]
+                num_packed = policy_loss.shape[-1]
+                num_internal_packed = num_packed - 1
+
+                is_sampled = is_internal_action_sampled.float()
+                is_sampled = rearrange(is_sampled, 'b -> b 1')
+
+                internal_weight = internal_loss_weight * is_sampled
+                internal_weight = repeat(internal_weight, 'b 1 -> b i', i = num_internal_packed)
+
+                main_weight = repeat(main_loss_weight, '1 -> b 1', b = batch_size)
+
+                loss_weight, _ = pack([main_weight, internal_weight], 'b *')
 
                 policy_loss = (policy_loss * loss_weight).sum(dim = -1)
 
@@ -620,7 +669,7 @@ class PPO(Module):
 
                 clip = self.value_clip
 
-                values = self.critic(states)
+                values = self.critic(states, time_embed_index = time_embed_indices)
 
                 scalar_values = hl_gauss(values)
 
@@ -683,6 +732,7 @@ def main(
     epochs = 2,
     num_internal_actions = 8,
     internal_action_dim = 3,
+    num_time_embeds = 4,
     seed = None,
     render = True,
     render_every_eps = 250,
@@ -724,7 +774,9 @@ def main(
             value = ('float', critic_pred_num_bins),
             returns = 'float',
             internal_actions = ('int', (num_internal_actions, internal_action_dim)),
-            internal_action_logits = ('float', (num_internal_actions, internal_action_dim, actor_hidden_dim * 2))
+            internal_action_logits = ('float', (num_internal_actions, internal_action_dim, actor_hidden_dim * 2)),
+            time_embed_index = 'int',
+            is_internal_action_sampled = 'bool'
         ),
         circular = True,
         overwrite = True
@@ -751,7 +803,8 @@ def main(
         value_clip,
         ema_decay,
         num_internal_actions = num_internal_actions,
-        internal_action_dim = internal_action_dim
+        internal_action_dim = internal_action_dim,
+        num_time_embeds = num_time_embeds
 
     ).to(device)
 
@@ -777,7 +830,7 @@ def main(
 
     # the generator cycle is applied to the literal list
     phase_generator = get_phase_generator(phase_schedule_tuples)
-    
+
     curr_phase = None
     phase_update_count = 0
 
@@ -799,23 +852,44 @@ def main(
         cum_reward = 0.
         steps = 0
 
+        time_embed_index_offset = 0
+
         with memories.one_episode():
+
+            last_internal_actions = None
+            last_internal_action_logits = None
+
             for timestep in range(max_timesteps):
                 time += 1
-                steps += 1
+
+                time_index_val = (timestep + time_embed_index_offset) % num_time_embeds
+                is_internal_action_sampled = (time_index_val == 0)
 
                 with torch.no_grad():
-                    mean, std, internals = agent.ema_actor.forward_eval(state)
-                    value = agent.ema_critic.forward_eval(state)
+                    time_index = tensor([time_index_val], device=device, dtype=torch.long)
+                    if not is_internal_action_sampled and exists(last_internal_actions):
+                        t_actions = tuple(rearrange(a, '... -> 1 ...') for a in last_internal_actions)
+                        t_actions = stack(t_actions, dim=1)
+                        mean, std, internals = agent.ema_actor.forward_eval(state, actions=t_actions, time_embed_index=time_index)
+                    else:
+                        mean, std, internals = agent.ema_actor.forward_eval(state, time_embed_index=time_index)
+
+                    value = agent.ema_critic.forward_eval(state, time_embed_index=time_index)
 
                 dist = Normal(mean, std)
                 action = dist.sample()
                 action_log_prob = dist.log_prob(action).sum(dim = -1)
 
+                internal_action_logits, internal_actions = tuple(rearrange(stack(t), 'l 1 ... -> l ...') for t in zip(*internals))
+
+                if is_internal_action_sampled or not exists(last_internal_actions):
+                    last_internal_actions = internal_actions.clone()
+                    last_internal_action_logits = internal_action_logits.clone()
+
                 env_action = action.tanh().cpu().numpy()
 
                 next_state_dict, reward, terminated, truncated, _ = env.step(env_action)
-                
+
                 next_state_np = np.concatenate([next_state_dict['observation'], next_state_dict['desired_goal']], axis=-1)
                 next_state = torch.from_numpy(next_state_np).float().to(device)
 
@@ -831,8 +905,6 @@ def main(
 
                 normalized_reward = total_reward / reward_norm
 
-                internal_action_logits, internal_actions = tuple(rearrange(stack(t), 'l 1 ... -> l ...') for t in zip(*internals))
-
                 memories.store(
                     learnable = True,
                     state = state.cpu(),
@@ -841,10 +913,13 @@ def main(
                     reward = normalized_reward,
                     is_boundary = terminated,
                     value = value.cpu(),
-                    internal_actions = internal_actions.cpu(),
-                    internal_action_logits = internal_action_logits.cpu()
+                    internal_actions = last_internal_actions.cpu(),
+                    internal_action_logits = last_internal_action_logits.cpu(),
+                    time_embed_index = time_index_val,
+                    is_internal_action_sampled = is_internal_action_sampled
                 )
 
+                steps += 1
                 state = next_state
 
                 # determine if truncating, either from environment or learning phase of the agent
@@ -855,7 +930,10 @@ def main(
 
                 if done and not terminated:
                     if memories.timestep_index < memories.max_timesteps:
-                        next_value = agent.ema_critic.forward_eval(state)
+                        next_time_index_val = (timestep + 1 + time_embed_index_offset) % num_time_embeds
+                        next_time_index = tensor([next_time_index_val], device = device, dtype = torch.long)
+
+                        next_value = agent.ema_critic.forward_eval(state, time_embed_index = next_time_index)
 
                         memories.store(
                             learnable = False,
@@ -865,8 +943,10 @@ def main(
                             reward = 0.,
                             is_boundary = True,
                             value = next_value.cpu(),
-                            internal_actions = internal_actions.cpu(), # dummy
-                            internal_action_logits = internal_action_logits.cpu() # dummy
+                            internal_actions = last_internal_actions.cpu(), # dummy
+                            internal_action_logits = last_internal_action_logits.cpu(), # dummy
+                            time_embed_index = next_time_index_val,
+                            is_internal_action_sampled = False # dummy
                         )
 
                 # break if done
