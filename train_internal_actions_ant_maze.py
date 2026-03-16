@@ -8,10 +8,10 @@
 #   "assoc-scan",
 #   "gymnasium[mujoco]>=1.0.0",
 #   "gymnasium-robotics",
-#   "moviepy",
 #   "memmap-replay-buffer",
 #   "fire",
-#   "tqdm"
+#   "tqdm",
+#   "termcolor"
 # ]
 # ///
 
@@ -22,22 +22,20 @@ import fire
 from pathlib import Path
 from shutil import rmtree
 from copy import deepcopy
-from functools import partial
 from itertools import zip_longest, cycle
 from collections import deque
-from random import randrange
 
 import numpy as np
 from tqdm import tqdm
+from termcolor import colored
 
 import torch
-from torch import nn, tensor, cat, stack
+from torch import nn, tensor, cat, stack, is_tensor
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
-from torch.utils.data import TensorDataset, DataLoader
 from torch.distributions import Categorical, Normal
 
-from einops import reduce, repeat, einsum, rearrange, pack
+from einops import reduce, repeat, rearrange, pack
 
 from ema_pytorch import EMA
 
@@ -175,7 +173,7 @@ class GumbelSoLU(Module):
 
         if not exists(actions):
             if self.training:
-                dist = torch.distributions.Categorical(logits = logits)
+                dist = Categorical(logits = logits)
                 actions = dist.sample()
             else:
                 actions = logits.argmax(dim = -1)
@@ -220,18 +218,17 @@ class FeedForward(Module):
 
     def forward(
         self,
-        queries,
+        x,
         actions = None
     ):
+        gate = self.proj_gelu(x)
+        hidden = self.proj_solu(x)
 
-        sim = self.proj_gelu(queries)
-        sim2 = self.proj_solu(queries)
+        hidden, logits_and_actions = self.activation(hidden, actions)
 
-        attn, logits_and_actions = self.activation(sim2, actions)
+        out = F.gelu(gate) + hidden
 
-        attn = F.gelu(sim) + attn
-
-        return self.values(attn), logits_and_actions
+        return self.values(out), logits_and_actions
 
 class SimBa(Module):
     def __init__(
@@ -255,7 +252,6 @@ class SimBa(Module):
 
         self.num_time_embeds = num_time_embeds
         self.time_emb = nn.Embedding(num_time_embeds, dim_hidden)
-
 
         layers = []
 
@@ -465,9 +461,23 @@ class PPO(Module):
     ):
         super().__init__()
 
-        self.actor = Actor(state_dim, actor_hidden_dim, action_dim, mlp_depth=num_internal_actions, internal_action_dim=internal_action_dim, num_time_embeds=num_time_embeds)
+        self.actor = Actor(
+            state_dim,
+            actor_hidden_dim,
+            action_dim,
+            mlp_depth = num_internal_actions,
+            internal_action_dim = internal_action_dim,
+            num_time_embeds = num_time_embeds
+        )
 
-        self.critic = Critic(state_dim, critic_hidden_dim, dim_pred = critic_pred_num_bins, mlp_depth=num_internal_actions, internal_action_dim=internal_action_dim, num_time_embeds=num_time_embeds)
+        self.critic = Critic(
+            state_dim,
+            critic_hidden_dim,
+            dim_pred = critic_pred_num_bins,
+            mlp_depth = num_internal_actions,
+            internal_action_dim = internal_action_dim,
+            num_time_embeds = num_time_embeds
+        )
 
         # weight tie rsmnorm
 
@@ -538,7 +548,7 @@ class PPO(Module):
             device = device
         )
 
-        for indices, is_boundaries, values, rewards in dl:
+        for indices, is_boundaries, values, rewards in tqdm(dl, desc='calculating GAE', leave=True):
             with torch.no_grad():
                 masks = (1. - is_boundaries.float())
                 scalar_values = hl_gauss(values.to(device))
@@ -553,6 +563,7 @@ class PPO(Module):
                 )
 
                 memories.data['returns'][indices, :returns.shape[-1]] = returns.cpu().numpy()
+
         memories.flush()
 
         # get data
@@ -578,17 +589,12 @@ class PPO(Module):
             device = device
         )
 
-        rsmnorm_copy = deepcopy(self.rsmnorm)
-        rsmnorm_copy.train()
-
         self.actor.train()
         self.critic.train()
 
-        torch.autograd.set_detect_anomaly(True)
-
         # policy phase training, similar to original PPO
 
-        for _ in range(self.epochs):
+        for epoch in range(self.epochs):
             for i, (
                 states,
                 actions,
@@ -599,7 +605,7 @@ class PPO(Module):
                 old_internal_action_logits,
                 time_embed_indices,
                 is_internal_action_sampled
-            ) in enumerate(dl):
+            ) in enumerate(tqdm(dl, desc=f'ppo epoch {epoch}', leave=True)):
 
                 mean, std, internals = self.actor(states, internal_actions, time_embed_index = time_embed_indices)
                 internal_action_logits = stack(tuple(t[0] for t in internals), dim = 1)
@@ -704,21 +710,265 @@ class PPO(Module):
         for states, *_ in dl:
             self.rsmnorm(states)
 
+# helpers for vectorized rollout
+
+def concat_goal_obs(state_dict):
+    """Concatenate observation and desired_goal from dict-style gym obs."""
+    return np.concatenate([state_dict['observation'], state_dict['desired_goal']], axis = -1)
+
+def record_eval_episode(
+    env_name,
+    agent,
+    max_timesteps,
+    num_time_embeds,
+    video_folder,
+    episode_id,
+    clear_previous = False
+):
+    """Spin up a temporary sync env, run one greedy episode, record video, tear down."""
+
+    if clear_previous:
+        rmtree(video_folder, ignore_errors = True)
+
+    eval_env = gym.make(env_name, render_mode = 'rgb_array')
+
+    eval_env = gym.wrappers.RecordVideo(
+        eval_env,
+        video_folder = video_folder,
+        name_prefix = f'antmaze-eval-eps-{episode_id}',
+        episode_trigger = lambda _: True,
+        disable_logger = True
+    )
+
+    state_dict, _ = eval_env.reset()
+    state = torch.from_numpy(concat_goal_obs(state_dict)).float().to(device)
+
+    last_int_actions = None
+
+    for timestep in range(max_timesteps):
+        time_idx = timestep % num_time_embeds
+        is_sampled = (time_idx == 0)
+
+        with torch.no_grad():
+            time_index = tensor([time_idx], device = device, dtype = torch.long)
+            state_batch = rearrange(state, 'd -> 1 d')
+
+            if not is_sampled and exists(last_int_actions):
+                mean, std, internals = agent.ema_actor.forward_eval(state_batch, actions = last_int_actions, time_embed_index = time_index)
+            else:
+                mean, std, internals = agent.ema_actor.forward_eval(state_batch, time_embed_index = time_index)
+
+        int_logits, int_actions = tuple(rearrange(stack(t), 'l b ... -> b l ...') for t in zip(*internals))
+
+        if is_sampled or not exists(last_int_actions):
+            last_int_actions = int_actions.clone()
+
+        action = mean[0].tanh().cpu().numpy()
+        next_state_dict, _, terminated, truncated, _ = eval_env.step(action)
+
+        if terminated or truncated:
+            break
+
+        state = torch.from_numpy(concat_goal_obs(next_state_dict)).float().to(device)
+
+    eval_env.close()
+
+def extract_final_obs(infos, idx, num_envs):
+    """Extract the final observation dict for a truncated env from vectorized infos."""
+    if 'final_observation' not in infos:
+        return None
+
+    final = infos['final_observation']
+
+    if not isinstance(final, (list, tuple, np.ndarray)):
+        return None
+
+    entry = final[idx]
+
+    if not isinstance(entry, dict) or 'observation' not in entry:
+        return None
+
+    return entry
+
+def collect_vectorized_rollouts(
+    env,
+    agent,
+    num_envs,
+    max_timesteps,
+    num_time_embeds,
+    memories,
+    seed = None
+):
+    """Run one batch of num_envs episodes in parallel, return (cum_rewards, steps)."""
+
+    # reset
+
+    state_dict, _ = env.reset(seed = seed)
+    state = torch.from_numpy(concat_goal_obs(state_dict)).float().to(device)
+
+    # per-env bookkeeping
+
+    env_active = np.ones(num_envs, dtype = bool)
+    cum_rewards = np.zeros(num_envs)
+    env_steps = np.zeros(num_envs, dtype = int)
+
+    episode_fields = (
+        'learnable', 'state', 'action', 'action_log_prob', 'reward',
+        'is_boundary', 'value', 'internal_actions', 'internal_action_logits',
+        'time_embed_index', 'is_internal_action_sampled'
+    )
+
+    collected = [{field: [] for field in episode_fields} for _ in range(num_envs)]
+
+    last_int_actions = None
+    last_int_logits = None
+    time_elapsed = 0
+
+    # rollout loop
+
+    for timestep in range(max_timesteps):
+        if not env_active.any():
+            break
+
+        time_elapsed += 1
+        time_idx = timestep % num_time_embeds
+        is_sampled = (time_idx == 0)
+
+        # batched forward pass
+
+        with torch.no_grad():
+            time_index = tensor([time_idx] * num_envs, device = device, dtype = torch.long)
+
+            if not is_sampled and exists(last_int_actions):
+                mean, std, internals = agent.ema_actor.forward_eval(state, actions = last_int_actions, time_embed_index = time_index)
+            else:
+                mean, std, internals = agent.ema_actor.forward_eval(state, time_embed_index = time_index)
+
+            value = agent.ema_critic.forward_eval(state, time_embed_index = time_index)
+
+        dist = Normal(mean, std)
+        action = dist.sample()
+        action_log_prob = dist.log_prob(action).sum(dim = -1)
+
+        int_logits, int_actions = tuple(rearrange(stack(t), 'l b ... -> b l ...') for t in zip(*internals))
+
+        if is_sampled or not exists(last_int_actions):
+            last_int_actions = int_actions.clone()
+            last_int_logits = int_logits.clone()
+
+        # step environment
+
+        env_action = action.tanh().cpu().numpy()
+
+        next_state_dict, reward_np, terminated, truncated, infos = env.step(env_action)
+        next_state = torch.from_numpy(concat_goal_obs(next_state_dict)).float().to(device)
+
+        # reward shaping
+
+        exp_bonus = (std.mean(dim = -1) * 0.01).cpu().numpy()
+        extreme_penalty = ((mean.abs() > 1.).float().mean(dim = -1) * 0.01).cpu().numpy()
+        total_reward = reward_np.astype(float) + exp_bonus - extreme_penalty
+
+        done = terminated | truncated
+
+        # scatter into per-env episode buffers
+
+        for i in range(num_envs):
+            if not env_active[i]:
+                continue
+
+            cum_rewards[i] += total_reward[i]
+            env_steps[i] += 1
+
+            d = collected[i]
+            d['learnable'].append(True)
+            d['state'].append(state[i].cpu())
+            d['action'].append(action[i].cpu())
+            d['action_log_prob'].append(action_log_prob[i].item())
+            d['reward'].append(total_reward[i])
+            d['is_boundary'].append(terminated[i])
+            d['value'].append(value[i].cpu())
+            d['internal_actions'].append(last_int_actions[i].cpu())
+            d['internal_action_logits'].append(last_int_logits[i].cpu())
+            d['time_embed_index'].append(time_idx)
+            d['is_internal_action_sampled'].append(is_sampled)
+
+            if not done[i]:
+                continue
+
+            env_active[i] = False
+
+            # for truncated (not terminated), store a bootstrap value
+
+            if terminated[i] or len(d['state']) >= memories.max_timesteps:
+                continue
+
+            final_obs = extract_final_obs(infos, i, num_envs)
+
+            if final_obs is None:
+                continue
+
+            final_state_np = concat_goal_obs({'observation': final_obs['observation'], 'desired_goal': final_obs['desired_goal']})
+            final_state_t = torch.from_numpy(final_state_np).float().to(device).unsqueeze(0)
+            next_time_idx = (timestep + 1) % num_time_embeds
+
+            with torch.no_grad():
+                next_value = agent.ema_critic.forward_eval(
+                    final_state_t,
+                    time_embed_index = tensor([next_time_idx], device = device, dtype = torch.long)
+                )[0]
+
+            d['learnable'].append(False)
+            d['state'].append(final_state_t[0].cpu())
+            d['action'].append(action[i].cpu())
+            d['action_log_prob'].append(0.)
+            d['reward'].append(0.)
+            d['is_boundary'].append(True)
+            d['value'].append(next_value.cpu())
+            d['internal_actions'].append(last_int_actions[i].cpu())
+            d['internal_action_logits'].append(last_int_logits[i].cpu())
+            d['time_embed_index'].append(next_time_idx)
+            d['is_internal_action_sampled'].append(False)
+
+        state = next_state
+
+    # flush collected episodes into the replay buffer
+
+    for i in range(num_envs):
+        d = collected[i]
+        with memories.one_episode():
+            for t in range(len(d['state'])):
+                memories.store(
+                    learnable = d['learnable'][t],
+                    state = d['state'][t],
+                    action = d['action'][t],
+                    action_log_prob = d['action_log_prob'][t],
+                    reward = d['reward'][t],
+                    is_boundary = bool(d['is_boundary'][t]),
+                    value = d['value'][t],
+                    internal_actions = d['internal_actions'][t],
+                    internal_action_logits = d['internal_action_logits'][t],
+                    time_embed_index = int(d['time_embed_index'][t]),
+                    is_internal_action_sampled = bool(d['is_internal_action_sampled'][t])
+                )
+
+    return cum_rewards, env_steps
+
 # main
 
 def main(
-    env_name = 'AntMaze_UMazeDense-v5',
-    phase_schedule = "250both,50inner,50outer",
-    max_timesteps = 1000,
+    num_envs = 8,
+    env_name = 'AntMaze_UMaze-v5',
+    phase_schedule = "10000both",
+    max_timesteps = 700,
     actor_hidden_dim = 64,
     critic_hidden_dim = 256,
-    critic_pred_num_bins = 250,
-    reward_range = (-3., 3.),
-    reward_norm = 100.,
+    critic_pred_num_bins = 100,
+    reward_range = (-50., 50.),
     update_episodes = 50,
     buffer_episodes = 100,
-    minibatch_size = 64,
-    gae_batch_size = 32,
+    minibatch_size = 1024,
+    gae_batch_size = 256,
     lr = 0.0008,
     betas = (0.9, 0.99),
     lam = 0.95,
@@ -735,30 +985,20 @@ def main(
     num_time_embeds = 4,
     seed = None,
     render = True,
-    render_every_eps = 250,
     save_every = 1000,
-    clear_videos = True,
     video_folder = './antmaze-recording',
     load = False
 ):
-    env = gym.make(env_name, render_mode = 'rgb_array')
+    # environment setup - always async for training
 
-    if render:
-        if clear_videos:
-            rmtree(video_folder, ignore_errors = True)
-
-        env = gym.wrappers.RecordVideo(
-            env = env,
-            video_folder = video_folder,
-            name_prefix = 'antmaze-video',
-            episode_trigger = lambda eps_num: divisible_by(eps_num, render_every_eps),
-            disable_logger = True
-        )
+    env = gym.make_vec(env_name, num_envs = num_envs, vectorization_mode = 'async')
 
     temp_env = gym.make(env_name)
     state_dim = temp_env.observation_space['observation'].shape[0] + temp_env.observation_space['desired_goal'].shape[0]
     action_dim = temp_env.action_space.shape[0]
     temp_env.close()
+
+    # replay buffer
 
     memories = ReplayBuffer(
         './antmaze-memories/internal-actions',
@@ -782,30 +1022,19 @@ def main(
         overwrite = True
     )
 
+    # agent
+
     agent = PPO(
-        state_dim,
-        action_dim,
-        actor_hidden_dim,
-        critic_hidden_dim,
-        critic_pred_num_bins,
-        reward_range,
-        epochs,
-        minibatch_size,
-        gae_batch_size,
-        lr,
-        betas,
-        lam,
-        gamma,
-        beta_s,
-        regen_reg_rate,
-        cautious_factor,
-        eps_clip,
-        value_clip,
-        ema_decay,
+        state_dim, action_dim,
+        actor_hidden_dim, critic_hidden_dim,
+        critic_pred_num_bins, reward_range,
+        epochs, minibatch_size, gae_batch_size,
+        lr, betas, lam, gamma, beta_s,
+        regen_reg_rate, cautious_factor,
+        eps_clip, value_clip, ema_decay,
         num_internal_actions = num_internal_actions,
         internal_action_dim = internal_action_dim,
         num_time_embeds = num_time_embeds
-
     ).to(device)
 
     if load:
@@ -815,7 +1044,8 @@ def main(
         torch.manual_seed(seed)
         np.random.seed(seed)
 
-    time = 0
+    # training state
+
     num_policy_updates = 0
 
     running_rewards = deque(maxlen = 100)
@@ -826,150 +1056,75 @@ def main(
     else:
         phase_schedule_tuples = phase_schedule
 
-    num_episodes = sum(duration for phase, duration in phase_schedule_tuples)
-
-    # the generator cycle is applied to the literal list
+    num_episodes = sum(duration for _, duration in phase_schedule_tuples)
     phase_generator = get_phase_generator(phase_schedule_tuples)
 
     curr_phase = None
     phase_update_count = 0
+    total_eps = 0
 
-    pbar = tqdm(range(num_episodes), desc = 'episodes')
+    print(colored(f'\nLearning Frequency set to 1 update every {update_episodes} episodes', 'cyan', attrs=['bold']))
+    print(colored(f'Latent Actions emitted every {num_time_embeds} steps\n', 'cyan', attrs=['bold']))
 
-    for eps in pbar:
+    pbar = tqdm(total = num_episodes, desc = 'episodes')
+
+    # training loop
+    prev_eps = 0
+
+    while total_eps < num_episodes:
         next_phase = next(phase_generator)
 
         if next_phase != curr_phase:
-            print(f'\n[Phase Change] Now switching to optimization phase: {next_phase}')
+            if exists(curr_phase):
+                print(f'\n[Phase Change] Now switching to optimization phase: {next_phase}')
             curr_phase = next_phase
             phase_update_count = 0
             pbar.set_description(f'episodes (phase: {curr_phase})')
 
-        state_dict, _ = env.reset(seed = seed)
-        state_np = np.concatenate([state_dict['observation'], state_dict['desired_goal']], axis=-1)
-        state = torch.from_numpy(state_np).float().to(device)
+        # collect num_envs episodes in parallel
 
-        cum_reward = 0.
-        steps = 0
+        cum_rewards, steps = collect_vectorized_rollouts(
+            env, agent, num_envs, max_timesteps,
+            num_time_embeds, memories, seed
+        )
 
-        time_embed_index_offset = 0
+        running_rewards.extend(cum_rewards)
+        running_steps.extend(steps)
 
-        with memories.one_episode():
+        total_eps += num_envs
+        pbar.update(num_envs)
 
-            last_internal_actions = None
-            last_internal_action_logits = None
+        # periodic learning
 
-            for timestep in range(max_timesteps):
-                time += 1
+        updating_agent = (total_eps // update_episodes) > (prev_eps // update_episodes)
 
-                time_index_val = (timestep + time_embed_index_offset) % num_time_embeds
-                is_internal_action_sampled = (time_index_val == 0)
-
-                with torch.no_grad():
-                    time_index = tensor([time_index_val], device=device, dtype=torch.long)
-                    if not is_internal_action_sampled and exists(last_internal_actions):
-                        t_actions = tuple(rearrange(a, '... -> 1 ...') for a in last_internal_actions)
-                        t_actions = stack(t_actions, dim=1)
-                        mean, std, internals = agent.ema_actor.forward_eval(state, actions=t_actions, time_embed_index=time_index)
-                    else:
-                        mean, std, internals = agent.ema_actor.forward_eval(state, time_embed_index=time_index)
-
-                    value = agent.ema_critic.forward_eval(state, time_embed_index=time_index)
-
-                dist = Normal(mean, std)
-                action = dist.sample()
-                action_log_prob = dist.log_prob(action).sum(dim = -1)
-
-                internal_action_logits, internal_actions = tuple(rearrange(stack(t), 'l 1 ... -> l ...') for t in zip(*internals))
-
-                if is_internal_action_sampled or not exists(last_internal_actions):
-                    last_internal_actions = internal_actions.clone()
-                    last_internal_action_logits = internal_action_logits.clone()
-
-                env_action = action.tanh().cpu().numpy()
-
-                next_state_dict, reward, terminated, truncated, _ = env.step(env_action)
-
-                next_state_np = np.concatenate([next_state_dict['observation'], next_state_dict['desired_goal']], axis=-1)
-                next_state = torch.from_numpy(next_state_np).float().to(device)
-
-                reward_np = np.array(reward)
-                total_reward_base = float(reward_np)
-
-                exploration_bonus = float(std.mean(dim = -1) * 0.01)
-                penalize_extreme_actions = float((mean.abs() > 1.).float().mean(dim = -1) * 0.01)
-
-                total_reward = total_reward_base + exploration_bonus - penalize_extreme_actions
-
-                cum_reward += total_reward
-
-                normalized_reward = total_reward / reward_norm
-
-                memories.store(
-                    learnable = True,
-                    state = state.cpu(),
-                    action = action.cpu(),
-                    action_log_prob = action_log_prob.item(),
-                    reward = normalized_reward,
-                    is_boundary = terminated,
-                    value = value.cpu(),
-                    internal_actions = last_internal_actions.cpu(),
-                    internal_action_logits = last_internal_action_logits.cpu(),
-                    time_embed_index = time_index_val,
-                    is_internal_action_sampled = is_internal_action_sampled
-                )
-
-                steps += 1
-                state = next_state
-
-                # determine if truncating, either from environment or learning phase of the agent
-
-                done = terminated or truncated
-
-                # take care of truncated by adding a non-learnable memory storing the next value for GAE
-
-                if done and not terminated:
-                    if memories.timestep_index < memories.max_timesteps:
-                        next_time_index_val = (timestep + 1 + time_embed_index_offset) % num_time_embeds
-                        next_time_index = tensor([next_time_index_val], device = device, dtype = torch.long)
-
-                        next_value = agent.ema_critic.forward_eval(state, time_embed_index = next_time_index)
-
-                        memories.store(
-                            learnable = False,
-                            state = state.cpu(),
-                            action = action.cpu(), # dummy
-                            action_log_prob = action_log_prob.item(), # dummy
-                            reward = 0.,
-                            is_boundary = True,
-                            value = next_value.cpu(),
-                            internal_actions = last_internal_actions.cpu(), # dummy
-                            internal_action_logits = last_internal_action_logits.cpu(), # dummy
-                            time_embed_index = next_time_index_val,
-                            is_internal_action_sampled = False # dummy
-                        )
-
-                # break if done
-
-                if done:
-                    running_rewards.append(cum_reward)
-                    running_steps.append(steps)
-                    avg_reward = sum(running_rewards) / len(running_rewards)
-                    avg_steps = sum(running_steps) / len(running_steps)
-                    pbar.set_postfix({'reward': round(avg_reward, 2), 'phase_updates': phase_update_count, 'steps': round(avg_steps, 2)})
-                    break
-
-        # updating of the agent
-
-        updating_agent = divisible_by(eps + 1, update_episodes)
+        if len(running_rewards) > 0:
+            avg_reward = sum(running_rewards) / len(running_rewards)
+            avg_steps = sum(running_steps) / len(running_steps)
+            pbar.set_postfix({
+                'reward': round(avg_reward, 2),
+                'phase_upd': phase_update_count,
+                'steps': round(avg_steps, 2)
+            })
 
         if updating_agent:
+
+            if render:
+                record_eval_episode(
+                    env_name, agent, max_timesteps,
+                    num_time_embeds, video_folder,
+                    total_eps,
+                    clear_previous = (num_policy_updates == 0)
+                )
+
             agent.learn(memories, phase = curr_phase)
             num_policy_updates += 1
             phase_update_count += 1
 
-        if divisible_by(eps, save_every) and eps > 0:
+        if divisible_by(total_eps, save_every) and total_eps > 0:
             agent.save()
+
+        prev_eps = total_eps
 
 if __name__ == '__main__':
     fire.Fire(main)
