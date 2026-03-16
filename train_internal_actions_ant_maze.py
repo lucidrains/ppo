@@ -63,6 +63,13 @@ def softclamp(t, value):
 def default(v, d):
     return v if exists(v) else d
 
+def maybe(fn):
+    return lambda v: fn(v) if exists(v) else v
+
+def module_device(module):
+    if is_tensor(module): return module.device
+    return next(module.parameters()).device
+
 def divisible_by(num, den):
     return (num % den) == 0
 
@@ -77,13 +84,23 @@ def update_network_(loss, optimizer):
 # phase schedule parsing
 
 def parse_string_schedule(schedule_str):
+    def expand_match(m):
+        inner_content = m.group(1)
+        repeats = int(m.group(2))
+        return " ".join([inner_content] * repeats)
+
+    schedule_str = re.sub(r'\(([^)]+)\)\s*\*\s*(\d+)', expand_match, schedule_str)
+
     matches = re.findall(r'(\d+)\s*(both|inner|outer)', schedule_str.lower())
     if not matches:
         raise ValueError(f"Could not parse phase schedule string: {schedule_str}")
     return [(phase, int(duration)) for duration, phase in matches]
 
-def get_phase_generator(schedule):
+def get_phase_generator(schedule, num_envs = 1):
     for phase, duration in cycle(schedule):
+        if duration % num_envs != 0:
+            raise ValueError(f"Phase '{phase}' duration {duration} is not a multiple of num_envs ({num_envs}). "
+                             f"Vectorized rollouts cannot have mixed phases.")
         for _ in range(duration):
             yield phase
 
@@ -221,13 +238,10 @@ class FeedForward(Module):
         x,
         actions = None
     ):
-        gate = self.proj_gelu(x)
-        hidden = self.proj_solu(x)
-
+        gate, hidden = self.proj_gelu(x), self.proj_solu(x)
         hidden, logits_and_actions = self.activation(hidden, actions)
 
         out = F.gelu(gate) + hidden
-
         return self.values(out), logits_and_actions
 
 class SimBa(Module):
@@ -255,11 +269,17 @@ class SimBa(Module):
 
         layers = []
 
+        # networks
+
         self.proj_in = nn.Linear(dim, dim_hidden)
 
-        for ind in range(depth):
-
-            layer = FeedForward(dim_hidden, expansion_factor, gumbel_sample = ff_solu_gumbel_sample, softmax_segments = internal_action_dim)
+        for _ in range(depth):
+            layer = FeedForward(
+                dim_hidden,
+                expansion_factor,
+                gumbel_sample = ff_solu_gumbel_sample,
+                softmax_segments = internal_action_dim
+            )
             layers.append(layer)
 
         # final layer out
@@ -283,8 +303,7 @@ class SimBa(Module):
 
         if exists(time_embed_index):
             assert (time_embed_index < self.num_time_embeds).all(), 'time indices passed in must be never greater than or equal to num time embeds'
-            time_emb = self.time_emb(time_embed_index)
-            x = x + time_emb
+            x = x + self.time_emb(time_embed_index)
 
         logits_and_actions = []
 
@@ -351,7 +370,6 @@ class Actor(Module):
             x = self.rsmnorm(x)
 
         hidden, logits_and_actions = self.net(x, actions = actions, time_embed_index = time_embed_index)
-
         action_logits = self.action_head(hidden)
 
         mean, log_var = action_logits.chunk(2, dim = -1)
@@ -395,9 +413,7 @@ class Critic(Module):
             x = self.rsmnorm(x)
 
         hidden, _ = self.net(x, time_embed_index = time_embed_index)
-
-        value = self.value_head(hidden)
-        return value
+        return self.value_head(hidden)
 
 # GAE
 
@@ -753,10 +769,8 @@ def record_eval_episode(
             time_index = tensor([time_idx], device = device, dtype = torch.long)
             state_batch = rearrange(state, 'd -> 1 d')
 
-            if not is_sampled and exists(last_int_actions):
-                mean, std, internals = agent.ema_actor.forward_eval(state_batch, actions = last_int_actions, time_embed_index = time_index)
-            else:
-                mean, std, internals = agent.ema_actor.forward_eval(state_batch, time_embed_index = time_index)
+            prev_actions = last_int_actions if not is_sampled else None
+            mean, std, internals = agent.ema_actor.forward_eval(state_batch, actions = prev_actions, time_embed_index = time_index)
 
         int_logits, int_actions = tuple(rearrange(stack(t), 'l b ... -> b l ...') for t in zip(*internals))
 
@@ -839,11 +853,8 @@ def collect_vectorized_rollouts(
         with torch.no_grad():
             time_index = tensor([time_idx] * num_envs, device = device, dtype = torch.long)
 
-            if not is_sampled and exists(last_int_actions):
-                mean, std, internals = agent.ema_actor.forward_eval(state, actions = last_int_actions, time_embed_index = time_index)
-            else:
-                mean, std, internals = agent.ema_actor.forward_eval(state, time_embed_index = time_index)
-
+            prev_actions = last_int_actions if not is_sampled else None
+            mean, std, internals = agent.ema_actor.forward_eval(state, actions = prev_actions, time_embed_index = time_index)
             value = agent.ema_critic.forward_eval(state, time_embed_index = time_index)
 
         dist = Normal(mean, std)
@@ -900,7 +911,7 @@ def collect_vectorized_rollouts(
 
             # for truncated (not terminated), store a bootstrap value
 
-            if terminated[i] or len(d['state']) >= memories.max_timesteps:
+            if terminated[i] or len(d['state']) > memories.max_timesteps:
                 continue
 
             final_obs = extract_final_obs(infos, i, num_envs)
@@ -959,7 +970,7 @@ def collect_vectorized_rollouts(
 def main(
     num_envs = 8,
     env_name = 'AntMaze_UMaze-v5',
-    phase_schedule = "10000both",
+    phase_schedule = "256both (128inner 128outer)*500",
     max_timesteps = 700,
     actor_hidden_dim = 64,
     critic_hidden_dim = 256,
@@ -1057,7 +1068,7 @@ def main(
         phase_schedule_tuples = phase_schedule
 
     num_episodes = sum(duration for _, duration in phase_schedule_tuples)
-    phase_generator = get_phase_generator(phase_schedule_tuples)
+    phase_generator = get_phase_generator(phase_schedule_tuples, num_envs=num_envs)
 
     curr_phase = None
     phase_update_count = 0
@@ -1072,14 +1083,15 @@ def main(
     prev_eps = 0
 
     while total_eps < num_episodes:
-        next_phase = next(phase_generator)
+        for _ in range(num_envs):
+            next_phase = next(phase_generator)
 
-        if next_phase != curr_phase:
-            if exists(curr_phase):
-                print(f'\n[Phase Change] Now switching to optimization phase: {next_phase}')
-            curr_phase = next_phase
-            phase_update_count = 0
-            pbar.set_description(f'episodes (phase: {curr_phase})')
+            if next_phase != curr_phase:
+                if exists(curr_phase):
+                    print(f'\n[Phase Change] Now switching to optimization phase: {next_phase}')
+                curr_phase = next_phase
+                phase_update_count = 0
+                pbar.set_description(f'episodes (phase: {curr_phase})')
 
         # collect num_envs episodes in parallel
 
