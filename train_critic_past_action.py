@@ -338,6 +338,13 @@ class PPO(Module):
         ema_decay,
         use_spo = False,
         asymmetric_spo = False,
+        next_state_value_weight = 0.,
+        actor_mlp_depth = 2,
+        actor_dropout = 0.1,
+        actor_rsmnorm_input = True,
+        critic_mlp_depth = 6,
+        critic_dropout = 0.1,
+        critic_rsmnorm_input = True,
         ema_kwargs: dict = dict(
             update_model_with_ema_every = 1000
         ),
@@ -345,9 +352,24 @@ class PPO(Module):
     ):
         super().__init__()
 
-        self.actor = Actor(state_dim, actor_hidden_dim, num_actions)
+        self.actor = Actor(
+            state_dim,
+            actor_hidden_dim,
+            num_actions,
+            mlp_depth = actor_mlp_depth,
+            dropout = actor_dropout,
+            rsmnorm_input = actor_rsmnorm_input
+        )
 
-        self.critic = Critic(state_dim, critic_hidden_dim, num_actions, dim_pred = critic_pred_num_bins)
+        self.critic = Critic(
+            state_dim,
+            critic_hidden_dim,
+            num_actions,
+            dim_pred = critic_pred_num_bins,
+            mlp_depth = critic_mlp_depth,
+            dropout = critic_dropout,
+            rsmnorm_input = critic_rsmnorm_input
+        )
 
         # weight tie rsmnorm
 
@@ -381,6 +403,7 @@ class PPO(Module):
         self.lam = lam
         self.gamma = gamma
         self.beta_s = beta_s
+        self.next_state_value_weight = next_state_value_weight
 
         self.eps_clip = eps_clip
         self.value_clip = value_clip
@@ -445,7 +468,7 @@ class PPO(Module):
             filter_fields = dict(
                 learnable = True
             ),
-            to_named_tuple = ('state', 'action', 'action_log_prob', 'returns', 'value', 'past_action'),
+            to_named_tuple = ('state', 'action', 'action_log_prob', 'returns', 'value', 'past_action', 'next_state', 'has_next_state'),
             timestep_level = True,
             device = device
         )
@@ -456,7 +479,7 @@ class PPO(Module):
         self.critic.train()
 
         for _ in range(self.epochs):
-            for _, (states, actions, old_log_probs, returns, old_values, past_action) in enumerate(dl):
+            for _, (states, actions, old_log_probs, returns, old_values, past_action, next_states, has_next_states) in enumerate(dl):
 
                 action_probs = self.actor(states)
                 dist = Categorical(action_probs)
@@ -492,6 +515,13 @@ class PPO(Module):
                     policy_loss = ppo_policy_loss
 
                 policy_loss = policy_loss - self.beta_s * entropy
+
+                if self.next_state_value_weight > 0.:
+                    next_value_pred = self.critic(next_states, action_probs)
+                    expected_next_value = hl_gauss(next_value_pred)
+                    expected_next_value = expected_next_value.masked_fill(~has_next_states, 0.)
+
+                    policy_loss = policy_loss - self.next_state_value_weight * expected_next_value
 
                 update_network_(policy_loss, self.opt_actor)
 
@@ -545,6 +575,12 @@ def main(
     max_timesteps = 500,
     actor_hidden_dim = 64,
     critic_hidden_dim = 256,
+    actor_mlp_depth = 2,
+    actor_dropout = 0.1,
+    actor_rsmnorm_input = True,
+    critic_mlp_depth = 6,
+    critic_dropout = 0.1,
+    critic_rsmnorm_input = True,
     update_timesteps = 5000,
     buffer_episodes = 40,
     critic_pred_num_bins = 250,
@@ -558,6 +594,7 @@ def main(
     value_clip = 0.4,
     beta_s = .01,
     regen_reg_rate = 1e-4,
+    next_state_value_weight = 0.1,
     use_spo = False,
     asymmetric_spo = False,
     cautious_factor = 0.1,
@@ -601,7 +638,9 @@ def main(
             is_boundary = 'bool',
             value = ('float', critic_pred_num_bins),
             returns = 'float',
-            past_action = ('int', num_actions)
+            past_action = ('int', num_actions),
+            next_state = ('float', state_dim),
+            has_next_state = 'bool'
         ),
         circular = True,
         overwrite = True
@@ -626,8 +665,15 @@ def main(
         eps_clip,
         value_clip,
         ema_decay,
-        use_spo,
-        asymmetric_spo
+        use_spo=use_spo,
+        asymmetric_spo=asymmetric_spo,
+        next_state_value_weight=next_state_value_weight,
+        actor_mlp_depth=actor_mlp_depth,
+        actor_dropout=actor_dropout,
+        actor_rsmnorm_input=actor_rsmnorm_input,
+        critic_mlp_depth=critic_mlp_depth,
+        critic_dropout=critic_dropout,
+        critic_rsmnorm_input=critic_rsmnorm_input
     ).to(device)
 
     if load:
@@ -640,7 +686,13 @@ def main(
     time = 0
     num_policy_updates = 0
 
-    for eps in tqdm(range(num_episodes), desc = 'episodes'):
+    reward_window = deque(maxlen = 100)
+    steps_window = deque(maxlen = 100)
+
+    pbar = tqdm(range(num_episodes), desc = 'episodes')
+    for eps in pbar:
+
+        episode_reward = 0.
 
         state, _ = env.reset(seed = seed)
         state = torch.from_numpy(state).to(device)
@@ -664,10 +716,15 @@ def main(
                 next_state = torch.from_numpy(next_state).to(device)
 
                 reward = float(reward)
+                episode_reward += reward
+
+                has_next_state = not terminated
 
                 memory = memories.store(
                     learnable = True,
                     state = state,
+                    next_state = next_state,
+                    has_next_state = has_next_state,
                     action = action,
                     action_log_prob = action_log_prob,
                     reward = reward,
@@ -691,6 +748,8 @@ def main(
 
                     bootstrap_value_memory = memory._replace(
                         state = state,
+                        next_state = state,
+                        has_next_state = False,
                         learnable = False,
                         is_boundary = True,
                         value = next_value,
@@ -709,6 +768,14 @@ def main(
 
                 if done:
                     break
+
+        reward_window.append(episode_reward)
+        steps_window.append(timestep + 1)
+
+        pbar.set_postfix(
+            reward = f"{sum(reward_window) / len(reward_window):.2f}",
+            steps = f"{sum(steps_window) / len(steps_window):.1f}"
+        )
 
         if divisible_by(eps, save_every):
             agent.save()
