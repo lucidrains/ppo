@@ -339,6 +339,7 @@ class PPO(Module):
         use_spo = False,
         asymmetric_spo = False,
         next_state_value_weight = 0.,
+        main_policy_loss_weight = 1.,
         actor_mlp_depth = 2,
         actor_dropout = 0.1,
         actor_rsmnorm_input = True,
@@ -404,6 +405,7 @@ class PPO(Module):
         self.gamma = gamma
         self.beta_s = beta_s
         self.next_state_value_weight = next_state_value_weight
+        self.main_policy_loss_weight = main_policy_loss_weight
 
         self.eps_clip = eps_clip
         self.value_clip = value_clip
@@ -514,7 +516,7 @@ class PPO(Module):
                 else:
                     policy_loss = ppo_policy_loss
 
-                policy_loss = policy_loss - self.beta_s * entropy
+                policy_loss = policy_loss * self.main_policy_loss_weight - self.beta_s * entropy
 
                 if self.next_state_value_weight > 0.:
                     next_value_pred = self.critic(next_states, action_probs)
@@ -595,6 +597,7 @@ def main(
     beta_s = .01,
     regen_reg_rate = 1e-4,
     next_state_value_weight = 0.1,
+    main_policy_loss_weight = 1.,
     use_spo = False,
     asymmetric_spo = False,
     cautious_factor = 0.1,
@@ -665,15 +668,16 @@ def main(
         eps_clip,
         value_clip,
         ema_decay,
-        use_spo=use_spo,
-        asymmetric_spo=asymmetric_spo,
-        next_state_value_weight=next_state_value_weight,
-        actor_mlp_depth=actor_mlp_depth,
-        actor_dropout=actor_dropout,
-        actor_rsmnorm_input=actor_rsmnorm_input,
-        critic_mlp_depth=critic_mlp_depth,
-        critic_dropout=critic_dropout,
-        critic_rsmnorm_input=critic_rsmnorm_input
+        use_spo = use_spo,
+        asymmetric_spo = asymmetric_spo,
+        next_state_value_weight = next_state_value_weight,
+        main_policy_loss_weight = main_policy_loss_weight,
+        actor_mlp_depth = actor_mlp_depth,
+        actor_dropout = actor_dropout,
+        actor_rsmnorm_input = actor_rsmnorm_input,
+        critic_mlp_depth = critic_mlp_depth,
+        critic_dropout = critic_dropout,
+        critic_rsmnorm_input = critic_rsmnorm_input
     ).to(device)
 
     if load:
