@@ -457,40 +457,48 @@ def calc_internal_gae(
     learnable,
     gamma,
     lam,
-    num_time_embeds
+    num_time_embeds,
+    use_accelerated = None
 ):
     b, seq_len = rewards.shape
     device = rewards.device
-    
-    internal_returns = torch.zeros_like(values)
-    
-    next_int_val = torch.zeros(b, device=device)
-    next_int_gae = torch.zeros(b, device=device)
-    
-    bucket_reward = torch.zeros(b, device=device)
-    bucket_mask = torch.ones(b, device=device)
-    
-    for t in reversed(range(seq_len)):
-        is_boundary = (masks[:, t] == 0)
-        is_truncated = is_boundary & (~learnable[:, t])
-        
-        step_reward = rewards[:, t] + torch.where(is_truncated, values[:, t], torch.zeros_like(values[:, t]))
-        bucket_reward = step_reward + gamma * masks[:, t] * bucket_reward
-        bucket_mask = bucket_mask * masks[:, t]
-        
-        sampled_t = is_sampled[:, t]
-        
-        delta = bucket_reward + (gamma ** num_time_embeds) * bucket_mask * next_int_val - values[:, t]
-        next_int_gae = delta + (gamma ** num_time_embeds) * lam * bucket_mask * next_int_gae
-        
-        internal_return_t = next_int_gae + values[:, t]
-        internal_returns[:, t] = internal_return_t
-        
-        next_int_val = torch.where(sampled_t, values[:, t], next_int_val)
-        
-        bucket_reward = torch.where(sampled_t, torch.zeros_like(bucket_reward), bucket_reward)
-        bucket_mask = torch.where(sampled_t, torch.ones_like(bucket_mask), bucket_mask)
-        
+    use_accelerated = default(use_accelerated, rewards.is_cuda)
+    scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
+
+    is_boundary = (masks == 0)
+    is_truncated = is_boundary & (~learnable)
+    step_rewards = rewards + torch.where(is_truncated, values, torch.zeros_like(values))
+
+    is_sampled_next = is_sampled.roll(-1, dims = 1)
+    is_sampled_next[:, -1] = True
+
+    # bucket rewards
+
+    bucket_reward_gates = gamma * masks * (~is_sampled_next).float()
+    bucket_rewards = scan(bucket_reward_gates, step_rewards)
+
+    # bucket masks
+
+    bucket_mask_gates = masks * (~is_sampled_next).float()
+    bucket_mask_values = masks * is_sampled_next.float()
+    bucket_masks = scan(bucket_mask_gates, bucket_mask_values)
+
+    # next internal values
+
+    next_internal_val_gates = (~is_sampled).float()
+    next_internal_val_values = values * is_sampled.float()
+    next_internal_values = scan(next_internal_val_gates, next_internal_val_values)
+
+    next_internal_values = F.pad(next_internal_values[:, 1:], (0, 1), value = 0.0)
+
+    # internal gae
+
+    deltas = bucket_rewards + (gamma ** num_time_embeds) * bucket_masks * next_internal_values - values
+
+    next_internal_gae_gates = (gamma ** num_time_embeds) * lam * bucket_masks
+    next_internal_gaes = scan(next_internal_gae_gates, deltas)
+
+    internal_returns = next_internal_gaes + values
     return internal_returns
 
 # agent
@@ -511,6 +519,7 @@ class PPO(Module):
         betas,
         lam,
         gamma,
+        gamma_inner,
         beta_s,
         regen_reg_rate,
         cautious_factor,
@@ -578,6 +587,7 @@ class PPO(Module):
 
         self.lam = lam
         self.gamma = gamma
+        self.gamma_inner = gamma_inner
         self.beta_s = beta_s
 
         self.eps_clip = eps_clip
@@ -636,7 +646,7 @@ class PPO(Module):
                     masks = masks.cpu(),
                     is_sampled = is_sampled.cpu(),
                     learnable = learnable.cpu(),
-                    gamma = self.gamma,
+                    gamma = self.gamma_inner,
                     lam = self.lam,
                     num_time_embeds = self.actor.net.num_time_embeds
                 )
@@ -716,12 +726,12 @@ class PPO(Module):
                 scalar_old_values = hl_gauss(old_values)
                 advantages_main = normalize(returns - scalar_old_values.detach())
                 advantages_main = rearrange(advantages_main, '... -> ... 1')
-                
+
                 scalar_old_internal_values = hl_gauss(old_internal_values)
                 advantages_inner = normalize(internal_returns - scalar_old_internal_values.detach(), mask = is_internal_action_sampled)
                 advantages_inner = rearrange(advantages_inner, '... -> ... 1')
                 advantages_inner = repeat(advantages_inner, 'b 1 -> b num', num = internal_log_probs[0].numel())
-                
+
                 advantages, _ = pack([advantages_main, advantages_inner], 'b *')
 
                 surr1 = ratios * advantages
@@ -803,7 +813,7 @@ class PPO(Module):
                     inner_v_weight = 1. * self.actor.net.num_time_embeds
 
                 is_sampled_float = is_internal_action_sampled.float()
-                
+
                 value_loss = value_loss_main.mean() * main_v_weight + (value_loss_inner * is_sampled_float).mean() * inner_v_weight
 
                 update_network_(value_loss, self.opt_critic)
@@ -1077,6 +1087,7 @@ def main(
     betas = (0.9, 0.99),
     lam = 0.95,
     gamma = 0.99,
+    gamma_inner = 0.99,
     eps_clip = 0.2,
     value_clip = 0.4,
     beta_s = .01,
@@ -1135,7 +1146,7 @@ def main(
         actor_hidden_dim, critic_hidden_dim,
         critic_pred_num_bins, reward_range,
         epochs, minibatch_size, gae_batch_size,
-        lr, betas, lam, gamma, beta_s,
+        lr, betas, lam, gamma, gamma_inner, beta_s,
         regen_reg_rate, cautious_factor,
         eps_clip, value_clip, ema_decay,
         num_internal_actions = num_internal_actions,
