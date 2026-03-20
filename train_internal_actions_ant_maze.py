@@ -73,8 +73,14 @@ def module_device(module):
 def divisible_by(num, den):
     return (num % den) == 0
 
-def normalize(t, eps = 1e-5):
-    return (t - t.mean()) / t.std(unbiased = False).clamp(min = eps)
+def normalize(t, mask = None, eps = 1e-5):
+    if not exists(mask):
+        return (t - t.mean()) / t.std(unbiased = False).clamp(min = eps)
+    masked_t = t[mask]
+    if masked_t.numel() == 0: return t
+    mean = masked_t.mean()
+    std = masked_t.std(unbiased = False).clamp(min = eps)
+    return (t - mean) / std
 
 def update_network_(loss, optimizer):
     optimizer.zero_grad()
@@ -405,6 +411,7 @@ class Critic(Module):
         )
 
         self.value_head = nn.Linear(hidden_dim, dim_pred)
+        self.internal_value_head = nn.Linear(hidden_dim, dim_pred)
 
     def forward(self, x, time_embed_index = None):
 
@@ -413,7 +420,7 @@ class Critic(Module):
             x = self.rsmnorm(x)
 
         hidden, _ = self.net(x, time_embed_index = time_embed_index)
-        return self.value_head(hidden)
+        return self.value_head(hidden), self.internal_value_head(hidden)
 
 # GAE
 
@@ -442,6 +449,50 @@ def calc_gae(
 
     return returns
 
+def calc_internal_gae(
+    rewards,
+    values,
+    masks,
+    is_sampled,
+    learnable,
+    gamma,
+    lam,
+    num_time_embeds
+):
+    b, seq_len = rewards.shape
+    device = rewards.device
+    
+    internal_returns = torch.zeros_like(values)
+    
+    next_int_val = torch.zeros(b, device=device)
+    next_int_gae = torch.zeros(b, device=device)
+    
+    bucket_reward = torch.zeros(b, device=device)
+    bucket_mask = torch.ones(b, device=device)
+    
+    for t in reversed(range(seq_len)):
+        is_boundary = (masks[:, t] == 0)
+        is_truncated = is_boundary & (~learnable[:, t])
+        
+        step_reward = rewards[:, t] + torch.where(is_truncated, values[:, t], torch.zeros_like(values[:, t]))
+        bucket_reward = step_reward + gamma * masks[:, t] * bucket_reward
+        bucket_mask = bucket_mask * masks[:, t]
+        
+        sampled_t = is_sampled[:, t]
+        
+        delta = bucket_reward + (gamma ** num_time_embeds) * bucket_mask * next_int_val - values[:, t]
+        next_int_gae = delta + (gamma ** num_time_embeds) * lam * bucket_mask * next_int_gae
+        
+        internal_return_t = next_int_gae + values[:, t]
+        internal_returns[:, t] = internal_return_t
+        
+        next_int_val = torch.where(sampled_t, values[:, t], next_int_val)
+        
+        bucket_reward = torch.where(sampled_t, torch.zeros_like(bucket_reward), bucket_reward)
+        bucket_mask = torch.where(sampled_t, torch.ones_like(bucket_mask), bucket_mask)
+        
+    return internal_returns
+
 # agent
 
 class PPO(Module):
@@ -466,7 +517,7 @@ class PPO(Module):
         eps_clip,
         value_clip,
         ema_decay,
-        internal_policy_loss_weight = 0.1,
+        internal_policy_loss_weight = 1.0,
         num_internal_actions = 4,
         internal_action_dim = 3,
         num_time_embeds = 8,
@@ -560,14 +611,15 @@ class PPO(Module):
         dl = memories.dataloader(
             batch_size = self.gae_batch_size,
             return_indices = True,
-            to_named_tuple = ('_index', 'is_boundary', 'value', 'reward'),
+            to_named_tuple = ('_index', 'is_boundary', 'value', 'internal_value', 'reward', 'is_internal_action_sampled', 'learnable'),
             device = device
         )
 
-        for indices, is_boundaries, values, rewards in tqdm(dl, desc='calculating GAE', leave=True):
+        for indices, is_boundaries, values, internal_values, rewards, is_sampled, learnable in tqdm(dl, desc='calculating GAE', leave=True):
             with torch.no_grad():
                 masks = (1. - is_boundaries.float())
                 scalar_values = hl_gauss(values.to(device))
+                scalar_internal_values = hl_gauss(internal_values.to(device))
 
                 returns = calc_gae(
                     rewards = rewards,
@@ -578,7 +630,19 @@ class PPO(Module):
                     use_accelerated = False
                 )
 
+                internal_returns = calc_internal_gae(
+                    rewards = rewards.cpu(),
+                    values = scalar_internal_values.cpu(),
+                    masks = masks.cpu(),
+                    is_sampled = is_sampled.cpu(),
+                    learnable = learnable.cpu(),
+                    gamma = self.gamma,
+                    lam = self.lam,
+                    num_time_embeds = self.actor.net.num_time_embeds
+                )
+
                 memories.data['returns'][indices, :returns.shape[-1]] = returns.cpu().numpy()
+                memories.data['internal_returns'][indices, :internal_returns.shape[-1]] = internal_returns.cpu().numpy()
 
         memories.flush()
 
@@ -595,7 +659,9 @@ class PPO(Module):
                 'action',
                 'action_log_prob',
                 'returns',
+                'internal_returns',
                 'value',
+                'internal_value',
                 'internal_actions',
                 'internal_action_logits',
                 'time_embed_index',
@@ -616,7 +682,9 @@ class PPO(Module):
                 actions,
                 old_log_probs,
                 returns,
+                internal_returns,
                 old_values,
+                old_internal_values,
                 internal_actions,
                 old_internal_action_logits,
                 time_embed_indices,
@@ -646,8 +714,15 @@ class PPO(Module):
                 ratios = (action_log_probs - old_log_probs).exp()
 
                 scalar_old_values = hl_gauss(old_values)
-                advantages = normalize(returns - scalar_old_values.detach())
-                advantages = rearrange(advantages, '... -> ... 1')
+                advantages_main = normalize(returns - scalar_old_values.detach())
+                advantages_main = rearrange(advantages_main, '... -> ... 1')
+                
+                scalar_old_internal_values = hl_gauss(old_internal_values)
+                advantages_inner = normalize(internal_returns - scalar_old_internal_values.detach(), mask = is_internal_action_sampled)
+                advantages_inner = rearrange(advantages_inner, '... -> ... 1')
+                advantages_inner = repeat(advantages_inner, 'b 1 -> b num', num = internal_log_probs[0].numel())
+                
+                advantages, _ = pack([advantages_main, advantages_inner], 'b *')
 
                 surr1 = ratios * advantages
                 surr2 = ratios.clamp(1 - self.eps_clip, 1 + self.eps_clip) * advantages
@@ -662,10 +737,10 @@ class PPO(Module):
                     internal_loss_weight = 0.
                 elif phase == 'inner':
                     main_loss_weight = torch.zeros((1,), device = device)
-                    internal_loss_weight = self.internal_policy_loss_weight
+                    internal_loss_weight = self.internal_policy_loss_weight * self.actor.net.num_time_embeds
                 elif phase == 'both':
                     main_loss_weight = torch.ones((1,), device = device)
-                    internal_loss_weight = self.internal_policy_loss_weight
+                    internal_loss_weight = self.internal_policy_loss_weight * self.actor.net.num_time_embeds
                 else:
                     raise ValueError(f'unknown phase {phase}')
 
@@ -691,31 +766,45 @@ class PPO(Module):
 
                 clip = self.value_clip
 
-                values = self.critic(states, time_embed_index = time_embed_indices)
+                values, internal_values = self.critic(states, time_embed_index = time_embed_indices)
 
                 scalar_values = hl_gauss(values)
-
-                # using the proposal from https://www.authorea.com/users/855021/articles/1240083-on-analysis-of-clipped-critic-loss-in-proximal-policy-gradient
-
-                clipped_returns = returns.clamp(scalar_old_values - clip, scalar_old_values + clip)
-
-                clipped_loss = hl_gauss(values, clipped_returns, reduction = 'none')
-                loss = hl_gauss(values, returns, reduction = 'none')
-
-                old_values_lo = scalar_old_values - clip
-                old_values_hi = scalar_old_values + clip
+                scalar_internal_values = hl_gauss(internal_values)
 
                 def is_between(mid, lo, hi):
                     return (lo < mid) & (mid < hi)
 
-                value_loss = torch.where(
-                    is_between(scalar_values, returns, old_values_lo) |
-                    is_between(scalar_values, old_values_hi, returns),
-                    0.,
-                    torch.min(loss, clipped_loss)
-                )
+                def calc_value_loss(scalar_values, scalar_old_values, returns, values):
+                    clipped_returns = returns.clamp(scalar_old_values - clip, scalar_old_values + clip)
+                    clipped_loss = hl_gauss(values, clipped_returns, reduction = 'none')
+                    loss = hl_gauss(values, returns, reduction = 'none')
 
-                value_loss = value_loss.mean()
+                    old_values_lo = scalar_old_values - clip
+                    old_values_hi = scalar_old_values + clip
+
+                    return torch.where(
+                        is_between(scalar_values, returns, old_values_lo) |
+                        is_between(scalar_values, old_values_hi, returns),
+                        0.,
+                        torch.min(loss, clipped_loss)
+                    )
+
+                value_loss_main = calc_value_loss(scalar_values, scalar_old_values, returns, values)
+                value_loss_inner = calc_value_loss(scalar_internal_values, scalar_old_internal_values, internal_returns, internal_values)
+
+                if phase == 'outer':
+                    main_v_weight = 1.
+                    inner_v_weight = 0.
+                elif phase == 'inner':
+                    main_v_weight = 0.
+                    inner_v_weight = 1. * self.actor.net.num_time_embeds
+                elif phase == 'both':
+                    main_v_weight = 1.
+                    inner_v_weight = 1. * self.actor.net.num_time_embeds
+
+                is_sampled_float = is_internal_action_sampled.float()
+                
+                value_loss = value_loss_main.mean() * main_v_weight + (value_loss_inner * is_sampled_float).mean() * inner_v_weight
 
                 update_network_(value_loss, self.opt_critic)
 
@@ -759,7 +848,7 @@ def record_eval_episode(
     state_dict, _ = eval_env.reset()
     state = torch.from_numpy(concat_goal_obs(state_dict)).float().to(device)
 
-    last_int_actions = None
+    last_internal_actions = None
 
     for timestep in range(max_timesteps):
         time_idx = timestep % num_time_embeds
@@ -769,13 +858,13 @@ def record_eval_episode(
             time_index = tensor([time_idx], device = device, dtype = torch.long)
             state_batch = rearrange(state, 'd -> 1 d')
 
-            prev_actions = last_int_actions if not is_sampled else None
+            prev_actions = last_internal_actions if not is_sampled else None
             mean, std, internals = agent.ema_actor.forward_eval(state_batch, actions = prev_actions, time_embed_index = time_index)
 
-        int_logits, int_actions = tuple(rearrange(stack(t), 'l b ... -> b l ...') for t in zip(*internals))
+        internal_action_logits, internal_actions = tuple(rearrange(stack(t), 'l b ... -> b l ...') for t in zip(*internals))
 
-        if is_sampled or not exists(last_int_actions):
-            last_int_actions = int_actions.clone()
+        if is_sampled or not exists(last_internal_actions):
+            last_internal_actions = internal_actions.clone()
 
         action = mean[0].tanh().cpu().numpy()
         next_state_dict, _, terminated, truncated, _ = eval_env.step(action)
@@ -828,14 +917,14 @@ def collect_vectorized_rollouts(
 
     episode_fields = (
         'learnable', 'state', 'action', 'action_log_prob', 'reward',
-        'is_boundary', 'value', 'internal_actions', 'internal_action_logits',
+        'is_boundary', 'value', 'internal_value', 'internal_actions', 'internal_action_logits',
         'time_embed_index', 'is_internal_action_sampled'
     )
 
     collected = [{field: [] for field in episode_fields} for _ in range(num_envs)]
 
-    last_int_actions = None
-    last_int_logits = None
+    last_internal_actions = None
+    last_internal_logits = None
     time_elapsed = 0
 
     # rollout loop
@@ -853,19 +942,19 @@ def collect_vectorized_rollouts(
         with torch.no_grad():
             time_index = tensor([time_idx] * num_envs, device = device, dtype = torch.long)
 
-            prev_actions = last_int_actions if not is_sampled else None
+            prev_actions = last_internal_actions if not is_sampled else None
             mean, std, internals = agent.ema_actor.forward_eval(state, actions = prev_actions, time_embed_index = time_index)
-            value = agent.ema_critic.forward_eval(state, time_embed_index = time_index)
+            value, internal_value = agent.ema_critic.forward_eval(state, time_embed_index = time_index)
 
         dist = Normal(mean, std)
         action = dist.sample()
         action_log_prob = dist.log_prob(action).sum(dim = -1)
 
-        int_logits, int_actions = tuple(rearrange(stack(t), 'l b ... -> b l ...') for t in zip(*internals))
+        internal_action_logits_stacked, internal_actions_stacked = tuple(rearrange(stack(t), 'l b ... -> b l ...') for t in zip(*internals))
 
-        if is_sampled or not exists(last_int_actions):
-            last_int_actions = int_actions.clone()
-            last_int_logits = int_logits.clone()
+        if is_sampled or not exists(last_internal_actions):
+            last_internal_actions = internal_actions_stacked.clone()
+            last_internal_logits = internal_action_logits_stacked.clone()
 
         # step environment
 
@@ -899,8 +988,9 @@ def collect_vectorized_rollouts(
             d['reward'].append(total_reward[i])
             d['is_boundary'].append(terminated[i])
             d['value'].append(value[i].cpu())
-            d['internal_actions'].append(last_int_actions[i].cpu())
-            d['internal_action_logits'].append(last_int_logits[i].cpu())
+            d['internal_value'].append(internal_value[i].cpu())
+            d['internal_actions'].append(last_internal_actions[i].cpu())
+            d['internal_action_logits'].append(last_internal_logits[i].cpu())
             d['time_embed_index'].append(time_idx)
             d['is_internal_action_sampled'].append(is_sampled)
 
@@ -924,10 +1014,11 @@ def collect_vectorized_rollouts(
             next_time_idx = (timestep + 1) % num_time_embeds
 
             with torch.no_grad():
-                next_value = agent.ema_critic.forward_eval(
+                next_value, next_internal_value = agent.ema_critic.forward_eval(
                     final_state_t,
                     time_embed_index = tensor([next_time_idx], device = device, dtype = torch.long)
-                )[0]
+                )
+                next_value, next_internal_value = next_value[0], next_internal_value[0]
 
             d['learnable'].append(False)
             d['state'].append(final_state_t[0].cpu())
@@ -936,8 +1027,9 @@ def collect_vectorized_rollouts(
             d['reward'].append(0.)
             d['is_boundary'].append(True)
             d['value'].append(next_value.cpu())
-            d['internal_actions'].append(last_int_actions[i].cpu())
-            d['internal_action_logits'].append(last_int_logits[i].cpu())
+            d['internal_value'].append(next_internal_value.cpu())
+            d['internal_actions'].append(last_internal_actions[i].cpu())
+            d['internal_action_logits'].append(last_internal_logits[i].cpu())
             d['time_embed_index'].append(next_time_idx)
             d['is_internal_action_sampled'].append(False)
 
@@ -957,6 +1049,7 @@ def collect_vectorized_rollouts(
                     reward = d['reward'][t],
                     is_boundary = bool(d['is_boundary'][t]),
                     value = d['value'][t],
+                    internal_value = d['internal_value'][t],
                     internal_actions = d['internal_actions'][t],
                     internal_action_logits = d['internal_action_logits'][t],
                     time_embed_index = int(d['time_embed_index'][t]),
@@ -1023,7 +1116,9 @@ def main(
             reward = 'float',
             is_boundary = 'bool',
             value = ('float', critic_pred_num_bins),
+            internal_value = ('float', critic_pred_num_bins),
             returns = 'float',
+            internal_returns = 'float',
             internal_actions = ('int', (num_internal_actions, internal_action_dim)),
             internal_action_logits = ('float', (num_internal_actions, internal_action_dim, actor_hidden_dim * 2)),
             time_embed_index = 'int',
