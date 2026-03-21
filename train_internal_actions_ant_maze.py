@@ -11,12 +11,14 @@
 #   "memmap-replay-buffer",
 #   "fire",
 #   "tqdm",
-#   "termcolor"
+#   "termcolor",
+#   "wandb"
 # ]
 # ///
 
 from __future__ import annotations
 import re
+import wandb
 
 import fire
 from pathlib import Path
@@ -110,9 +112,6 @@ def parse_string_schedule(schedule_str):
 
 def get_phase_generator(schedule, num_envs = 1):
     for phase, duration in cycle(schedule):
-        if duration % num_envs != 0:
-            raise ValueError(f"Phase '{phase}' duration {duration} is not a multiple of num_envs ({num_envs}). "
-                             f"Vectorized rollouts cannot have mixed phases.")
         for _ in range(duration):
             yield phase
 
@@ -201,11 +200,8 @@ class GumbelSoLU(Module):
         logits = rearrange(x, '... (segments d) -> ... segments d', segments = self.softmax_segments)
 
         if not exists(actions):
-            if self.training:
-                dist = Categorical(logits = logits)
-                actions = dist.sample()
-            else:
-                actions = logits.argmax(dim = -1)
+            dist = Categorical(logits = logits)
+            actions = dist.sample()
 
             prob = logits.softmax(dim = -1)
             one_hot = F.one_hot(actions.long(), prob.shape[-1]).float()
@@ -318,8 +314,6 @@ class SimBa(Module):
         self.layers = ModuleList(layers)
         self.residual_norms = ModuleList([nn.LayerNorm(dim_hidden, bias=False) for _ in range(depth)])
 
-        self.final_norm = nn.RMSNorm(dim_hidden)
-
     def forward(
         self,
         x,
@@ -354,18 +348,23 @@ class SimBa(Module):
             if is_inner:
                 layer_actions = next(actions_iter, None)
                 out, one_logits_and_actions = layer(x, layer_actions, is_sampled)
+
+                if exists(is_sampled):
+                    mask = is_sampled.float()
+                    while mask.ndim < out.ndim:
+                        mask = mask.unsqueeze(-1)
+                    out = out * mask + out.detach() * (1. - mask)
+
                 logits_and_actions.append(one_logits_and_actions)
             else:
                 out, _ = layer(x, None, is_sampled)
 
             x = self.residual_norms[i](x + out)
 
-        out = self.final_norm(x)
-
         if no_batch:
-            out = rearrange(out, '1 ... -> ...')
+            x = rearrange(x, '1 ... -> ...')
 
-        return out, logits_and_actions
+        return x, logits_and_actions
 
 # networks
 
@@ -618,7 +617,7 @@ class PPO(Module):
             for i in range(module.net.outer_depth, module.net.outer_depth + module.net.num_internal_actions):
                 for p in module.net.layers[i].parameters():
                     inner_layer_ids.add(id(p))
-            
+
             inner_params, outer_params = [], []
             for p in module.parameters():
                 if id(p) in inner_layer_ids:
@@ -1138,8 +1137,8 @@ def main(
     max_timesteps = 700,
     actor_hidden_dim = 64,
     critic_hidden_dim = 256,
-    actor_depth = 8,
-    critic_depth = 8,
+    actor_depth = 12,
+    critic_depth = 12,
     critic_pred_num_bins = 100,
     reward_range = (-50., 50.),
     update_episodes = 50,
@@ -1158,15 +1157,20 @@ def main(
     cautious_factor = 0.1,
     ema_decay = 0.9,
     epochs = 2,
-    num_internal_actions = 2,
+    num_internal_actions = 4,
     internal_action_dim = 3,
     num_time_embeds = 4,
     seed = None,
     render = True,
     save_every = 1000,
     video_folder = './antmaze-recording',
-    load = False
+    load = False,
+    use_wandb = True,
+    wandb_project = 'antmaze-internal-actions'
 ):
+    if use_wandb:
+        wandb.init(project=wandb_project, config=locals())
+
     rmtree(video_folder, ignore_errors = True)
 
     # environment setup - always async for training
@@ -1240,6 +1244,9 @@ def main(
     else:
         phase_schedule_tuples = phase_schedule
 
+    # align durations to be multiples of num_envs
+    phase_schedule_tuples = [(phase, ((duration + num_envs - 1) // num_envs) * num_envs) for phase, duration in phase_schedule_tuples]
+
     num_episodes = sum(duration for _, duration in phase_schedule_tuples)
     phase_generator = get_phase_generator(phase_schedule_tuples, num_envs=num_envs)
 
@@ -1292,6 +1299,21 @@ def main(
                 'steps': round(avg_steps, 2)
             })
 
+            if use_wandb:
+                for cr, st in zip(cum_rewards, steps):
+                    phase_mapping = {'outer': 0, 'inner': 1, 'both': 2}
+                    wandb.log({
+                        'episode_reward': cr,
+                        'episode_steps': st,
+                        'avg_reward': avg_reward,
+                        'avg_steps': avg_steps,
+                        'total_eps': total_eps,
+                        'num_policy_updates': num_policy_updates,
+                        'phase_update_count': phase_update_count,
+                        'phase': curr_phase,
+                        'phase_id': phase_mapping.get(curr_phase, -1)
+                    })
+
         if updating_agent:
 
             if render:
@@ -1301,6 +1323,11 @@ def main(
                     total_eps,
                     clear_previous = False
                 )
+                if use_wandb:
+                    videos = list(Path(video_folder).glob("*.mp4"))
+                    if len(videos) > 0:
+                        latest_video = max(videos, key=lambda p: p.stat().st_mtime)
+                        wandb.log({"eval_video": wandb.Video(str(latest_video), format="mp4")}, step=total_eps)
 
             agent.learn(memories, phase = curr_phase)
             num_policy_updates += 1
@@ -1310,6 +1337,22 @@ def main(
             agent.save()
 
         prev_eps = total_eps
+
+    if render:
+        record_eval_episode(
+            env_name, agent, max_timesteps,
+            num_time_embeds, video_folder,
+            total_eps,
+            clear_previous = False
+        )
+        if use_wandb:
+            videos = list(Path(video_folder).glob("*.mp4"))
+            if len(videos) > 0:
+                latest_video = max(videos, key=lambda p: p.stat().st_mtime)
+                wandb.log({"final_eval_video": wandb.Video(str(latest_video), format="mp4")}, step=total_eps)
+
+    if use_wandb:
+        wandb.finish()
 
 if __name__ == '__main__':
     fire.Fire(main)
