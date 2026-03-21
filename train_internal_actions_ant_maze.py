@@ -6,7 +6,7 @@
 #   "adam-atan2-pytorch",
 #   "hl-gauss-pytorch",
 #   "assoc-scan",
-#   "gymnasium[mujoco]>=1.0.0",
+#   "gymnasium[mujoco,moviepy]>=1.0.0",
 #   "gymnasium-robotics",
 #   "memmap-replay-buffer",
 #   "fire",
@@ -82,10 +82,16 @@ def normalize(t, mask = None, eps = 1e-5):
     std = masked_t.std(unbiased = False).clamp(min = eps)
     return (t - mean) / std
 
-def update_network_(loss, optimizer):
-    optimizer.zero_grad()
+def update_network_(loss, opt_inner, opt_outer, phase):
     loss.mean().backward()
-    optimizer.step()
+
+    if phase in ('inner', 'both'):
+        opt_inner.step()
+    if phase in ('outer', 'both'):
+        opt_outer.step()
+
+    opt_inner.zero_grad()
+    opt_outer.zero_grad()
 
 # phase schedule parsing
 
@@ -172,7 +178,7 @@ class SoLU(Module):
         self.norm = nn.LayerNorm(dim, bias = False)
         self.softmax_segments = softmax_segments
 
-    def forward(self, x, actions = None):
+    def forward(self, x, actions = None, is_sampled = None):
 
         logits = rearrange(x, '... (segments d) -> ... segments d', segments = self.softmax_segments)
         prob = logits.softmax(dim = -1)
@@ -190,7 +196,7 @@ class GumbelSoLU(Module):
         self.softmax_segments = softmax_segments
         self.norm = nn.LayerNorm(dim, bias = False)
 
-    def forward(self, x, actions = None):
+    def forward(self, x, actions = None, is_sampled = None):
 
         logits = rearrange(x, '... (segments d) -> ... segments d', segments = self.softmax_segments)
 
@@ -201,12 +207,25 @@ class GumbelSoLU(Module):
             else:
                 actions = logits.argmax(dim = -1)
 
-        prob = logits.softmax(dim = -1)
-        one_hot = F.one_hot(actions.long(), prob.shape[-1]).float()
+            prob = logits.softmax(dim = -1)
+            one_hot = F.one_hot(actions.long(), prob.shape[-1]).float()
 
-        # straight through estimator
-        one_hot = one_hot + prob - prob.detach()
-        one_hot = rearrange(one_hot, '... segments d -> ... (segments d)')
+            # straight through estimator
+            one_hot = one_hot + prob - prob.detach()
+            one_hot = rearrange(one_hot, '... segments d -> ... (segments d)')
+        else:
+            # discrete action already provided (off-step or replayed trajectory).
+            prob = logits.softmax(dim = -1)
+            one_hot = F.one_hot(actions.long(), prob.shape[-1]).float()
+
+            ste_term = prob - prob.detach()
+
+            if exists(is_sampled):
+                is_sampled_mask = rearrange(is_sampled.float(), 'b -> b 1 1')
+                ste_term = ste_term * is_sampled_mask
+
+            one_hot = one_hot + ste_term
+            one_hot = rearrange(one_hot, '... segments d -> ... (segments d)')
 
         return self.norm(x * one_hot), (logits, actions)
 
@@ -242,10 +261,11 @@ class FeedForward(Module):
     def forward(
         self,
         x,
-        actions = None
+        actions = None,
+        is_sampled = None
     ):
         gate, hidden = self.proj_gelu(x), self.proj_solu(x)
-        hidden, logits_and_actions = self.activation(hidden, actions)
+        hidden, logits_and_actions = self.activation(hidden, actions, is_sampled)
 
         out = F.gelu(gate) + hidden
         return self.values(out), logits_and_actions
@@ -271,6 +291,9 @@ class SimBa(Module):
         dim_hidden = default(dim_hidden, dim * expansion_factor)
 
         self.num_time_embeds = num_time_embeds
+        self.num_internal_actions = num_internal_actions
+        self.outer_depth = (depth - num_internal_actions) // 2
+
         self.time_emb = nn.Embedding(num_time_embeds, dim_hidden)
 
         layers = []
@@ -279,11 +302,13 @@ class SimBa(Module):
 
         self.proj_in = nn.Linear(dim, dim_hidden)
 
-        for _ in range(depth):
+        for i in range(depth):
+            is_inner = self.outer_depth <= i < (self.outer_depth + num_internal_actions)
+
             layer = FeedForward(
                 dim_hidden,
                 expansion_factor,
-                gumbel_sample = ff_solu_gumbel_sample,
+                gumbel_sample = ff_solu_gumbel_sample and is_inner,
                 softmax_segments = internal_action_dim
             )
             layers.append(layer)
@@ -291,6 +316,7 @@ class SimBa(Module):
         # final layer out
 
         self.layers = ModuleList(layers)
+        self.residual_norms = ModuleList([nn.LayerNorm(dim_hidden, bias=False) for _ in range(depth)])
 
         self.final_norm = nn.RMSNorm(dim_hidden)
 
@@ -314,14 +340,25 @@ class SimBa(Module):
         logits_and_actions = []
 
         if not exists(actions):
-            actions = tuple()
-        else:
+            actions = [None] * self.num_internal_actions
+        elif torch.is_tensor(actions):
             actions = actions.unbind(dim = 1)
 
-        for layer, layer_actions in zip_longest(self.layers, actions):
-            x, one_logits_and_actions = layer(x, layer_actions)
+        is_sampled = (time_embed_index == 0) if exists(time_embed_index) else None
 
-            logits_and_actions.append(one_logits_and_actions)
+        actions_iter = iter(actions)
+
+        for i, layer in enumerate(self.layers):
+            is_inner = self.outer_depth <= i < (self.outer_depth + self.num_internal_actions)
+
+            if is_inner:
+                layer_actions = next(actions_iter, None)
+                out, one_logits_and_actions = layer(x, layer_actions, is_sampled)
+                logits_and_actions.append(one_logits_and_actions)
+            else:
+                out, _ = layer(x, None, is_sampled)
+
+            x = self.residual_norms[i](x + out)
 
         out = self.final_norm(x)
 
@@ -338,7 +375,7 @@ class Actor(Module):
         state_dim,
         hidden_dim,
         action_dim,
-        mlp_depth = 6,
+        actor_depth = 6,
         dropout = 0.1,
         rsmnorm_input = True,
         num_internal_actions = 4,
@@ -351,7 +388,7 @@ class Actor(Module):
         self.net = SimBa(
             state_dim,
             dim_hidden = hidden_dim * 2,
-            depth = mlp_depth,
+            depth = actor_depth,
             dropout = dropout,
             ff_solu_gumbel_sample = True,
             num_internal_actions = num_internal_actions,
@@ -389,7 +426,7 @@ class Critic(Module):
         state_dim,
         hidden_dim,
         dim_pred = 1,
-        mlp_depth = 6, # recent paper has findings that show scaling critic is more important than scaling actor
+        critic_depth = 6, # recent paper has findings that show scaling critic is more important than scaling actor
         dropout = 0.1,
         rsmnorm_input = True,
         num_internal_actions = 4,
@@ -402,7 +439,7 @@ class Critic(Module):
         self.net = SimBa(
             state_dim,
             dim_hidden = hidden_dim,
-            depth = mlp_depth,
+            depth = critic_depth,
             dropout = dropout,
             ff_solu_gumbel_sample = False,
             num_internal_actions = num_internal_actions,
@@ -526,6 +563,8 @@ class PPO(Module):
         eps_clip,
         value_clip,
         ema_decay,
+        actor_depth = 6,
+        critic_depth = 6,
         internal_policy_loss_weight = 1.0,
         num_internal_actions = 4,
         internal_action_dim = 3,
@@ -541,7 +580,8 @@ class PPO(Module):
             state_dim,
             actor_hidden_dim,
             action_dim,
-            mlp_depth = num_internal_actions,
+            actor_depth = actor_depth,
+            num_internal_actions = num_internal_actions,
             internal_action_dim = internal_action_dim,
             num_time_embeds = num_time_embeds
         )
@@ -550,7 +590,8 @@ class PPO(Module):
             state_dim,
             critic_hidden_dim,
             dim_pred = critic_pred_num_bins,
-            mlp_depth = num_internal_actions,
+            critic_depth = critic_depth,
+            num_internal_actions = num_internal_actions,
             internal_action_dim = internal_action_dim,
             num_time_embeds = num_time_embeds
         )
@@ -572,11 +613,28 @@ class PPO(Module):
         self.ema_actor = EMA(self.actor, beta = ema_decay, include_online_model = False, **ema_kwargs)
         self.ema_critic = EMA(self.critic, beta = ema_decay, include_online_model = False, **ema_kwargs)
 
-        self.opt_actor = AdoptAtan2(self.actor.parameters(), lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
-        self.opt_critic = AdoptAtan2(self.critic.parameters(), lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
+        def get_inner_outer_params(module):
+            inner_layer_ids = set()
+            for i in range(module.net.outer_depth, module.net.outer_depth + module.net.num_internal_actions):
+                for p in module.net.layers[i].parameters():
+                    inner_layer_ids.add(id(p))
+            
+            inner_params, outer_params = [], []
+            for p in module.parameters():
+                if id(p) in inner_layer_ids:
+                    inner_params.append(p)
+                else:
+                    outer_params.append(p)
+            return inner_params, outer_params
 
-        self.ema_actor.add_to_optimizer_post_step_hook(self.opt_actor)
-        self.ema_critic.add_to_optimizer_post_step_hook(self.opt_critic)
+        actor_inner, actor_outer = get_inner_outer_params(self.actor)
+        critic_inner, critic_outer = get_inner_outer_params(self.critic)
+
+        self.opt_actor_inner = AdoptAtan2(actor_inner, lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
+        self.opt_actor_outer = AdoptAtan2(actor_outer, lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
+
+        self.opt_critic_inner = AdoptAtan2(critic_inner, lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
+        self.opt_critic_outer = AdoptAtan2(critic_outer, lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
 
         # learning hparams
 
@@ -770,7 +828,7 @@ class PPO(Module):
 
                 policy_loss = (policy_loss * loss_weight).sum(dim = -1)
 
-                update_network_(policy_loss, self.opt_actor)
+                update_network_(policy_loss, self.opt_actor_inner, self.opt_actor_outer, phase)
 
                 # calculate clipped value loss and update value network separate from policy network
 
@@ -816,7 +874,10 @@ class PPO(Module):
 
                 value_loss = value_loss_main.mean() * main_v_weight + (value_loss_inner * is_sampled_float).mean() * inner_v_weight
 
-                update_network_(value_loss, self.opt_critic)
+                update_network_(value_loss, self.opt_critic_inner, self.opt_critic_outer, phase)
+
+                self.ema_actor.update()
+                self.ema_critic.update()
 
         # update the state normalization with rsmnorm for 1 epoch after actor critic are updated
 
@@ -1073,10 +1134,12 @@ def collect_vectorized_rollouts(
 def main(
     num_envs = 8,
     env_name = 'AntMaze_UMaze-v5',
-    phase_schedule = "256both (128inner 128outer)*500",
+    phase_schedule = "1000both (500inner 500outer)*250",
     max_timesteps = 700,
     actor_hidden_dim = 64,
     critic_hidden_dim = 256,
+    actor_depth = 8,
+    critic_depth = 8,
     critic_pred_num_bins = 100,
     reward_range = (-50., 50.),
     update_episodes = 50,
@@ -1095,7 +1158,7 @@ def main(
     cautious_factor = 0.1,
     ema_decay = 0.9,
     epochs = 2,
-    num_internal_actions = 8,
+    num_internal_actions = 2,
     internal_action_dim = 3,
     num_time_embeds = 4,
     seed = None,
@@ -1104,6 +1167,8 @@ def main(
     video_folder = './antmaze-recording',
     load = False
 ):
+    rmtree(video_folder, ignore_errors = True)
+
     # environment setup - always async for training
 
     env = gym.make_vec(env_name, num_envs = num_envs, vectorization_mode = 'async')
@@ -1149,6 +1214,8 @@ def main(
         lr, betas, lam, gamma, gamma_inner, beta_s,
         regen_reg_rate, cautious_factor,
         eps_clip, value_clip, ema_decay,
+        actor_depth = actor_depth,
+        critic_depth = critic_depth,
         num_internal_actions = num_internal_actions,
         internal_action_dim = internal_action_dim,
         num_time_embeds = num_time_embeds
@@ -1232,7 +1299,7 @@ def main(
                     env_name, agent, max_timesteps,
                     num_time_embeds, video_folder,
                     total_eps,
-                    clear_previous = (num_policy_updates == 0)
+                    clear_previous = False
                 )
 
             agent.learn(memories, phase = curr_phase)
