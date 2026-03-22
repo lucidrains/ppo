@@ -32,7 +32,7 @@ from tqdm import tqdm
 from termcolor import colored
 
 import torch
-from torch import nn, tensor, cat, stack, is_tensor
+from torch import nn, tensor, cat, stack, is_tensor, zeros, ones, zeros_like, where, save, load, manual_seed
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
 from torch.distributions import Categorical, Normal
@@ -131,8 +131,8 @@ class RSMNorm(Module):
         self.eps = eps
 
         self.register_buffer('step', tensor(1))
-        self.register_buffer('running_mean', torch.zeros(dim))
-        self.register_buffer('running_variance', torch.ones(dim))
+        self.register_buffer('running_mean', zeros(dim))
+        self.register_buffer('running_variance', ones(dim))
 
     def forward(
         self,
@@ -335,7 +335,7 @@ class SimBa(Module):
 
         if not exists(actions):
             actions = [None] * self.num_internal_actions
-        elif torch.is_tensor(actions):
+        elif is_tensor(actions):
             actions = actions.unbind(dim = 1)
 
         is_sampled = (time_embed_index == 0) if exists(time_embed_index) else None
@@ -428,7 +428,7 @@ class Critic(Module):
         critic_depth = 6, # recent paper has findings that show scaling critic is more important than scaling actor
         dropout = 0.1,
         rsmnorm_input = True,
-        num_internal_actions = 4,
+        num_internal_actions = 0,
         internal_action_dim = 3,
         num_time_embeds = 8
     ):
@@ -441,13 +441,12 @@ class Critic(Module):
             depth = critic_depth,
             dropout = dropout,
             ff_solu_gumbel_sample = False,
-            num_internal_actions = num_internal_actions,
+            num_internal_actions = num_internal_actions, # kept for depth calculation consistency matching
             internal_action_dim = internal_action_dim,
             num_time_embeds = num_time_embeds
         )
 
         self.value_head = nn.Linear(hidden_dim, dim_pred)
-        self.internal_value_head = nn.Linear(hidden_dim, dim_pred)
 
     def forward(self, x, time_embed_index = None):
 
@@ -456,7 +455,7 @@ class Critic(Module):
             x = self.rsmnorm(x)
 
         hidden, _ = self.net(x, time_embed_index = time_embed_index)
-        return self.value_head(hidden), self.internal_value_head(hidden)
+        return self.value_head(hidden)
 
 # GAE
 
@@ -503,7 +502,7 @@ def calc_internal_gae(
 
     is_boundary = (masks == 0)
     is_truncated = is_boundary & (~learnable)
-    step_rewards = rewards + torch.where(is_truncated, values, torch.zeros_like(values))
+    step_rewards = rewards + where(is_truncated, values, zeros_like(values))
 
     is_sampled_next = is_sampled.roll(-1, dims = 1)
     is_sampled_next[:, -1] = True
@@ -590,7 +589,17 @@ class PPO(Module):
             critic_hidden_dim,
             dim_pred = critic_pred_num_bins,
             critic_depth = critic_depth,
-            num_internal_actions = num_internal_actions,
+            num_internal_actions = 0,
+            internal_action_dim = internal_action_dim,
+            num_time_embeds = num_time_embeds
+        )
+
+        self.internal_critic = Critic(
+            state_dim,
+            critic_hidden_dim,
+            dim_pred = critic_pred_num_bins,
+            critic_depth = critic_depth,
+            num_internal_actions = 0,
             internal_action_dim = internal_action_dim,
             num_time_embeds = num_time_embeds
         )
@@ -599,6 +608,7 @@ class PPO(Module):
 
         self.rsmnorm = self.actor.rsmnorm
         self.critic.rsmnorm = self.rsmnorm
+        self.internal_critic.rsmnorm = self.rsmnorm
 
         # https://arxiv.org/abs/2403.03950
 
@@ -611,11 +621,18 @@ class PPO(Module):
 
         self.ema_actor = EMA(self.actor, beta = ema_decay, include_online_model = False, **ema_kwargs)
         self.ema_critic = EMA(self.critic, beta = ema_decay, include_online_model = False, **ema_kwargs)
+        self.ema_internal_critic = EMA(self.internal_critic, beta = ema_decay, include_online_model = False, **ema_kwargs)
 
         def get_inner_outer_params(module):
             inner_layer_ids = set()
             for i in range(module.net.outer_depth, module.net.outer_depth + module.net.num_internal_actions):
                 for p in module.net.layers[i].parameters():
+                    inner_layer_ids.add(id(p))
+                for p in module.net.residual_norms[i].parameters():
+                    inner_layer_ids.add(id(p))
+
+            if hasattr(module.net, 'time_emb'):
+                for p in module.net.time_emb.parameters():
                     inner_layer_ids.add(id(p))
 
             inner_params, outer_params = [], []
@@ -627,13 +644,12 @@ class PPO(Module):
             return inner_params, outer_params
 
         actor_inner, actor_outer = get_inner_outer_params(self.actor)
-        critic_inner, critic_outer = get_inner_outer_params(self.critic)
 
         self.opt_actor_inner = AdoptAtan2(actor_inner, lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
         self.opt_actor_outer = AdoptAtan2(actor_outer, lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
 
-        self.opt_critic_inner = AdoptAtan2(critic_inner, lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
-        self.opt_critic_outer = AdoptAtan2(critic_outer, lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
+        self.opt_critic = AdoptAtan2(self.critic.parameters(), lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
+        self.opt_internal_critic = AdoptAtan2(self.internal_critic.parameters(), lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
 
         # learning hparams
 
@@ -654,19 +670,21 @@ class PPO(Module):
         self.save_path = Path(save_path)
 
     def save(self):
-        torch.save({
+        save({
             'actor': self.actor.state_dict(),
             'critic': self.critic.state_dict(),
+            'internal_critic': self.internal_critic.state_dict()
         }, str(self.save_path))
 
     def load(self):
         if not self.save_path.exists():
             return
 
-        data = torch.load(str(self.save_path), weights_only = True)
+        data = load(str(self.save_path), weights_only = True)
 
         self.actor.load_state_dict(data['actor'])
         self.critic.load_state_dict(data['critic'])
+        self.internal_critic.load_state_dict(data['internal_critic'])
 
     def learn(self, memories: ReplayBuffer, *, phase = 'both', device = device):
         hl_gauss = self.critic_hl_gauss_loss
@@ -740,6 +758,7 @@ class PPO(Module):
 
         self.actor.train()
         self.critic.train()
+        self.internal_critic.train()
 
         # policy phase training, similar to original PPO
 
@@ -800,13 +819,13 @@ class PPO(Module):
                 # weigh internal a bit less
 
                 if phase == 'outer':
-                    main_loss_weight = torch.ones((1,), device = device)
+                    main_loss_weight = ones((1,), device = device)
                     internal_loss_weight = 0.
                 elif phase == 'inner':
-                    main_loss_weight = torch.zeros((1,), device = device)
+                    main_loss_weight = zeros((1,), device = device)
                     internal_loss_weight = self.internal_policy_loss_weight * self.actor.net.num_time_embeds
                 elif phase == 'both':
-                    main_loss_weight = torch.ones((1,), device = device)
+                    main_loss_weight = ones((1,), device = device)
                     internal_loss_weight = self.internal_policy_loss_weight * self.actor.net.num_time_embeds
                 else:
                     raise ValueError(f'unknown phase {phase}')
@@ -833,10 +852,8 @@ class PPO(Module):
 
                 clip = self.value_clip
 
-                values, internal_values = self.critic(states, time_embed_index = time_embed_indices)
-
+                values = self.critic(states, time_embed_index = time_embed_indices)
                 scalar_values = hl_gauss(values)
-                scalar_internal_values = hl_gauss(internal_values)
 
                 def is_between(mid, lo, hi):
                     return (lo < mid) & (mid < hi)
@@ -849,7 +866,7 @@ class PPO(Module):
                     old_values_lo = scalar_old_values - clip
                     old_values_hi = scalar_old_values + clip
 
-                    return torch.where(
+                    return where(
                         is_between(scalar_values, returns, old_values_lo) |
                         is_between(scalar_values, old_values_hi, returns),
                         0.,
@@ -857,7 +874,26 @@ class PPO(Module):
                     )
 
                 value_loss_main = calc_value_loss(scalar_values, scalar_old_values, returns, values)
-                value_loss_inner = calc_value_loss(scalar_internal_values, scalar_old_internal_values, internal_returns, internal_values)
+
+                sampled_mask = is_internal_action_sampled
+                if sampled_mask.any():
+                    sampled_states = states[sampled_mask]
+                    sampled_times = time_embed_indices[sampled_mask]
+                    sampled_internal_values = self.internal_critic(sampled_states, time_embed_index = sampled_times)
+                    sampled_scalar_internal = hl_gauss(sampled_internal_values)
+
+                    sampled_old_internal = hl_gauss(old_internal_values[sampled_mask])
+                    sampled_returns = internal_returns[sampled_mask]
+
+                    sampled_loss_inner = calc_value_loss(
+                        sampled_scalar_internal,
+                        sampled_old_internal,
+                        sampled_returns,
+                        sampled_internal_values
+                    )
+                    value_loss_inner_sum = sampled_loss_inner.sum()
+                else:
+                    value_loss_inner_sum = zeros((1,), device=states.device)
 
                 if phase == 'outer':
                     main_v_weight = 1.
@@ -869,20 +905,20 @@ class PPO(Module):
                     main_v_weight = 1.
                     inner_v_weight = 1. * self.actor.net.num_time_embeds
 
-                is_sampled_float = is_internal_action_sampled.float()
+                batch_size_f = tensor(states.shape[0], dtype=torch.float32, device=states.device)
+                value_loss = value_loss_main.mean() * main_v_weight + (value_loss_inner_sum / batch_size_f) * inner_v_weight
 
-                value_loss = value_loss_main.mean() * main_v_weight + (value_loss_inner * is_sampled_float).mean() * inner_v_weight
-
-                update_network_(value_loss, self.opt_critic_inner, self.opt_critic_outer, phase)
+                update_network_(value_loss, self.opt_internal_critic, self.opt_critic, phase)
 
                 self.ema_actor.update()
                 self.ema_critic.update()
+                self.ema_internal_critic.update()
 
         # update the state normalization with rsmnorm for 1 epoch after actor critic are updated
 
         self.rsmnorm.train()
 
-        for states, *_ in dl:
+        for states, *_ in tqdm(dl, desc='updating rsmnorm', leave=True):
             self.rsmnorm(states)
 
 # helpers for vectorized rollout
@@ -995,6 +1031,7 @@ def collect_vectorized_rollouts(
 
     last_internal_actions = None
     last_internal_logits = None
+    last_internal_value = None
     time_elapsed = 0
 
     # rollout loop
@@ -1014,7 +1051,13 @@ def collect_vectorized_rollouts(
 
             prev_actions = last_internal_actions if not is_sampled else None
             mean, std, internals = agent.ema_actor.forward_eval(state, actions = prev_actions, time_embed_index = time_index)
-            value, internal_value = agent.ema_critic.forward_eval(state, time_embed_index = time_index)
+            value = agent.ema_critic.forward_eval(state, time_embed_index = time_index)
+
+            if is_sampled or not exists(last_internal_value):
+                internal_value = agent.ema_internal_critic.forward_eval(state, time_embed_index = time_index)
+                last_internal_value = internal_value
+            else:
+                internal_value = last_internal_value
 
         dist = Normal(mean, std)
         action = dist.sample()
@@ -1084,10 +1127,19 @@ def collect_vectorized_rollouts(
             next_time_idx = (timestep + 1) % num_time_embeds
 
             with torch.no_grad():
-                next_value, next_internal_value = agent.ema_critic.forward_eval(
+                next_value = agent.ema_critic.forward_eval(
                     final_state_t,
                     time_embed_index = tensor([next_time_idx], device = device, dtype = torch.long)
                 )
+
+                if next_time_idx == 0:
+                    next_internal_value = agent.ema_internal_critic.forward_eval(
+                        final_state_t,
+                        time_embed_index = tensor([next_time_idx], device = device, dtype = torch.long)
+                    )
+                else:
+                    next_internal_value = zeros_like(next_value)
+
                 next_value, next_internal_value = next_value[0], next_internal_value[0]
 
             d['learnable'].append(False)
@@ -1229,7 +1281,7 @@ def main(
         agent.load()
 
     if exists(seed):
-        torch.manual_seed(seed)
+        manual_seed(seed)
         np.random.seed(seed)
 
     # training state
