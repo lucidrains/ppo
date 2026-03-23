@@ -93,7 +93,7 @@ $ python train.py
 ```
 
 ```bibtex
-@article{Lee2024AnalysisClippedCritic
+@article{Lee2024AnalysisClippedCritic,
     title   = {On Analysis of Clipped Critic Loss in Proximal Policy Gradient},
     author  = {Yongjin Lee, Moonyoung Chung},
     journal = {Authorea},
@@ -152,3 +152,16 @@ $ python train.py
     url     = {https://arxiv.org/abs/2503.19037}
 }
 ```
+
+```bibtex
+@misc{osband2026delightfulpolicygradient,
+    title   = {Delightful Policy Gradient},
+    author  = {Ian Osband},
+    year    = {2026},
+    eprint  = {2603.14608},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2603.14608},
+}
+```
+
