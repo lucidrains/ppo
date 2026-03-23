@@ -1,3 +1,20 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "fire",
+#     "torch",
+#     "numpy",
+#     "gymnasium[box2d,other]",
+#     "tqdm",
+#     "einops",
+#     "ema-pytorch",
+#     "adam-atan2-pytorch",
+#     "hl-gauss-pytorch",
+#     "hyper-connections",
+#     "assoc-scan"
+# ]
+# ///
+
 # testing pmpo used in dreamer v4 - https://arxiv.org/abs/2509.24527
 # pmpo https://arxiv.org/html/2410.04166v1
 
@@ -108,12 +125,13 @@ class RSMNorm(Module):
         # update running mean and variance
 
         with torch.no_grad():
+            x_flat = rearrange(x, '... d -> (...) d')
+            batch_mean = x_flat.mean(dim = 0)
+            batch_var = x_flat.var(dim = 0, unbiased = False)
 
-            new_obs_mean = reduce(x, '... d -> d', 'mean')
-            delta = new_obs_mean - mean
-
-            new_mean = mean + delta / time
-            new_variance = (time - 1) / time * (variance + (delta ** 2) / time)
+            momentum = 0.1
+            new_mean = (1 - momentum) * mean + momentum * batch_mean
+            new_variance = (1 - momentum) * variance + momentum * batch_var
 
             self.step.add_(1)
             self.running_mean.copy_(new_mean)
@@ -419,20 +437,25 @@ class PPO(Module):
 
             returns = calc_gae_from_values(values = scalar_values)
 
+            # calculate advantages globally and normalize
+
+            advantages = returns - scalar_values
+            advantages = normalize(advantages)
+
         # convert values to torch tensors
 
         to_torch_tensor = lambda t: stack(t).to(device).detach()
 
         states = to_torch_tensor(states)
         actions = to_torch_tensor(actions)
-        old_values = to_torch_tensor(values)
+        old_values = hl_gauss(to_torch_tensor(values))
         old_log_probs = to_torch_tensor(old_log_probs)
         old_action_probs = to_torch_tensor(old_action_probs)
 
         # prepare dataloader for policy phase training
 
         learnable = tensor(learnable).to(device)
-        data = (states, actions, old_log_probs, returns, old_values, old_action_probs)
+        data = (states, actions, old_log_probs, returns, old_values, old_action_probs, advantages)
         data = tuple(t[learnable] for t in data)
 
         dataset = TensorDataset(*data)
@@ -442,22 +465,16 @@ class PPO(Module):
         # policy phase training, similar to original PPO
 
         for _ in range(self.epochs):
-            for i, (states, actions, old_log_probs, returns, old_values, old_action_probs) in enumerate(dl):
+            for i, (states, actions, old_log_probs, returns, scalar_old_values, old_action_probs, advantages) in enumerate(dl):
 
                 action_probs = self.actor(states)
                 dist = Categorical(action_probs)
                 action_log_probs = dist.log_prob(actions)
                 entropy = dist.entropy()
 
-                scalar_old_values = hl_gauss(old_values)
-
-                # without normalize it does not work
-
-                advantages = normalize(returns - scalar_old_values.detach())
-
                 # kl div to prior
 
-                kl_div = F.kl_div(log(action_probs), old_action_probs, reduction = 'mean')
+                kl_div = F.kl_div(log(action_probs), old_action_probs, reduction = 'batchmean')
 
                 # signed advantage, with balanced weighting of positive and negative advantages
 
@@ -468,13 +485,17 @@ class PPO(Module):
 
                 scaled_action_log_probs = action_log_probs * advantages.tanh().abs()
 
+                pos_loss, neg_loss = 0., 0.
+
                 if pos.any():
-                    policy_loss = policy_loss - 0.5 * scaled_action_log_probs[pos].mean()
+                    pos_loss = scaled_action_log_probs[pos].sum()
 
                 if neg.any():
-                    policy_loss = policy_loss + 0.5 * scaled_action_log_probs[neg].mean()
+                    neg_loss = scaled_action_log_probs[neg].sum()
 
-                policy_loss = policy_loss + kl_div * self.kl_div_loss_weight - self.beta_s * entropy
+                policy_loss = policy_loss - 0.5 * (pos_loss - neg_loss) / max(1, len(advantages))
+
+                policy_loss = policy_loss + kl_div * self.kl_div_loss_weight - self.beta_s * entropy.mean()
 
                 update_network_(policy_loss, self.opt_actor)
 
@@ -529,7 +550,7 @@ def main(
     actor_hidden_dim = 64,
     critic_hidden_dim = 256,
     critic_pred_num_bins = 250,
-    reward_range = (-100., 100.),
+    reward_range = (-400., 400.),
     minibatch_size = 64,
     lr = 0.0004,
     betas = (0.9, 0.99),
@@ -549,11 +570,13 @@ def main(
     save_every = 1000,
     clear_videos = True,
     video_folder = './lunar-recording',
-    load = False
+    load = False,
+    live = False
 ):
-    env = gym.make(env_name, render_mode = 'rgb_array')
+    render_mode = 'human' if live else 'rgb_array'
+    env = gym.make(env_name, render_mode = render_mode)
 
-    if render:
+    if render and not live:
         if clear_videos:
             rmtree(video_folder, ignore_errors = True)
 
@@ -569,6 +592,7 @@ def main(
     num_actions = env.action_space.n
 
     memories = deque([])
+    episode_rewards = deque(maxlen=100)
 
     agent = PPO(
         state_dim,
@@ -601,10 +625,13 @@ def main(
     time = 0
     num_policy_updates = 0
 
-    for eps in tqdm(range(num_episodes), desc = 'episodes'):
+    pbar = tqdm(range(num_episodes), desc = 'episodes')
+    for eps in pbar:
 
         state, _ = env.reset(seed = seed)
         state = torch.from_numpy(state).to(device)
+
+        curr_cumulative_reward = 0.
 
         for timestep in range(max_timesteps):
             time += 1
@@ -622,6 +649,7 @@ def main(
             next_state = torch.from_numpy(next_state).to(device)
 
             reward = float(reward)
+            curr_cumulative_reward += reward
 
             memory = Memory(True, state, action, action_log_prob, reward, terminated, value, action_probs)
 
@@ -631,6 +659,9 @@ def main(
 
             # determine if truncating, either from environment or learning phase of the agent
 
+            if timestep == max_timesteps - 1:
+                truncated = True
+
             updating_agent = divisible_by(time, update_timesteps)
             done = terminated or truncated or updating_agent
 
@@ -638,15 +669,13 @@ def main(
 
             if done and not terminated:
                 next_value = agent.ema_critic.forward_eval(state)
+                scalar_next_value = agent.critic_hl_gauss_loss(next_value.unsqueeze(0)).item()
 
-                bootstrap_value_memory = memory._replace(
-                    state = state,
-                    learnable = False,
-                    is_boundary = True,
-                    value = next_value
-                )
-
-                memories.append(bootstrap_value_memory)
+                last_mem = memories.pop()
+                memories.append(last_mem._replace(
+                    reward = last_mem.reward + gamma * scalar_next_value,
+                    is_boundary = True
+                ))
 
             # updating of the agent
 
@@ -659,6 +688,9 @@ def main(
 
             if done:
                 break
+
+        episode_rewards.append(curr_cumulative_reward)
+        pbar.set_postfix(reward=f"{sum(episode_rewards) / len(episode_rewards):.2f}")
 
         if divisible_by(eps, save_every):
             agent.save()

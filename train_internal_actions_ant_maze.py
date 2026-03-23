@@ -350,10 +350,9 @@ class SimBa(Module):
                 out, one_logits_and_actions = layer(x, layer_actions, is_sampled)
 
                 if exists(is_sampled):
-                    mask = is_sampled.float()
-                    while mask.ndim < out.ndim:
-                        mask = mask.unsqueeze(-1)
-                    out = out * mask + out.detach() * (1. - mask)
+                    # we no longer detach out on off-steps so the inner network's values projection
+                    # can learn to seamlessly translate the coasting latent actions continuously
+                    pass
 
                 logits_and_actions.append(one_logits_and_actions)
             else:
@@ -791,6 +790,15 @@ class PPO(Module):
                 old_internal_dist = Categorical(logits = old_internal_action_logits)
                 old_internal_log_probs = old_internal_dist.log_prob(internal_actions)
 
+                # mask out off-step log probs to prevent NaN ratios from old logits
+                sampled_mask_bool = is_internal_action_sampled
+                while sampled_mask_bool.ndim < internal_log_probs.ndim:
+                    sampled_mask_bool = sampled_mask_bool.unsqueeze(-1)
+
+                internal_log_probs = where(sampled_mask_bool, internal_log_probs, zeros_like(internal_log_probs))
+                old_internal_log_probs = where(sampled_mask_bool, old_internal_log_probs, zeros_like(old_internal_log_probs))
+                internal_entropy = where(sampled_mask_bool, internal_entropy, zeros_like(internal_entropy))
+
                 action_log_probs, _ = pack([action_log_probs, internal_log_probs], 'b *')
                 old_log_probs, _ = pack([old_log_probs, old_internal_log_probs], 'b *')
                 entropy, _ = pack([entropy, internal_entropy], 'b * ')
@@ -1211,7 +1219,7 @@ def main(
     epochs = 2,
     num_internal_actions = 4,
     internal_action_dim = 3,
-    num_time_embeds = 1,
+    num_time_embeds = 2,
     seed = None,
     render = True,
     save_every = 1000,

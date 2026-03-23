@@ -1,3 +1,22 @@
+# /// script
+# dependencies = [
+#   "adam-atan2-pytorch",
+#   "assoc-scan",
+#   "einops",
+#   "ema-pytorch",
+#   "fire",
+#   "gymnasium[box2d,other]",
+#   "hl-gauss-pytorch>=0.1.7",
+#   "numpy",
+#   "torch",
+#   "torchaudio",
+#   "torchvision",
+#   "tqdm",
+#   "hyper-connections",
+#   "memmap-replay-buffer"
+# ]
+# ///
+
 from __future__ import annotations
 
 import fire
@@ -94,12 +113,13 @@ class RSMNorm(Module):
         # update running mean and variance
 
         with torch.no_grad():
+            x_flat = rearrange(x, '... d -> (...) d')
+            batch_mean = x_flat.mean(dim = 0)
+            batch_var = x_flat.var(dim = 0, unbiased = False)
 
-            new_obs_mean = reduce(x, '... d -> d', 'mean')
-            delta = new_obs_mean - mean
-
-            new_mean = mean + delta / time
-            new_variance = (time - 1) / time * (variance + (delta ** 2) / time)
+            momentum = 0.1
+            new_mean = (1 - momentum) * mean + momentum * batch_mean
+            new_variance = (1 - momentum) * variance + momentum * batch_var
 
             self.step.add_(1)
             self.running_mean.copy_(new_mean)
@@ -338,6 +358,7 @@ class PPO(Module):
         ema_decay,
         use_spo = False,
         asymmetric_spo = False,
+        use_delight_gating = False,
         next_state_value_weight = 0.,
         main_policy_loss_weight = 1.,
         actor_mlp_depth = 2,
@@ -412,6 +433,7 @@ class PPO(Module):
 
         self.use_spo = use_spo
         self.asymmetric_spo = asymmetric_spo # https://arxiv.org/abs/2510.06062v1
+        self.use_delight_gating = use_delight_gating
 
         self.save_path = Path(save_path)
 
@@ -496,16 +518,22 @@ class PPO(Module):
 
                 advantages = normalize(returns - scalar_old_values.detach())
 
+                maybe_gated_advantages = advantages
+
+                if self.use_delight_gating:
+                    delight_gate = (-action_log_probs * advantages).sigmoid().detach()
+                    maybe_gated_advantages = advantages * delight_gate
+
                 if self.use_spo or self.asymmetric_spo:
                     # Xie et al. https://arxiv.org/abs/2401.16025v9 line 14 of Algorithm 1
                     spo_policy_loss = -(
-                        ratios * advantages -
-                        (advantages.abs() * (ratios - 1.).square()) / (2 * self.eps_clip)
+                        ratios * maybe_gated_advantages -
+                        (maybe_gated_advantages.abs() * (ratios - 1.).square()) / (2 * self.eps_clip)
                     )
 
                 if not self.use_spo or self.asymmetric_spo:
-                    surr1 = ratios * advantages
-                    surr2 = ratios.clamp(1 - self.eps_clip, 1 + self.eps_clip) * advantages
+                    surr1 = ratios * maybe_gated_advantages
+                    surr2 = ratios.clamp(1 - self.eps_clip, 1 + self.eps_clip) * maybe_gated_advantages
                     ppo_policy_loss = - torch.min(surr1, surr2)
 
                 if self.asymmetric_spo:
@@ -586,7 +614,7 @@ def main(
     update_timesteps = 5000,
     buffer_episodes = 40,
     critic_pred_num_bins = 250,
-    reward_range = (-100., 100.),
+    reward_range = (-400., 400.),
     minibatch_size = 64,
     lr = 0.0008,
     betas = (0.9, 0.99),
@@ -600,6 +628,7 @@ def main(
     main_policy_loss_weight = 1.,
     use_spo = False,
     asymmetric_spo = False,
+    use_delight_gating = False,
     cautious_factor = 0.1,
     ema_decay = 0.9,
     epochs = 2,
@@ -670,6 +699,7 @@ def main(
         ema_decay,
         use_spo = use_spo,
         asymmetric_spo = asymmetric_spo,
+        use_delight_gating = use_delight_gating,
         next_state_value_weight = next_state_value_weight,
         main_policy_loss_weight = main_policy_loss_weight,
         actor_mlp_depth = actor_mlp_depth,
@@ -719,7 +749,21 @@ def main(
 
                 next_state = torch.from_numpy(next_state).to(device)
 
+                past_action = F.one_hot(action, num_classes = num_actions)
+
+                if timestep == max_timesteps - 1:
+                    truncated = True
+
                 reward = float(reward)
+                
+                updating_agent = divisible_by(time, update_timesteps)
+                done = terminated or truncated or updating_agent
+
+                if done and not terminated:
+                    next_value = agent.ema_critic.forward_eval(state, past_action)
+                    scalar_next_value = agent.critic_hl_gauss_loss(next_value).item()
+                    reward += agent.gamma * scalar_next_value
+
                 episode_reward += reward
 
                 has_next_state = not terminated
@@ -732,35 +776,13 @@ def main(
                     action = action,
                     action_log_prob = action_log_prob,
                     reward = reward,
-                    is_boundary = terminated,
+                    is_boundary = done,
                     value = value,
                     past_action = past_action
                 )
 
                 state = next_state
                 past_action = F.one_hot(action, num_classes = num_actions)
-
-                # determine if truncating, either from environment or learning phase of the agent
-
-                updating_agent = divisible_by(time, update_timesteps)
-                done = terminated or truncated or updating_agent
-
-                # take care of truncated by adding a non-learnable memory storing the next value for GAE
-
-                if done and not terminated:
-                    next_value = agent.ema_critic.forward_eval(state, past_action)
-
-                    bootstrap_value_memory = memory._replace(
-                        state = state,
-                        next_state = state,
-                        has_next_state = False,
-                        learnable = False,
-                        is_boundary = True,
-                        value = next_value,
-                        past_action = past_action
-                    )
-
-                    memories.store(**bootstrap_value_memory._asdict())
 
                 # updating of the agent
 
