@@ -1185,7 +1185,7 @@ def collect_vectorized_rollouts(
 def main(
     num_envs = 8,
     env_name = 'AntMaze_UMaze-v5',
-    phase_schedule = "1000both (500inner 500outer)*250",
+    phase_schedule = "1000both (500inner 500outer)*199",
     max_timesteps = 700,
     actor_hidden_dim = 64,
     critic_hidden_dim = 256,
@@ -1211,7 +1211,7 @@ def main(
     epochs = 2,
     num_internal_actions = 4,
     internal_action_dim = 3,
-    num_time_embeds = 4,
+    num_time_embeds = 1,
     seed = None,
     render = True,
     save_every = 1000,
