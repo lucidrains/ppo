@@ -165,3 +165,14 @@ $ python train.py
 }
 ```
 
+```bibtex
+@misc{eysenbach2018diversityneedlearningskills,
+    title   = {Diversity is All You Need: Learning Skills without a Reward Function}, 
+    author  = {Benjamin Eysenbach and Abhishek Gupta and Julian Ibarz and Sergey Levine},
+    year    = {2018},
+    eprint  = {1802.06070},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.AI},
+    url     = {https://arxiv.org/abs/1802.06070}, 
+}
+```
