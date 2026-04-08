@@ -630,7 +630,7 @@ class PPO(Module):
                     states_with_rewards_pred,
                     states_with_rewards
                 )
-                world_model_loss = world_model_loss[mask[:, :-1]].mean()
+                world_model_loss = world_model_loss[mask[:, 1:]].mean()
 
                 # done loss
 

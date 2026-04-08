@@ -579,7 +579,7 @@ class PPO(Module):
                     states_with_rewards
                 )
 
-                world_model_loss = world_model_loss[mask[:, :-1]]
+                world_model_loss = world_model_loss[mask[:, 1:]]
 
                 # predicting termination head
 
@@ -702,9 +702,13 @@ def main(
     agent.eval()
     model = agent.ema_model
 
-    for eps in tqdm(range(num_episodes), desc = 'episodes'):
+    pbar = tqdm(range(num_episodes), desc = 'episodes')
+    recent_rewards = deque(maxlen = 20)
+
+    for eps in pbar:
 
         one_episode_memories = deque([])
+        eps_reward = 0.
 
         eps_tensor = tensor(eps)
 
@@ -756,6 +760,7 @@ def main(
             next_state = torch.from_numpy(next_state).to(device)
 
             reward = float(reward)
+            eps_reward += reward
 
             prev_action = action
             prev_reward = tensor(reward).to(device) # from the xval paper, we know pre-norm transformers can handle scaled tokens https://arxiv.org/abs/2310.02989
@@ -783,7 +788,7 @@ def main(
                     value = next_value
                 )
 
-                memories.append(bootstrap_value_memory)
+                one_episode_memories.append(bootstrap_value_memory)
 
             # break if done
 
@@ -791,6 +796,9 @@ def main(
                 break
 
         episode_lens.append(timestep + 1)
+        recent_rewards.append(eps_reward)
+        avg_reward = sum(recent_rewards) / len(recent_rewards)
+        pbar.set_postfix(avg_reward=f'{avg_reward:.2f}')
 
         # add list[Memory] to all episode memories list[list[Memory]]
 
