@@ -755,7 +755,7 @@ def main(
                     truncated = True
 
                 reward = float(reward)
-                
+
                 updating_agent = divisible_by(time, update_timesteps)
                 done = terminated or truncated or updating_agent
 

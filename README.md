@@ -167,12 +167,24 @@ $ python train.py
 
 ```bibtex
 @misc{eysenbach2018diversityneedlearningskills,
-    title   = {Diversity is All You Need: Learning Skills without a Reward Function}, 
+    title   = {Diversity is All You Need: Learning Skills without a Reward Function},
     author  = {Benjamin Eysenbach and Abhishek Gupta and Julian Ibarz and Sergey Levine},
     year    = {2018},
     eprint  = {1802.06070},
     archivePrefix = {arXiv},
     primaryClass = {cs.AI},
-    url     = {https://arxiv.org/abs/1802.06070}, 
+    url     = {https://arxiv.org/abs/1802.06070},
+}
+```
+
+```bibtex
+@misc{mustafaoglu2025evolutionarypolicyoptimization,
+    title   = {Evolutionary Policy Optimization},
+    author  = {Zelal Su "Lain" Mustafaoglu and Keshav Pingali and Risto Miikkulainen},
+    year    = {2025},
+    eprint  = {2504.12568},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2504.12568},
 }
 ```
