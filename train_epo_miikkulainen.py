@@ -289,6 +289,7 @@ def main(
     population_size = 8,
     elite_count = 3,
     mutation_prob = 0.3,
+    frac_tournament = 0.25,
     record_every = 2,
     total_generations = 50,
     pretrain_steps = 25000,
@@ -317,6 +318,7 @@ def main(
         population_size = population_size,
         elite_count = elite_count,
         mutation_prob = mutation_prob,
+        frac_tournament = frac_tournament,
         record_every = record_every,
         total_generations = total_generations,
         pretrain_steps = pretrain_steps,
@@ -392,8 +394,14 @@ def main(
             clone.set_weights(elite_agent.get_weights())
             next_population.append(clone)
 
+        num_tournament_contenders = max(2, int(config['elite_count'] * config['frac_tournament']))
+        num_tournament_contenders = min(config['elite_count'], num_tournament_contenders)
+
         while len(next_population) < config['population_size']:
-            parent1, parent2 = random.sample(elites, 2)
+            # deterministic tournament selection - let top 2 winners become parents
+            contenders = random.sample(elites, num_tournament_contenders)
+            contenders.sort(key = lambda x: x[0], reverse = True)
+            parent1, parent2 = contenders[:2]
 
             fitness1, agent1 = parent1
             fitness2, agent2 = parent2
