@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # /// script
 # dependencies = [
 #   "torch",
@@ -19,8 +21,8 @@ import os
 import shutil
 import random
 import glob
+import math
 from copy import deepcopy
-from collections import deque
 
 from tqdm import tqdm
 import wandb
@@ -29,9 +31,8 @@ import fire
 import numpy as np
 
 import torch
-import torch.nn.functional as F
-from torch import nn, tensor, stack
-from torch.nn import Module, Sequential, Linear, Tanh, Softmax, MSELoss
+from torch import tensor, stack
+from torch.nn import Module, Sequential, Softmax, MSELoss
 from torch.optim import Adam
 from torch.distributions import Categorical
 
@@ -40,7 +41,6 @@ import gymnasium as gym
 from einops.layers.torch import Rearrange
 from x_mlps_pytorch import MLP
 from moviepy import VideoFileClip, clips_array, ColorClip
-import math
 
 # helpers
 
@@ -49,6 +49,17 @@ def exists(val):
 
 def default(v, d):
     return v if exists(v) else d
+
+def maybe(fn):
+    return lambda v: fn(v) if exists(v) else v
+
+def module_device(module):
+    if isinstance(module, torch.Tensor):
+        return module.device
+    return next(module.parameters()).device
+
+def divisible_by(num, den):
+    return (num % den) == 0
 
 def update_network_(loss, optimizer):
     optimizer.zero_grad()
@@ -117,6 +128,7 @@ class PPOAgent(Module):
         self.clear_buffer()
 
     def select_action(self, state):
+        device = module_device(self)
         state = tensor(state, dtype = torch.float32, device = device)
 
         with torch.no_grad():
@@ -130,6 +142,8 @@ class PPOAgent(Module):
         return action
 
     def update(self):
+        device = module_device(self)
+
         rewards = []
         discounted_reward = 0
 
@@ -207,7 +221,7 @@ def train_agent_for_steps(agent, config, total_timesteps, show_pbar = False):
         state = next_state
         done = terminated or truncated
 
-        if (time % config['ppo_update_steps']) == 0:
+        if divisible_by(time, config['ppo_update_steps']):
             agent.update()
 
         if done:
@@ -260,7 +274,15 @@ def crossover(weights1, weights2, fitness1, fitness2, min_fitness, eps = 1e-5):
 
     for key, weight1 in weights1.items():
         if weight1.is_floating_point():
-            child_weights[key] = alpha * weight1 + (1 - alpha) * weights2[key]
+            if weight1.ndim >= 2:
+                dim = random.choice([0, 1])
+                shape = [1] * weight1.ndim
+                shape[dim] = weight1.shape[dim]
+                mask = torch.rand(shape, device = weight1.device) < alpha
+            else:
+                mask = torch.rand_like(weight1) < alpha
+
+            child_weights[key] = torch.where(mask, weight1, weights2[key])
         else:
             child_weights[key] = weight1
 
@@ -282,14 +304,120 @@ def mutate(weights, fitness1, fitness2, scaled_fitness1, scaled_fitness2, eps = 
 
     return mutated_weights
 
+# migrate - ring topology, shift non-elite individuals to adjacent island
+
+def migrate_islands_(islands, elite_count, num_migrants):
+    num_islands = len(islands)
+    migrants_per_island = []
+
+    for island in islands:
+        non_elites = island[elite_count:]
+        random.shuffle(non_elites)
+
+        migrants = non_elites[:num_migrants]
+        island[elite_count:] = non_elites[num_migrants:]
+
+        migrants_per_island.append(migrants)
+
+    # ring shift - island i receives migrants from island i-1
+
+    for i in range(num_islands):
+        source_idx = (i - 1) % num_islands
+        islands[i].extend(migrants_per_island[source_idx])
+
+# record and stitch videos
+
+def record_island_videos(island_fitnesses, config, generation):
+    num_islands = config['num_islands']
+    video_folder = config['video_folder']
+    video_files = []
+
+    for island_idx in range(num_islands):
+        best_agent = island_fitnesses[island_idx][0][1]
+
+        eval_env = gym.make(config['env_id'], render_mode = "rgb_array")
+        eval_env = gym.wrappers.RecordVideo(
+            env = eval_env,
+            video_folder = video_folder,
+            name_prefix = f"gen-{generation + 1}-island-{island_idx}",
+            disable_logger = True
+        )
+
+        state, _ = eval_env.reset()
+        done = False
+
+        while not done:
+            state_tensor = tensor(state, dtype = torch.float32, device = device)
+
+            with torch.no_grad():
+                action_probs = best_agent.policy.actor(state_tensor)
+                action = torch.argmax(action_probs).item()
+
+            state, _, terminated, truncated, _ = eval_env.step(action)
+            done = terminated or truncated
+
+        eval_env.close()
+
+        videos = glob.glob(os.path.join(video_folder, f"gen-{generation + 1}-island-{island_idx}*.mp4"))
+        if videos:
+            video_files.append(max(videos, key = os.path.getctime))
+
+    if not video_files:
+        return
+
+    try:
+        clips = [VideoFileClip(v).resize(0.5) for v in video_files]
+
+        n = len(clips)
+        cols = int(math.ceil(math.sqrt(n)))
+        rows = int(math.ceil(n / cols))
+
+        w, h = clips[0].size
+        duration = max(c.duration for c in clips)
+
+        if rows * cols > n:
+            blank_clip = ColorClip(size = (w, h), color = (0, 0, 0), duration = duration)
+            clips.extend([blank_clip] * (rows * cols - n))
+
+        grid = [clips[r * cols : (r + 1) * cols] for r in range(rows)]
+
+        final_clip = clips_array(grid)
+        stitched_path = os.path.join(video_folder, f"gen-{generation + 1}-stitched.mp4")
+        final_clip.write_videofile(stitched_path, logger = None)
+
+        for clip in clips:
+            clip.close()
+        final_clip.close()
+
+        wandb.log(dict(
+            generation = generation,
+            evaluation_video = wandb.Video(stitched_path, fps = 30, format = "mp4")
+        ))
+
+        for v in video_files:
+            try:
+                os.remove(v)
+            except:
+                pass
+
+    except Exception as e:
+        print(f"  failed to stitch videos: {e}")
+        wandb.log(dict(
+            generation = generation,
+            evaluation_videos = [wandb.Video(v, fps = 30, format = "mp4") for v in video_files]
+        ))
+
 # main
 
 def main(
     env_id = "LunarLander-v3",
-    population_size = 8,
+    num_islands = 2,
+    population_size = 16,
     elite_count = 3,
     mutation_prob = 0.3,
     frac_tournament = 0.25,
+    migrate_every = 5,
+    frac_migrate = 0.2,
     record_every = 2,
     total_generations = 50,
     pretrain_steps = 25000,
@@ -313,12 +441,18 @@ def main(
     action_dim = temp_env.action_space.n
     temp_env.close()
 
+    num_migrants = int(population_size * frac_migrate)
+
     config = dict(
         env_id = env_id,
+        num_islands = num_islands,
         population_size = population_size,
         elite_count = elite_count,
         mutation_prob = mutation_prob,
         frac_tournament = frac_tournament,
+        migrate_every = migrate_every,
+        frac_migrate = frac_migrate,
+        num_migrants = num_migrants,
         record_every = record_every,
         total_generations = total_generations,
         pretrain_steps = pretrain_steps,
@@ -344,168 +478,134 @@ def main(
 
     if os.path.exists(config['video_folder']):
         shutil.rmtree(config['video_folder'])
-    os.makedirs(config['video_folder'], exist_ok=True)
+    os.makedirs(config['video_folder'], exist_ok = True)
 
-    print("pre-training base model...")
+    # pre-train base model
+
     base_agent = PPOAgent(config).to(device)
     train_agent_for_steps(base_agent, config, config['pretrain_steps'], show_pbar = True)
 
-    print("initializing population...")
-    population = []
+    # initialize islands
+
     base_weights = base_agent.get_weights()
 
-    for _ in range(config['population_size']):
-        clone = PPOAgent(config).to(device)
-        clone.set_weights(base_weights)
-        population.append(clone)
+    islands = [
+        [PPOAgent(config).to(device) for _ in range(population_size)]
+        for _ in range(num_islands)
+    ]
 
-    for generation in range(config['total_generations']):
-        print(f"generation {generation + 1}/{config['total_generations']}")
+    for island in islands:
+        for agent in island:
+            agent.set_weights(base_weights)
 
-        fitnesses = []
+    num_tournament_contenders = max(2, int(elite_count * frac_tournament))
+    num_tournament_contenders = min(elite_count, num_tournament_contenders)
 
-        for agent in population:
-            fitness = evaluate_agent(agent, config)
-            fitnesses.append((fitness, agent))
+    # evolution loop
 
-        fitnesses.sort(key = lambda x: x[0], reverse = True)
+    for generation in tqdm(range(total_generations), desc = "evolution"):
+        island_fitnesses = []
+        next_islands = []
 
-        raw_fitness_vals = [fitness for fitness, _ in fitnesses]
-        min_fitness = min(raw_fitness_vals)
+        all_best = []
+        all_mean = []
+        pbar_postfix = {}
 
-        elites = fitnesses[:config['elite_count']]
-        elite_agents = [agent for _, agent in elites]
-        best_fitness = elites[0][0]
-        mean_fitness = np.mean(raw_fitness_vals)
+        for island_idx, population in enumerate(islands):
 
-        print(f"  best reward: {best_fitness:.2f}")
-        print(f"  mean reward: {mean_fitness:.2f}")
+            # evaluate fitness
 
-        wandb.log({
-            "generation": generation,
-            "max_reward": best_fitness,
-            "mean_reward": mean_fitness
-        })
+            fitnesses = []
 
-        next_population = []
+            for agent in population:
+                fitness = evaluate_agent(agent, config)
+                fitnesses.append((fitness, agent))
 
-        for elite_agent in elite_agents:
-            clone = PPOAgent(config).to(device)
-            clone.set_weights(elite_agent.get_weights())
-            next_population.append(clone)
+            fitnesses.sort(key = lambda x: x[0], reverse = True)
+            island_fitnesses.append(fitnesses)
 
-        num_tournament_contenders = max(2, int(config['elite_count'] * config['frac_tournament']))
-        num_tournament_contenders = min(config['elite_count'], num_tournament_contenders)
+            raw_fitness_vals = [f for f, _ in fitnesses]
+            min_fitness = min(raw_fitness_vals)
+            best_fitness = raw_fitness_vals[0]
+            mean_fitness = np.mean(raw_fitness_vals)
 
-        while len(next_population) < config['population_size']:
-            # deterministic tournament selection - let top 2 winners become parents
-            contenders = random.sample(elites, num_tournament_contenders)
-            contenders.sort(key = lambda x: x[0], reverse = True)
-            parent1, parent2 = contenders[:2]
+            all_best.append(best_fitness)
+            all_mean.append(mean_fitness)
+            pbar_postfix[f"i{island_idx + 1}"] = f"{best_fitness:.1f}"
 
-            fitness1, agent1 = parent1
-            fitness2, agent2 = parent2
+            # elites survive directly
 
-            weights1 = agent1.get_weights()
-            weights2 = agent2.get_weights()
+            elites = fitnesses[:elite_count]
 
-            child_weights, scaled_fitness1, scaled_fitness2 = crossover(
-                weights1, weights2, fitness1, fitness2, min_fitness
-            )
+            next_population = []
 
-            child = PPOAgent(config).to(device)
+            for _, elite_agent in elites:
+                clone = PPOAgent(config).to(device)
+                clone.set_weights(elite_agent.get_weights())
+                next_population.append(clone)
 
-            if random.random() < config['mutation_prob']:
-                mutated_weights = mutate(
-                    child_weights, fitness1, fitness2, scaled_fitness1, scaled_fitness2
-                )
-                child.set_weights(mutated_weights)
-            else:
-                child.set_weights(child_weights)
-                train_agent_for_steps(child, config, config['finetune_steps'])
+            # fill rest of population with tournament-selected crossover children
 
-            next_population.append(child)
+            while len(next_population) < population_size:
+                if elite_count >= 2:
+                    contenders1 = random.sample(elites, num_tournament_contenders)
+                    parent1 = max(contenders1, key = lambda x: x[0])
 
-        population = next_population
+                    contenders2 = random.sample(elites, num_tournament_contenders)
+                    parent2 = max(contenders2, key = lambda x: x[0])
+                else:
+                    parent1 = parent2 = elites[0]
 
-        if (generation + 1) % config['record_every'] == 0:
-            print(f"  recording videos for generation {generation + 1}...")
-            video_files_logged = []
+                fitness1, agent1 = parent1
+                fitness2, agent2 = parent2
 
-            sorted_agents = [agent for _, agent in fitnesses]
-
-            for agent_idx, agent in enumerate(sorted_agents):
-                eval_env = gym.make(config['env_id'], render_mode = "rgb_array")
-                eval_env = gym.wrappers.RecordVideo(
-                    env = eval_env,
-                    video_folder = config['video_folder'],
-                    name_prefix = f"gen-{generation + 1}-agent-{agent_idx}",
-                    disable_logger = True
+                child_weights, scaled_fitness1, scaled_fitness2 = crossover(
+                    agent1.get_weights(), agent2.get_weights(),
+                    fitness1, fitness2, min_fitness
                 )
 
-                state, _ = eval_env.reset()
-                done = False
+                child = PPOAgent(config).to(device)
 
-                while not done:
-                    state_tensor = tensor(state, dtype = torch.float32, device = device)
-
-                    with torch.no_grad():
-                        action_probs = agent.policy.actor(state_tensor)
-                        action = torch.argmax(action_probs).item()
-
-                    state, _, terminated, truncated, _ = eval_env.step(action)
-                    done = terminated or truncated
-
-                eval_env.close()
-
-                videos = glob.glob(os.path.join(config['video_folder'], f"gen-{generation + 1}-agent-{agent_idx}*.mp4"))
-                if videos:
-                    video_files_logged.append(max(videos, key=os.path.getctime))
-
-            # Stitch and log videos to wandb
-            if video_files_logged:
-                try:
-                    clips = [VideoFileClip(v).resized(0.5) for v in video_files_logged]
-
-                    n = len(clips)
-                    cols = int(math.ceil(math.sqrt(n)))
-                    rows = int(math.ceil(n / cols))
-
-                    w, h = clips[0].size
-                    duration = max([c.duration for c in clips])
-
-                    if rows * cols > n:
-                        blank_clip = ColorClip(size=(w, h), color=(0,0,0), duration=duration)
-                        clips.extend([blank_clip] * (rows * cols - n))
-
-                    grid = []
-                    for r in range(rows):
-                        grid.append(clips[r * cols : (r + 1) * cols])
-
-                    final_clip = clips_array(grid)
-                    stitched_path = os.path.join(config['video_folder'], f"gen-{generation + 1}-stitched.mp4")
-                    final_clip.write_videofile(stitched_path, logger=None)
-
-                    for clip in clips:
-                        clip.close()
-                    final_clip.close()
-
-                    wandb.log(dict(
-                        generation = generation,
-                        evaluation_video = wandb.Video(stitched_path, fps=30, format="mp4")
+                if random.random() < mutation_prob:
+                    child.set_weights(mutate(
+                        child_weights, fitness1, fitness2,
+                        scaled_fitness1, scaled_fitness2
                     ))
+                else:
+                    child.set_weights(child_weights)
+                    train_agent_for_steps(child, config, finetune_steps)
 
-                    for v in video_files_logged:
-                        try:
-                            os.remove(v)
-                        except:
-                            pass
-                except Exception as e:
-                    print(f"  failed to stitch videos: {e}")
-                    wandb.log(dict(
-                        generation = generation,
-                        evaluation_videos = [wandb.Video(v, fps=30, format="mp4") for v in video_files_logged]
-                    ))
+                next_population.append(child)
+
+            next_islands.append(next_population)
+
+        islands = next_islands
+
+        # logging
+
+        tqdm.write(f"gen {generation + 1} | best: {max(all_best):.1f} | mean: {np.mean(all_mean):.1f} | " + " | ".join(f"i{i+1}: {b:.1f}" for i, b in enumerate(all_best)))
+
+        log_dict = dict(
+            generation = generation,
+            global_max_reward = max(all_best),
+            global_mean_reward = np.mean(all_mean),
+        )
+
+        for i in range(num_islands):
+            log_dict[f"island_{i}_max_reward"] = all_best[i]
+            log_dict[f"island_{i}_mean_reward"] = all_mean[i]
+
+        wandb.log(log_dict)
+
+        # periodic migration
+
+        if divisible_by(generation + 1, migrate_every) and num_migrants > 0:
+            migrate_islands_(islands, elite_count, num_migrants)
+
+        # periodic video recording
+
+        if divisible_by(generation + 1, record_every):
+            record_island_videos(island_fitnesses, config, generation)
 
     print("evolution complete.")
     wandb.finish()
