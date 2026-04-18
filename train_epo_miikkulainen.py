@@ -31,8 +31,9 @@ import fire
 import numpy as np
 
 import torch
+import torch.nn.functional as F
 from torch import tensor, stack
-from torch.nn import Module, Sequential, Softmax, MSELoss
+from torch.nn import Module, Sequential, Softmax
 from torch.optim import Adam
 from torch.distributions import Categorical
 
@@ -121,6 +122,7 @@ class PPOAgent(Module):
         super().__init__()
 
         self.config = config
+        self.entropy_coef = config.get('ppo_entropy_coef', 0.01)
 
         self.policy = ActorCritic(config['state_dim'], config['action_dim'])
         self.optimizer = Adam(self.policy.parameters(), lr = config['ppo_lr'])
@@ -172,10 +174,18 @@ class PPOAgent(Module):
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 1 - self.config['ppo_eps_clip'], 1 + self.config['ppo_eps_clip']) * advantages
 
-            policy_loss = -torch.min(surr1, surr2).mean()
+            policy_loss = -torch.min(surr1, surr2)
 
-            value_loss = 0.5 * MSELoss()(state_values, rewards)
-            entropy_bonus = -0.01 * dist_entropy.mean()
+            if self.config['use_delightful_gating']:
+                surprisal = -logprobs.detach()
+                delight = advantages * surprisal
+                gate = torch.sigmoid(delight / self.config['delight_temp'])
+                policy_loss = policy_loss * gate
+
+            policy_loss = policy_loss.mean()
+
+            value_loss = 0.5 * F.mse_loss(state_values, rewards)
+            entropy_bonus = -self.entropy_coef * dist_entropy.mean()
 
             loss = policy_loss + value_loss + entropy_bonus
 
@@ -428,7 +438,10 @@ def main(
     ppo_eps_clip = 0.2,
     ppo_k_epochs = 4,
     ppo_update_steps = 2000,
-    video_folder = "./lunar-recording"
+    video_folder = "./lunar-recording",
+    use_delightful_gating = False,
+    delight_temp = 1.0,
+    ppo_entropy_coef = 0.01
 ):
     try:
         gym.make(env_id)
@@ -463,6 +476,9 @@ def main(
         ppo_eps_clip = ppo_eps_clip,
         ppo_k_epochs = ppo_k_epochs,
         ppo_update_steps = ppo_update_steps,
+        use_delightful_gating = use_delightful_gating,
+        delight_temp = delight_temp,
+        ppo_entropy_coef = ppo_entropy_coef,
         video_folder = video_folder,
         state_dim = state_dim,
         action_dim = action_dim
