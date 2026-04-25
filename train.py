@@ -68,6 +68,36 @@ def update_network_(loss, optimizer):
     loss.mean().backward()
     optimizer.step()
 
+# Simplicial Embeddings
+# Lavoie et al - https://arxiv.org/abs/2204.00616
+# Obando-Ceron et al - https://openreview.net/forum?id=mCpq1GCKxA
+
+class SEM(Module):
+    def __init__(
+        self,
+        dim,
+        temperature = 0.1,
+        dim_simplex = 8,
+        pre_layernorm = False
+    ):
+        super().__init__()
+        assert divisible_by(dim, dim_simplex), f'{dim} must be divisible by {dim_simplex}'
+
+        self.dim = dim
+        self.dim_simplex = dim_simplex
+        self.temperature = temperature
+
+        self.norm = nn.LayerNorm(dim, bias = False) if pre_layernorm else nn.Identity()
+
+    def forward(
+        self,
+        t
+    ):
+        t = self.norm(t)
+        t = rearrange(t, '... (l v) -> ... l v', v = self.dim_simplex)
+        t = (t / self.temperature).softmax(dim = -1)
+        return rearrange(t, '... l v -> ... (l v)')
+
 # RSM Norm (not to be confused with RMSNorm from transformers)
 # this was proposed by SimBa https://arxiv.org/abs/2410.09754
 # experiments show this to outperform other types of normalization
@@ -133,7 +163,9 @@ class SimBa(Module):
         depth = 3,
         dropout = 0.,
         expansion_factor = 2,
-        num_residual_streams = 4
+        num_residual_streams = 4,
+        simplicial_embed = True,
+        dim_simplex = 4
     ):
         super().__init__()
         """
@@ -173,6 +205,8 @@ class SimBa(Module):
 
         self.final_norm = nn.RMSNorm(dim_hidden)
 
+        self.simplicial_embed = SEM(dim_hidden, dim_simplex) if simplicial_embed else nn.Identity()
+
     def forward(self, x):
         no_batch = x.ndim == 1
 
@@ -193,7 +227,7 @@ class SimBa(Module):
         if no_batch:
             out = rearrange(out, '1 ... -> ...')
 
-        return out
+        return self.simplicial_embed(out)
 
 # networks
 
@@ -252,7 +286,11 @@ class Critic(Module):
             dropout = dropout
         )
 
-        self.value_head = nn.Linear(hidden_dim, dim_pred)
+        self.value_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_dim * 2, dim_pred)
+        )
 
     def forward(self, x):
 
@@ -666,7 +704,9 @@ def main(
     save_every = 1000,
     clear_videos = True,
     video_folder = './lunar-recording',
-    load = False
+    rolling_window = 20,
+    log_every = 5,
+    load = False,
 ):
     env = gym.make(env_name, render_mode = 'rgb_array')
 
@@ -723,11 +763,16 @@ def main(
 
     time = 0
     num_policy_updates = 0
+    last_cum_rewards = deque([], rolling_window)
 
-    for eps in tqdm(range(num_episodes), desc = 'episodes'):
+    pbar = tqdm(range(num_episodes), desc = 'episodes')
+
+    for eps in pbar:
 
         state, _ = env.reset(seed = seed)
         state = torch.from_numpy(state).to(device)
+
+        cum_rewards = 0.
 
         for timestep in range(max_timesteps):
             time += 1
@@ -753,6 +798,8 @@ def main(
             memories.append(memory)
 
             state = next_state
+
+            cum_rewards += reward
 
             # determine if truncating, either from environment or learning phase of the agent
 
@@ -788,8 +835,13 @@ def main(
             if done:
                 break
 
+        last_cum_rewards.append(cum_rewards)
+
         if divisible_by(eps, save_every):
             agent.save()
+
+        if divisible_by(eps, log_every):
+            pbar.set_postfix(rewards = np.mean(last_cum_rewards))
 
 if __name__ == '__main__':
     fire.Fire(main)

@@ -45,8 +45,6 @@ from adam_atan2_pytorch.adopt_atan2 import AdoptAtan2
 
 from hl_gauss_pytorch import HLGaussLoss
 
-from hyper_connections import ManifoldConstrainedHyperConnections
-
 from assoc_scan import AssocScan
 
 import gymnasium as gym
@@ -153,6 +151,39 @@ class ReluSquared(Module):
     def forward(self, x):
         return x.sign() * F.relu(x) ** 2
 
+class OrthogonalResidualUpdate(Module):
+    def __init__(
+        self,
+        double_precision = True
+    ):
+        super().__init__()
+        self.double_precision = double_precision
+
+    def forward(self, x, residual):
+        use_double, dtype = self.double_precision, residual.dtype
+
+        orig_residual = residual
+        if use_double:
+            residual, x = residual.double(), x.double()
+
+        unit = F.normalize(residual, dim = -1)
+        parallel = (x * unit).sum(dim = -1, keepdim = True) * unit
+        orthogonal = x - parallel
+
+        if use_double:
+            orthogonal = orthogonal.to(dtype)
+
+        return orig_residual + orthogonal
+
+class Residual(Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+        self.update = OrthogonalResidualUpdate()
+
+    def forward(self, x, **kwargs):
+        return self.update(self.fn(x, **kwargs), x)
+
 class SimBa(Module):
 
     def __init__(
@@ -179,10 +210,6 @@ class SimBa(Module):
 
         dim_inner = dim_hidden * expansion_factor
 
-        # hyper connections
-
-        init_hyper_conn, self.expand_stream, self.reduce_stream = ManifoldConstrainedHyperConnections.get_init_and_expand_reduce_stream_functions(1, num_fracs = num_residual_streams, sinkhorn_iters = 2)
-
         for ind in range(depth):
 
             layer = nn.Sequential(
@@ -193,7 +220,7 @@ class SimBa(Module):
                 nn.Dropout(dropout),
             )
 
-            layer = init_hyper_conn(dim = dim_hidden, layer_index = ind, branch = layer)
+            layer = Residual(layer)
             layers.append(layer)
 
         # final layer out
@@ -210,12 +237,8 @@ class SimBa(Module):
 
         x = self.proj_in(x)
 
-        x = self.expand_stream(x)
-
         for layer in self.layers:
             x = layer(x)
-
-        x = self.reduce_stream(x)
 
         out = self.final_norm(x)
 
