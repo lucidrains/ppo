@@ -74,6 +74,43 @@ def update_network_(loss, optimizer):
     loss.mean().backward()
     optimizer.step()
 
+# FIRE - Frobenius-Isometry Reinitialization
+# Han et al. https://arxiv.org/abs/2602.08040
+
+@torch.no_grad()
+def apply_fire(
+    module,
+    num_iters = 20,
+    coefs = (1.5, -0.5),
+    shrink_perturb = False,
+    shrink_perturb_factors = (0.5, 0.01)
+):
+    a, b = coefs
+
+    for p in module.parameters():
+        if p.ndim != 2:
+            continue
+
+        t = p.data
+        t_norm = t.norm()
+
+        if t_norm == 0.:
+            continue
+
+        t = t / t_norm
+
+        for _ in range(num_iters):
+            A = t.T @ t
+            t = a * t + b * (t @ A)
+
+        if shrink_perturb:
+            scale, noise_scale = shrink_perturb_factors
+            noise = torch.randn_like(t)
+
+            t = t.mul_(1. - scale).add_(noise * noise_scale)
+
+        p.data.copy_(t)
+
 # RSM Norm (not to be confused with RMSNorm from transformers)
 # this was proposed by SimBa https://arxiv.org/abs/2410.09754
 # experiments show this to outperform other types of normalization
@@ -661,7 +698,8 @@ def main(
     save_every = 1000,
     clear_videos = True,
     video_folder = './lunar-recording',
-    load = False
+    load = False,
+    fire_every = 0
 ):
     env = gym.make(env_name, render_mode = 'rgb_array')
 
@@ -748,6 +786,10 @@ def main(
 
     pbar = tqdm(range(num_episodes), desc = 'episodes')
     for eps in pbar:
+
+        if fire_every > 0 and eps > 0 and divisible_by(eps, fire_every):
+            apply_fire(agent.critic)
+            agent.ema_critic.copy_params_from_model_to_ema()
 
         episode_reward = 0.
 

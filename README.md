@@ -188,3 +188,15 @@ $ python train.py
     url     = {https://arxiv.org/abs/2504.12568},
 }
 ```
+
+```bibtex
+@misc{han2026firefrobeniusisometryreinitializationbalancing,
+    title   = {FIRE: Frobenius-Isometry Reinitialization for Balancing the Stability-Plasticity Tradeoff},
+    author  = {Isaac Han and Sangyeon Park and Seungwon Oh and Donghu Kim and Hojoon Lee and Kyung-Joong Kim},
+    year    = {2026},
+    eprint  = {2602.08040},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2602.08040},
+}
+```
