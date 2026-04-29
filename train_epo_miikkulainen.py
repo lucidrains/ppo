@@ -20,7 +20,6 @@ import shutil
 import random
 import glob
 from copy import deepcopy
-from collections import deque
 
 from tqdm import tqdm
 import wandb
@@ -31,7 +30,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import tensor, stack, nn
-from torch.nn import Module, Sequential, Softmax, Linear, Tanh, MSELoss
+from torch.nn import Module, Sequential, Softmax
 from torch.optim import Adam
 from torch.distributions import Categorical
 
@@ -58,6 +57,105 @@ def update_network_(loss, optimizer):
 # globals
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+
+# flat param helpers for CEM
+
+def get_flat_params(model):
+    return torch.cat([p.data.view(-1) for p in model.parameters()])
+
+def set_flat_params(model, flat_params):
+    offset = 0
+    for param in model.parameters():
+        numel = param.numel()
+        param.data.copy_(flat_params[offset:offset + numel].view(param.size()))
+        offset += numel
+
+# cross-entropy method for meta-evolution
+
+class CEM:
+    def __init__(
+        self,
+        init_params,
+        pop_size,
+        num_elite,
+        tau = 0.5,
+        sigma_init = 0.05,
+        sigma_end = 0.001
+    ):
+        self.mu = init_params.clone()
+        self.pop_size = pop_size
+        self.num_elite = num_elite
+        self.tau = tau
+        self.sigma_init = sigma_init
+        self.sigma_end = sigma_end
+        self.epsilon = torch.ones_like(self.mu) * sigma_init
+        self.sigma = self.epsilon.sqrt()
+
+    def sample(self):
+        noise = torch.randn(self.pop_size, *self.mu.shape, device = self.mu.device)
+        return [self.mu + self.sigma * noise[i] for i in range(self.pop_size)]
+
+    def update(self, samples, fitnesses):
+        elite_indices = np.argsort(fitnesses)[::-1][:self.num_elite]
+        elite_samples = torch.stack([samples[i] for i in elite_indices])
+
+        self.mu = elite_samples.mean(dim = 0)
+        self.epsilon = self.tau * self.epsilon + (1 - self.tau) * self.sigma_end
+        self.sigma = (elite_samples.var(dim = 0, unbiased = False) + self.epsilon).sqrt()
+
+# meta temperature - single parameter evolved by CEM to predict delightful gate temperature
+
+class MetaTemperature(Module):
+    def __init__(self, min_bound = -3., max_bound = 3.):
+        super().__init__()
+        self.min_bound = min_bound
+        self.max_bound = max_bound
+        self.param = nn.Parameter(torch.zeros(1))
+
+    def forward(self):
+        return (self.param.sigmoid() * (self.max_bound - self.min_bound) + self.min_bound).exp()
+
+# meta state tracker
+
+class MetaState:
+    def __init__(self, cem, pop_size):
+        self.cem = cem
+        self.pop_size = pop_size
+        self.resample()
+
+    def resample(self):
+        self.sampled_params = self.cem.sample()
+        self.meta_temps = []
+
+        for params in self.sampled_params:
+            temp_module = MetaTemperature().to(device)
+            set_flat_params(temp_module, params)
+            self.meta_temps.append(temp_module)
+
+        self.fitnesses = [0.] * self.pop_size
+        self.usage_counts = [0] * self.pop_size
+        self.current_idx = 0
+
+    @property
+    def current_meta_temp(self):
+        return self.meta_temps[self.current_idx]
+
+    def record_fitness(self, fitness):
+        self.fitnesses[self.current_idx] += fitness
+        self.usage_counts[self.current_idx] += 1
+        self.current_idx += 1
+
+        if self.current_idx < self.pop_size:
+            return
+
+        # all meta-mlps evaluated, update CEM and resample
+
+        avg_fitnesses = [
+            f / max(1, c) for f, c in zip(self.fitnesses, self.usage_counts)
+        ]
+
+        self.cem.update(self.sampled_params, avg_fitnesses)
+        self.resample()
 
 # networks
 
@@ -130,7 +228,7 @@ class PPOAgent(Module):
 
         return action
 
-    def update(self):
+    def update(self, meta_temp = None):
         rewards = []
         discounted_reward = 0
 
@@ -164,7 +262,14 @@ class PPOAgent(Module):
             if self.config['use_delightful_gating']:
                 surprisal = -logprobs.detach()
                 delight = advantages * surprisal
-                gate = torch.sigmoid(delight / self.config['delight_temp'])
+
+                if exists(meta_temp):
+                    with torch.no_grad():
+                        temp = meta_temp()
+                else:
+                    temp = self.config['delight_temp']
+
+                gate = torch.sigmoid(delight / temp)
                 policy_loss = policy_loss * gate
 
             policy_loss = policy_loss.mean()
@@ -194,7 +299,7 @@ class PPOAgent(Module):
 
 # loops
 
-def train_agent_for_steps(agent, config, total_timesteps, show_pbar = False):
+def train_agent_for_steps(agent, config, total_timesteps, show_pbar = False, meta_temp = None):
     env = gym.make(config['env_id'])
     time = 0
     state, _ = env.reset()
@@ -217,7 +322,7 @@ def train_agent_for_steps(agent, config, total_timesteps, show_pbar = False):
         done = terminated or truncated
 
         if (time % config['ppo_update_steps']) == 0:
-            agent.update()
+            agent.update(meta_temp = meta_temp)
 
         if done:
             state, _ = env.reset()
@@ -226,13 +331,14 @@ def train_agent_for_steps(agent, config, total_timesteps, show_pbar = False):
         pbar.close()
 
     if len(agent.buffer_states) > 0:
-        agent.update()
+        agent.update(meta_temp = meta_temp)
 
     env.close()
 
 def evaluate_agent(agent, config):
     env = gym.make(config['env_id'])
     rewards = []
+    entropies = []
 
     for _ in range(config['eval_episodes']):
         state, _ = env.reset()
@@ -244,7 +350,9 @@ def evaluate_agent(agent, config):
 
             with torch.no_grad():
                 action_probs = agent.policy.actor(state_tensor)
+                dist = Categorical(action_probs)
                 action = torch.argmax(action_probs).item()
+                entropies.append(dist.entropy().item())
 
             state, reward, terminated, truncated, _ = env.step(action)
             episode_reward += reward
@@ -254,12 +362,11 @@ def evaluate_agent(agent, config):
 
     env.close()
 
-    return np.mean(rewards)
+    return np.mean(rewards), np.mean(entropies)
 
 # evolution
 
 def crossover(weights1, weights2, fitness1, fitness2, min_fitness, eps = 1e-5):
-
     scaled_fitness1 = fitness1 - min_fitness + eps
     scaled_fitness2 = fitness2 - min_fitness + eps
 
@@ -300,9 +407,9 @@ def main(
     mutation_prob = 0.3,
     frac_tournament = 0.25,
     record_every = 2,
-    total_generations = 50,
+    total_generations = 60,
     pretrain_steps = 25000,
-    finetune_steps = 500,
+    finetune_steps = 750,
     eval_episodes = 5,
     ppo_lr = 3e-4,
     ppo_gamma = 0.99,
@@ -310,9 +417,13 @@ def main(
     ppo_k_epochs = 4,
     ppo_update_steps = 2000,
     video_folder = "./lunar-recording",
-    use_delightful_gating = False,
+    use_delightful_gating = True,
     delight_temp = 1.0,
-    ppo_entropy_coef = 0.01
+    ppo_entropy_coef = 0.01,
+    use_meta_evolution = True,
+    meta_pop_size = 8,
+    meta_num_elite = 3,
+    meta_kappa = 1.0
 ):
     try:
         gym.make(env_id)
@@ -324,6 +435,9 @@ def main(
     state_dim = temp_env.observation_space.shape[0]
     action_dim = temp_env.action_space.n
     temp_env.close()
+
+    if use_meta_evolution:
+        use_delightful_gating = True
 
     config = dict(
         env_id = env_id,
@@ -346,7 +460,11 @@ def main(
         ppo_entropy_coef = ppo_entropy_coef,
         video_folder = video_folder,
         state_dim = state_dim,
-        action_dim = action_dim
+        action_dim = action_dim,
+        use_meta_evolution = use_meta_evolution,
+        meta_pop_size = meta_pop_size,
+        meta_num_elite = meta_num_elite,
+        meta_kappa = meta_kappa
     )
 
     wandb.init(
@@ -365,6 +483,19 @@ def main(
     base_agent = PPOAgent(config).to(device)
     train_agent_for_steps(base_agent, config, config['pretrain_steps'], show_pbar = True)
 
+    # initialize meta-evolution
+
+    meta_state = None
+
+    if use_meta_evolution:
+        dummy_meta = MetaTemperature().to(device)
+        init_meta_params = get_flat_params(dummy_meta)
+
+        meta_state = MetaState(
+            cem = CEM(init_meta_params, meta_pop_size, meta_num_elite),
+            pop_size = meta_pop_size
+        )
+
     print("initializing population...")
     population = []
     base_weights = base_agent.get_weights()
@@ -380,16 +511,16 @@ def main(
         fitnesses = []
 
         for agent in population:
-            fitness = evaluate_agent(agent, config)
-            fitnesses.append((fitness, agent))
+            fitness, entropy = evaluate_agent(agent, config)
+            fitnesses.append((fitness, entropy, agent))
 
         fitnesses.sort(key = lambda x: x[0], reverse = True)
 
-        raw_fitness_vals = [fitness for fitness, _ in fitnesses]
+        raw_fitness_vals = [fitness for fitness, _, _ in fitnesses]
         min_fitness = min(raw_fitness_vals)
 
         elites = fitnesses[:config['elite_count']]
-        elite_agents = [agent for _, agent in elites]
+        elite_agents = [agent for _, _, agent in elites]
         best_fitness = elites[0][0]
         mean_fitness = np.mean(raw_fitness_vals)
 
@@ -418,8 +549,8 @@ def main(
             contenders.sort(key = lambda x: x[0], reverse = True)
             parent1, parent2 = contenders[:2]
 
-            fitness1, agent1 = parent1
-            fitness2, agent2 = parent2
+            fitness1, _, agent1 = parent1
+            fitness2, _, agent2 = parent2
 
             weights1 = agent1.get_weights()
             weights2 = agent2.get_weights()
@@ -437,7 +568,24 @@ def main(
                 child.set_weights(mutated_weights)
             else:
                 child.set_weights(child_weights)
-                train_agent_for_steps(child, config, config['finetune_steps'])
+                # lamarckian fine-tuning, optionally guided by meta-evolved temperature
+
+                meta_temp = None
+
+                if use_meta_evolution:
+                    meta_temp = meta_state.current_meta_temp
+
+                train_agent_for_steps(child, config, config['finetune_steps'], meta_temp = meta_temp)
+
+                if use_meta_evolution:
+                    child_fitness, child_entropy = evaluate_agent(child, config)
+
+                    alpha = scaled_fitness1 / (scaled_fitness1 + scaled_fitness2 + 1e-5)
+                    expected_start_fitness = alpha * fitness1 + (1 - alpha) * fitness2
+                    delta_return = child_fitness - expected_start_fitness
+
+                    meta_fitness = delta_return + meta_kappa * child_entropy
+                    meta_state.record_fitness(meta_fitness)
 
             next_population.append(child)
 
@@ -447,7 +595,7 @@ def main(
             print(f"  recording videos for generation {generation + 1}...")
             video_files_logged = []
 
-            sorted_agents = [agent for _, agent in fitnesses]
+            sorted_agents = [agent for _, _, agent in fitnesses]
 
             for agent_idx, agent in enumerate(sorted_agents):
                 eval_env = gym.make(config['env_id'], render_mode = "rgb_array")
