@@ -212,3 +212,24 @@ $ python train.py
     url     = {https://arxiv.org/abs/2503.03660},
 }
 ```
+
+```bibtex
+@misc{hahn2025action,
+    title   = {Action Chunking Proximal Policy Optimization for Universal Robotic Dexterous Grasping},
+    author  = {Sanghyun Hahn and Jonghyun Choi},
+    year    = {2025},
+    url     = {https://openreview.net/forum?id=WFQnqY1c39}
+}
+```
+
+```bibtex
+@misc{shin2026adaptiveactionchunkingmultichunk,
+    title   = {Adaptive Action Chunking via Multi-Chunk Q Value Estimation},
+    author  = {Yongjae Shin and Jongseong Chae and Seongmin Kim and Jongeui Park and Youngchul Sung},
+    year    = {2026},
+    eprint  = {2605.10044},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2605.10044},
+}
+```
