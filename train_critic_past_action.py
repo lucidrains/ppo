@@ -814,7 +814,7 @@ def main(
 
                 next_state = torch.from_numpy(next_state).to(device)
 
-                past_action = F.one_hot(action, num_classes = num_actions)
+                next_past_action = F.one_hot(action, num_classes = num_actions)
 
                 if timestep == max_timesteps - 1:
                     truncated = True
@@ -825,7 +825,7 @@ def main(
                 done = terminated or truncated or updating_agent
 
                 if done and not terminated:
-                    next_value = agent.ema_critic.forward_eval(state, past_action)
+                    next_value = agent.ema_critic.forward_eval(next_state, next_past_action)
                     scalar_next_value = agent.critic_hl_gauss_loss(next_value).item()
                     reward += agent.gamma * scalar_next_value
 
@@ -847,7 +847,7 @@ def main(
                 )
 
                 state = next_state
-                past_action = F.one_hot(action, num_classes = num_actions)
+                past_action = next_past_action
 
                 # updating of the agent
 

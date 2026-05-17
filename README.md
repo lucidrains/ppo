@@ -200,3 +200,15 @@ $ python train.py
     url     = {https://arxiv.org/abs/2602.08040},
 }
 ```
+
+```bibtex
+@misc{tian2026chunkingcritic,
+    title   = {Chunking the Critic: A Transformer-based Soft Actor-Critic with N-Step Returns},
+    author  = {Dong Tian and Onur Celik and Gerhard Neumann},
+    year    = {2026},
+    eprint  = {2503.03660},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2503.03660},
+}
+```
