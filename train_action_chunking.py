@@ -7,7 +7,7 @@
 #   "fire",
 #   "gymnasium[box2d,other]",
 #   "hl-gauss-pytorch>=0.1.7",
-#   "memmap-replay-buffer>=0.1.1",
+#   "memmap-replay-buffer>=0.1.2",
 #   "numpy",
 #   "torch",
 #   "tqdm",
@@ -354,9 +354,7 @@ class PPO(nn.Module):
                     use_accelerated = False
                 )
 
-                memories.data['returns'][indices, :returns.shape[-1]] = returns.cpu().numpy()
-                memories.data['value'][indices, :values.shape[-2]] = values.cpu().numpy()
-                memories.flush()
+                memories.update(indices, returns = returns, value = values)
 
         # phase 2 - train on chunks starting at chunk boundaries
 
