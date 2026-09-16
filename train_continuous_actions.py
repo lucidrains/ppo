@@ -1,6 +1,7 @@
 # /// script
 # dependencies = [
 #   "torch",
+#   "torch-einops-utils>=0.1.24",
 #   "einops",
 #   "ema-pytorch",
 #   "adam-atan2-pytorch",
@@ -10,6 +11,7 @@
 #   "gymnasium[box2d,other]",
 #   "moviepy",
 #   "memmap-replay-buffer",
+#   "numpy",
 #   "fire",
 #   "tqdm"
 # ]
@@ -49,6 +51,8 @@ from hyper_connections import ManifoldConstrainedHyperConnections
 
 from assoc_scan import AssocScan
 
+from x_ppo import ppo_actor_loss
+
 import gymnasium as gym
 
 from memmap_replay_buffer import ReplayBuffer
@@ -67,9 +71,6 @@ def default(v, d):
 
 def divisible_by(num, den):
     return (num % den) == 0
-
-def normalize(t, eps = 1e-5):
-    return (t - t.mean()) / (t.std() + eps)
 
 def update_network_(loss, optimizer):
     optimizer.zero_grad()
@@ -368,8 +369,6 @@ class PPO(Module):
         eps_clip,
         value_clip,
         ema_decay,
-        use_spo = False,
-        asymmetric_spo = False,
         ema_kwargs: dict = dict(
             update_model_with_ema_every = 1000
         ),
@@ -417,9 +416,6 @@ class PPO(Module):
 
         self.eps_clip = eps_clip
         self.value_clip = value_clip
-
-        self.use_spo = use_spo
-        self.asymmetric_spo = asymmetric_spo # https://arxiv.org/abs/2510.06062v1
 
         self.save_path = Path(save_path)
 
@@ -506,29 +502,9 @@ class PPO(Module):
 
                 # calculate clipped surrogate objective, classic PPO loss
 
-                ratios = (action_log_probs - old_log_probs).exp()
+                advantages = returns - scalar_old_values.detach()
 
-                advantages = normalize(returns - scalar_old_values.detach())
-
-                if self.use_spo or self.asymmetric_spo:
-                    # Xie et al. https://arxiv.org/abs/2401.16025v9 line 14 of Algorithm 1
-                    spo_policy_loss = -(
-                        ratios * advantages -
-                        (advantages.abs() * (ratios - 1.).square()) / (2 * self.eps_clip)
-                    )
-
-                if not self.use_spo or self.asymmetric_spo:
-                    surr1 = ratios * advantages
-                    surr2 = ratios.clamp(1 - self.eps_clip, 1 + self.eps_clip) * advantages
-                    ppo_policy_loss = - torch.min(surr1, surr2)
-
-                if self.asymmetric_spo:
-                    # https://arxiv.org/abs/2510.06062v1
-                    policy_loss = torch.where(advantages > 0, ppo_policy_loss, spo_policy_loss)
-                elif self.use_spo:
-                    policy_loss = spo_policy_loss
-                else:
-                    policy_loss = ppo_policy_loss
+                policy_loss = ppo_actor_loss(action_log_probs, old_log_probs, advantages, self.eps_clip, normalize_advantages = True)
 
                 policy_loss = policy_loss - self.beta_s * entropy
 
@@ -598,8 +574,6 @@ def main(
     value_clip = 0.4,
     beta_s = .01,
     regen_reg_rate = 1e-4,
-    use_spo = False,
-    asymmetric_spo = False,
     cautious_factor = 0.1,
     ema_decay = 0.9,
     epochs = 2,
@@ -671,9 +645,7 @@ def main(
         cautious_factor,
         eps_clip,
         value_clip,
-        ema_decay,
-        use_spo,
-        asymmetric_spo
+        ema_decay
     ).to(device)
 
     if load:

@@ -1,6 +1,7 @@
 # /// script
 # dependencies = [
 #   "torch",
+#   "torch-einops-utils>=0.1.24",
 #   "numpy",
 #   "tqdm",
 #   "wandb",
@@ -40,6 +41,8 @@ from einops.layers.torch import Rearrange
 from x_mlps_pytorch import MLP
 from moviepy import VideoFileClip, clips_array, ColorClip
 import math
+
+from x_ppo import ppo_actor_loss
 
 # helpers
 
@@ -252,12 +255,7 @@ class PPOAgent(Module):
         for _ in range(self.config['ppo_k_epochs']):
             logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions)
 
-            ratios = torch.exp(logprobs - old_logprobs.detach())
-
-            surr1 = ratios * advantages
-            surr2 = torch.clamp(ratios, 1 - self.config['ppo_eps_clip'], 1 + self.config['ppo_eps_clip']) * advantages
-
-            policy_loss = -torch.min(surr1, surr2)
+            policy_loss = ppo_actor_loss(logprobs, old_logprobs, advantages, self.config['ppo_eps_clip'])
 
             if self.config['use_delightful_gating']:
                 surprisal = -logprobs.detach()

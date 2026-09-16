@@ -9,6 +9,7 @@
 #   "hl-gauss-pytorch>=0.1.7",
 #   "numpy",
 #   "torch",
+#   "torch-einops-utils>=0.1.24",
 #   "torchaudio",
 #   "torchvision",
 #   "tqdm",
@@ -51,6 +52,10 @@ import gymnasium as gym
 
 from memmap_replay_buffer import ReplayBuffer
 
+from torch_einops_utils import z_score
+
+from x_ppo import ppo_actor_loss
+
 # constants
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -65,9 +70,6 @@ def default(v, d):
 
 def divisible_by(num, den):
     return (num % den) == 0
-
-def normalize(t, eps = 1e-5):
-    return (t - t.mean()) / (t.std() + eps)
 
 def update_network_(loss, optimizer):
     optimizer.zero_grad()
@@ -295,12 +297,14 @@ class Actor(Module):
         mlp_depth = 2,
         dropout = 0.1,
         rsmnorm_input = True,  # use the RSMNorm for inputs proposed by KAIST + SonyAI
+        use_past_action = False,
     ):
         super().__init__()
+        self.use_past_action = use_past_action
         self.rsmnorm = RSMNorm(state_dim) if rsmnorm_input else nn.Identity()
 
         self.net = SimBa(
-            state_dim,
+            state_dim + (num_actions if use_past_action else 0),
             dim_hidden = hidden_dim * 2,
             depth = mlp_depth,
             dropout = dropout
@@ -314,10 +318,14 @@ class Actor(Module):
             nn.Linear(hidden_dim, num_actions)
         )
 
-    def forward(self, x):
+    def forward(self, x, past_action = None):
         with torch.no_grad():
             self.rsmnorm.eval()
             x = self.rsmnorm(x)
+
+        if self.use_past_action:
+            assert past_action is not None
+            x = torch.cat((x, past_action), dim = -1)
 
         hidden = self.net(x)
 
@@ -416,14 +424,13 @@ class PPO(Module):
         eps_clip,
         value_clip,
         ema_decay,
-        use_spo = False,
-        asymmetric_spo = False,
         use_delight_gating = False,
         next_state_value_weight = 0.,
         main_policy_loss_weight = 1.,
         actor_mlp_depth = 2,
         actor_dropout = 0.1,
         actor_rsmnorm_input = True,
+        actor_use_past_action = False,
         critic_mlp_depth = 6,
         critic_dropout = 0.1,
         critic_rsmnorm_input = True,
@@ -440,7 +447,8 @@ class PPO(Module):
             num_actions,
             mlp_depth = actor_mlp_depth,
             dropout = actor_dropout,
-            rsmnorm_input = actor_rsmnorm_input
+            rsmnorm_input = actor_rsmnorm_input,
+            use_past_action = actor_use_past_action
         )
 
         self.critic = Critic(
@@ -491,8 +499,6 @@ class PPO(Module):
         self.eps_clip = eps_clip
         self.value_clip = value_clip
 
-        self.use_spo = use_spo
-        self.asymmetric_spo = asymmetric_spo # https://arxiv.org/abs/2510.06062v1
         self.use_delight_gating = use_delight_gating
 
         self.save_path = Path(save_path)
@@ -565,7 +571,7 @@ class PPO(Module):
         for _ in range(self.epochs):
             for _, (states, actions, old_log_probs, returns, old_values, past_action, next_states, has_next_states) in enumerate(dl):
 
-                action_probs = self.actor(states)
+                action_probs = self.actor(states, past_action)
                 dist = Categorical(action_probs)
                 action_log_probs = dist.log_prob(actions)
                 entropy = dist.entropy()
@@ -574,9 +580,7 @@ class PPO(Module):
 
                 # calculate clipped surrogate objective, classic PPO loss
 
-                ratios = (action_log_probs - old_log_probs).exp()
-
-                advantages = normalize(returns - scalar_old_values.detach())
+                advantages = z_score(returns - scalar_old_values.detach())
 
                 maybe_gated_advantages = advantages
 
@@ -584,25 +588,7 @@ class PPO(Module):
                     delight_gate = (-action_log_probs * advantages).sigmoid().detach()
                     maybe_gated_advantages = advantages * delight_gate
 
-                if self.use_spo or self.asymmetric_spo:
-                    # Xie et al. https://arxiv.org/abs/2401.16025v9 line 14 of Algorithm 1
-                    spo_policy_loss = -(
-                        ratios * maybe_gated_advantages -
-                        (maybe_gated_advantages.abs() * (ratios - 1.).square()) / (2 * self.eps_clip)
-                    )
-
-                if not self.use_spo or self.asymmetric_spo:
-                    surr1 = ratios * maybe_gated_advantages
-                    surr2 = ratios.clamp(1 - self.eps_clip, 1 + self.eps_clip) * maybe_gated_advantages
-                    ppo_policy_loss = - torch.min(surr1, surr2)
-
-                if self.asymmetric_spo:
-                    # https://arxiv.org/abs/2510.06062v1
-                    policy_loss = torch.where(advantages > 0, ppo_policy_loss, spo_policy_loss)
-                elif self.use_spo:
-                    policy_loss = spo_policy_loss
-                else:
-                    policy_loss = ppo_policy_loss
+                policy_loss = ppo_actor_loss(action_log_probs, old_log_probs, maybe_gated_advantages, self.eps_clip)
 
                 policy_loss = policy_loss * self.main_policy_loss_weight - self.beta_s * entropy
 
@@ -668,6 +654,7 @@ def main(
     actor_mlp_depth = 2,
     actor_dropout = 0.1,
     actor_rsmnorm_input = True,
+    actor_use_past_action = False,
     critic_mlp_depth = 6,
     critic_dropout = 0.1,
     critic_rsmnorm_input = True,
@@ -686,8 +673,6 @@ def main(
     regen_reg_rate = 1e-4,
     next_state_value_weight = 0.1,
     main_policy_loss_weight = 1.,
-    use_spo = False,
-    asymmetric_spo = False,
     use_delight_gating = False,
     cautious_factor = 0.1,
     ema_decay = 0.9,
@@ -758,14 +743,13 @@ def main(
         eps_clip,
         value_clip,
         ema_decay,
-        use_spo = use_spo,
-        asymmetric_spo = asymmetric_spo,
         use_delight_gating = use_delight_gating,
         next_state_value_weight = next_state_value_weight,
         main_policy_loss_weight = main_policy_loss_weight,
         actor_mlp_depth = actor_mlp_depth,
         actor_dropout = actor_dropout,
         actor_rsmnorm_input = actor_rsmnorm_input,
+        actor_use_past_action = actor_use_past_action,
         critic_mlp_depth = critic_mlp_depth,
         critic_dropout = critic_dropout,
         critic_rsmnorm_input = critic_rsmnorm_input
@@ -802,7 +786,7 @@ def main(
             for timestep in range(max_timesteps):
                 time += 1
 
-                action_probs = agent.ema_actor.forward_eval(state)
+                action_probs = agent.ema_actor.forward_eval(state, past_action)
                 value = agent.ema_critic.forward_eval(state, past_action)
 
                 dist = Categorical(action_probs)

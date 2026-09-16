@@ -39,6 +39,8 @@ from x_transformers import (
 
 from assoc_scan import AssocScan
 
+from x_ppo import ppo_actor_loss
+
 import gymnasium as gym
 
 # constants
@@ -68,9 +70,6 @@ def default(v, d):
 
 def divisible_by(num, den):
     return (num % den) == 0
-
-def normalize(t, eps = 1e-5):
-    return (t - t.mean()) / (t.std() + eps)
 
 def frac_gradient(t, frac = 1.):
     assert 0 <= frac <= 1.
@@ -193,14 +192,12 @@ class WorldModelActorCritic(Module):
 
         # calculate clipped surrogate objective, classic PPO loss
 
-        ratios = (action_log_probs - old_log_probs).exp()
+        advantages = returns - scalar_old_values.detach()
 
-        advantages = normalize(returns - scalar_old_values.detach())
+        policy_loss = ppo_actor_loss(action_log_probs, old_log_probs, advantages, self.eps_clip, normalize_advantages = True)
 
-        surr1 = ratios * advantages
-        surr2 = ratios.clamp(1 - self.eps_clip, 1 + self.eps_clip) * advantages
-        actor_loss = - torch.min(surr1, surr2) - self.entropy_weight * entropy
-        return actor_loss
+        policy_loss = policy_loss - self.entropy_weight * entropy
+        return policy_loss
 
     def compute_critic_loss(
         self,

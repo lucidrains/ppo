@@ -10,7 +10,9 @@
 #   "memmap-replay-buffer>=0.1.2",
 #   "numpy",
 #   "torch",
+#   "torch-einops-utils>=0.1.24",
 #   "tqdm",
+#   "wandb",
 #   "x-transformers",
 #   "einops"
 # ]
@@ -47,10 +49,12 @@ from hl_gauss_pytorch import HLGaussLoss
 from assoc_scan import AssocScan
 from x_transformers import Decoder
 from einops import rearrange, repeat
-from torch_einops_utils import lens_to_mask
+from torch_einops_utils import lens_to_mask, masked_mean
 
 import gymnasium as gym
 from memmap_replay_buffer import ReplayBuffer
+
+from x_ppo import ppo_actor_loss
 
 # helpers
 
@@ -69,11 +73,6 @@ def bernoulli(p):
 def sample_categorical(logits, low = 1):
     sampled = Categorical(logits = logits).sample()
     return (sampled + 1).clamp(min = low, max = logits.shape[-1]).item()
-
-def normalize(t: Tensor, eps = 1e-5):
-    if t.numel() <= 1:
-        return torch.zeros_like(t)
-    return (t - t.mean()) / (t.std() + eps)
 
 def update_network_(loss, optimizer):
     optimizer.zero_grad()
@@ -390,17 +389,15 @@ class PPO(nn.Module):
 
                 action_logits = self.actor(batch.seq_state[:, 0], batch.seq_past_action[:, 0], chunk_size = seq)
 
-                dist = Categorical(logits = action_logits[valid])
-                action_log_probs = dist.log_prob(batch.seq_action[valid])
+                dist = Categorical(logits = action_logits)
+                action_log_probs = dist.log_prob(batch.seq_action)
                 entropy = dist.entropy()
 
-                advantages = normalize(batch.seq_returns[valid] - hl_gauss(batch.seq_value[valid]).detach())
+                advantages = batch.seq_returns - hl_gauss(batch.seq_value).detach()
 
-                ratios = (action_log_probs - batch.seq_action_log_prob[valid]).exp()
-                surr1 = ratios * advantages
-                surr2 = ratios.clamp(1 - self.eps_clip, 1 + self.eps_clip) * advantages
+                policy_loss = ppo_actor_loss(action_log_probs, batch.seq_action_log_prob, advantages, self.eps_clip, mask = valid, normalize_advantages = True)
 
-                policy_loss = (-torch.min(surr1, surr2) - self.beta_s * entropy).mean()
+                policy_loss = policy_loss - self.beta_s * masked_mean(entropy, mask = valid)
 
                 update_network_(policy_loss, self.opt_actor)
 

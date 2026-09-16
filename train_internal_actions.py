@@ -34,6 +34,8 @@ import gymnasium as gym
 
 from memmap_replay_buffer import ReplayBuffer
 
+from x_ppo import ppo_actor_loss
+
 # constants
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -46,9 +48,6 @@ def default(v, d):
 
 def divisible_by(num, den):
     return (num % den) == 0
-
-def normalize(t, eps = 1e-5):
-    return (t - t.mean()) / t.std(unbiased = False).clamp(min = eps)
 
 def update_network_(loss, optimizer):
     optimizer.zero_grad()
@@ -560,15 +559,11 @@ class PPO(Module):
 
                 # calculate clipped surrogate objective, classic PPO loss
 
-                ratios = (action_log_probs - old_log_probs).exp()
-
                 scalar_old_values = hl_gauss(old_values)
-                advantages = normalize(returns - scalar_old_values.detach())
+                advantages = returns - scalar_old_values.detach()
                 advantages = rearrange(advantages, '... -> ... 1')
 
-                surr1 = ratios * advantages
-                surr2 = ratios.clamp(1 - self.eps_clip, 1 + self.eps_clip) * advantages
-                policy_loss = - torch.min(surr1, surr2)
+                policy_loss = ppo_actor_loss(action_log_probs, old_log_probs, advantages, self.eps_clip, normalize_advantages = True)
 
                 policy_loss = policy_loss - self.beta_s * entropy
 

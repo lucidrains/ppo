@@ -10,6 +10,7 @@
 #     "gymnasium[other]",
 #     "pygame",
 #     "assoc-scan",
+#     "torch-einops-utils>=0.1.24",
 #     "vector-quantize-pytorch>=1.28.0",
 # ]
 # ///
@@ -36,6 +37,8 @@ import gymnasium as gym
 
 from vector_quantize_pytorch import BinaryMapper
 
+from x_ppo import ppo_actor_loss
+
 # constants
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -52,9 +55,6 @@ def default(v, d):
 
 def divisible_by(num, den):
     return (num % den) == 0
-
-def normalize(t, eps = 1e-5):
-    return (t - t.mean()) / (t.std() + eps)
 
 # modules
 
@@ -262,12 +262,15 @@ class PPO(Module):
                 action_log_probs = self.actor.mapper.log_prob(logits, indices = actions_b, sum_bits = True)
                 entropy = self.actor.mapper.binary_entropy(logits).mean()
 
-                ratios = (action_log_probs - old_log_probs_b).exp()
-                advantages = normalize(returns_b - old_values_b.detach())
+                advantages = returns_b - old_values_b.detach()
 
-                surr1 = ratios * advantages
-                surr2 = ratios.clamp(1 - self.eps_clip, 1 + self.eps_clip) * advantages
-                policy_loss = -torch.min(surr1, surr2).mean() - self.beta_s * entropy
+                policy_loss = ppo_actor_loss(
+                    action_log_probs,
+                    old_log_probs_b,
+                    advantages,
+                    self.eps_clip,
+                    normalize_advantages = True
+                ).mean() - self.beta_s * entropy
 
                 self.opt_actor.zero_grad()
                 policy_loss.backward()

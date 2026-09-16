@@ -1,6 +1,7 @@
 # /// script
 # dependencies = [
 #   "torch",
+#   "torch-einops-utils>=0.1.24",
 #   "einops",
 #   "ema-pytorch",
 #   "adam-atan2-pytorch",
@@ -9,6 +10,7 @@
 #   "gymnasium[mujoco,moviepy]>=1.0.0",
 #   "gymnasium-robotics",
 #   "memmap-replay-buffer",
+#   "numpy",
 #   "fire",
 #   "tqdm",
 #   "termcolor",
@@ -52,6 +54,10 @@ import gymnasium_robotics
 
 from memmap_replay_buffer import ReplayBuffer
 
+from torch_einops_utils import z_score
+
+from x_ppo import ppo_actor_loss
+
 # constants
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -74,15 +80,6 @@ def module_device(module):
 
 def divisible_by(num, den):
     return (num % den) == 0
-
-def normalize(t, mask = None, eps = 1e-5):
-    if not exists(mask):
-        return (t - t.mean()) / t.std(unbiased = False).clamp(min = eps)
-    masked_t = t[mask]
-    if masked_t.numel() == 0: return t
-    mean = masked_t.mean()
-    std = masked_t.std(unbiased = False).clamp(min = eps)
-    return (t - mean) / std
 
 def update_network_(loss, opt_inner, opt_outer, phase):
     loss.mean().backward()
@@ -494,6 +491,13 @@ def calc_internal_gae(
     num_time_embeds,
     use_accelerated = None
 ):
+    # the internal policy acts once per chunk of num_time_embeds steps, so this
+    # computes the GAE at the chunk level (a "macro" GAE over chunk returns),
+    # reusing the same machinery as the outer GAE but with a gamma ** chunk_len
+    # discount per macro step. this gives the internal policy an unbiased
+    # advantage signal for the chunk-level decision, instead of the previous
+    # implementation which mixed residuals within a chunk against the
+    # chunk-start value as a baseline (double counting rewards and bootstraps)
     b, seq_len = rewards.shape
     device = rewards.device
     use_accelerated = default(use_accelerated, rewards.is_cuda)
@@ -501,38 +505,49 @@ def calc_internal_gae(
 
     is_boundary = (masks == 0)
     is_truncated = is_boundary & (~learnable)
+
+    # a truncated episode appends a bootstrap step whose internal value is the
+    # continuation value; propagate it into the last in-episode step so that the
+    # chunk return includes the gamma ** (steps remaining) bootstrap
+
     step_rewards = rewards + where(is_truncated, values, zeros_like(values))
+
+    # bucket (chunk) rewards: discounted sums of rewards within each chunk.
+    # scan semantics: out[i] = v[i] + gate[i] * out[i + 1]; gate[i] is on when
+    # the next step is not a chunk start, so the sum stops at chunk boundaries
 
     is_sampled_next = is_sampled.roll(-1, dims = 1)
     is_sampled_next[:, -1] = True
 
-    # bucket rewards
-
     bucket_reward_gates = gamma * masks * (~is_sampled_next).float()
     bucket_rewards = scan(bucket_reward_gates, step_rewards)
 
-    # bucket masks
+    # chunk-level gae over the chunk starts (is_sampled positions)
 
-    bucket_mask_gates = masks * (~is_sampled_next).float()
-    bucket_mask_values = masks * is_sampled_next.float()
-    bucket_masks = scan(bucket_mask_gates, bucket_mask_values)
+    internal_returns = zeros((b, seq_len), device = device)
+    internal_gae = zeros((b, seq_len), device = device)
 
-    # next internal values
+    for c in reversed(range(0, seq_len - 1, num_time_embeds)):
+        chunk_len = min(num_time_embeds, seq_len - 1 - c)
+        n = c + chunk_len
+        next_chunk_idx = c + num_time_embeds
 
-    next_internal_val_gates = (~is_sampled).float()
-    next_internal_val_values = values * is_sampled.float()
-    next_internal_values = scan(next_internal_val_gates, next_internal_val_values)
+        # bootstrap to the next chunk start value, if it exists in-episode
 
-    next_internal_values = F.pad(next_internal_values[:, 1:], (0, 1), value = 0.0)
+        in_ep_next = learnable[..., n].bool()
+        next_chunk_values = where(in_ep_next, values[..., n], zeros_like(values[..., c]))
 
-    # internal gae
+        deltas = bucket_rewards[..., c] + (gamma ** chunk_len) * next_chunk_values - values[..., c]
 
-    deltas = bucket_rewards + (gamma ** num_time_embeds) * bucket_masks * next_internal_values - values
+        if next_chunk_idx < seq_len:
+            has_next_chunk = learnable[..., next_chunk_idx].bool()
+            gates = (gamma ** chunk_len) * lam * has_next_chunk.float()
+            next_internal_gae = internal_gae[..., next_chunk_idx]
+            internal_gae[..., c] = deltas + gates * next_internal_gae
+        else:
+            internal_gae[..., c] = deltas
 
-    next_internal_gae_gates = (gamma ** num_time_embeds) * lam * bucket_masks
-    next_internal_gaes = scan(next_internal_gae_gates, deltas)
-
-    internal_returns = next_internal_gaes + values
+    internal_returns = internal_gae + values
     return internal_returns
 
 # agent
@@ -666,6 +681,7 @@ class PPO(Module):
         self.value_clip = value_clip
 
         self.internal_policy_loss_weight = internal_policy_loss_weight
+        self.internal_action_dim = internal_action_dim
         self.save_path = Path(save_path)
 
     def save(self):
@@ -761,6 +777,9 @@ class PPO(Module):
 
         # policy phase training, similar to original PPO
 
+        internal_entropy_total = 0.
+        internal_entropy_count = 0.
+
         for epoch in range(self.epochs):
             for i, (
                 states,
@@ -799,28 +818,27 @@ class PPO(Module):
                 old_internal_log_probs = where(sampled_mask_bool, old_internal_log_probs, zeros_like(old_internal_log_probs))
                 internal_entropy = where(sampled_mask_bool, internal_entropy, zeros_like(internal_entropy))
 
+                internal_entropy_total += internal_entropy.sum().item()
+                internal_entropy_count += sampled_mask_bool.float().sum().item()
+
                 action_log_probs, _ = pack([action_log_probs, internal_log_probs], 'b *')
                 old_log_probs, _ = pack([old_log_probs, old_internal_log_probs], 'b *')
                 entropy, _ = pack([entropy, internal_entropy], 'b * ')
 
                 # calculate clipped surrogate objective, classic PPO loss
 
-                ratios = (action_log_probs - old_log_probs).exp()
-
                 scalar_old_values = hl_gauss(old_values)
-                advantages_main = normalize(returns - scalar_old_values.detach())
+                advantages_main = z_score(returns - scalar_old_values.detach())
                 advantages_main = rearrange(advantages_main, '... -> ... 1')
 
                 scalar_old_internal_values = hl_gauss(old_internal_values)
-                advantages_inner = normalize(internal_returns - scalar_old_internal_values.detach(), mask = is_internal_action_sampled)
+                advantages_inner = z_score(internal_returns - scalar_old_internal_values.detach(), mask = is_internal_action_sampled)
                 advantages_inner = rearrange(advantages_inner, '... -> ... 1')
                 advantages_inner = repeat(advantages_inner, 'b 1 -> b num', num = internal_log_probs[0].numel())
 
                 advantages, _ = pack([advantages_main, advantages_inner], 'b *')
 
-                surr1 = ratios * advantages
-                surr2 = ratios.clamp(1 - self.eps_clip, 1 + self.eps_clip) * advantages
-                policy_loss = - torch.min(surr1, surr2)
+                policy_loss = ppo_actor_loss(action_log_probs, old_log_probs, advantages, self.eps_clip)
 
                 policy_loss = policy_loss - self.beta_s * entropy
 
@@ -924,6 +942,11 @@ class PPO(Module):
 
         # update the state normalization with rsmnorm for 1 epoch after actor critic are updated
 
+        if internal_entropy_count > 0:
+            avg_internal_entropy = internal_entropy_total / internal_entropy_count
+            max_internal_entropy = torch.log(tensor(self.internal_action_dim)).item()
+            print(colored(f'internal policy entropy: {avg_internal_entropy:.3f} (uniform = {max_internal_entropy:.3f})', 'yellow'))
+
         self.rsmnorm.train()
 
         for states, *_ in tqdm(dl, desc='updating rsmnorm', leave=True):
@@ -932,8 +955,17 @@ class PPO(Module):
 # helpers for vectorized rollout
 
 def concat_goal_obs(state_dict):
-    """Concatenate observation and desired_goal from dict-style gym obs."""
-    return np.concatenate([state_dict['observation'], state_dict['desired_goal']], axis = -1)
+    """Concatenate observation, achieved_goal and desired_goal from dict-style gym obs.
+
+    newer gymnasium-robotics versions (v5) strip the ant's x/y position out of
+    `observation`, so the achieved_goal must be included for the agent to be able
+    to localize itself and navigate the maze.
+    """
+    parts = [state_dict['observation']]
+    if 'achieved_goal' in state_dict:
+        parts.append(state_dict['achieved_goal'])
+    parts.append(state_dict['desired_goal'])
+    return np.concatenate(parts, axis = -1)
 
 def record_eval_episode(
     env_name,
@@ -1014,21 +1046,30 @@ def collect_vectorized_rollouts(
     max_timesteps,
     num_time_embeds,
     memories,
-    seed = None
+    seed = None,
+    shaping_scale = 1.0
 ):
-    """Run one batch of num_envs episodes in parallel, return (cum_rewards, steps)."""
+    """Run one batch of num_envs episodes in parallel, return (cum_rewards, steps, successes)."""
 
     # reset
 
     state_dict, _ = env.reset(seed = seed)
     state = torch.from_numpy(concat_goal_obs(state_dict)).float().to(device)
 
+    # dense potential-based shaping toward the goal (the sparse AntMaze reward
+    # alone gives no learning signal; without this, the old run's only "reward"
+    # was a std-based entropy bonus which rewarded thrashing in place)
+
+    use_shaping = 'achieved_goal' in state_dict and shaping_scale != 0.
+    prev_achieved_goal = np.asarray(state_dict['achieved_goal']) if use_shaping else None
+    goal = np.asarray(state_dict['desired_goal']) if use_shaping else None
+
     # per-env bookkeeping
 
     env_active = np.ones(num_envs, dtype = bool)
     cum_rewards = np.zeros(num_envs)
     env_steps = np.zeros(num_envs, dtype = int)
-
+    env_success = np.zeros(num_envs, dtype = bool)
     episode_fields = (
         'learnable', 'state', 'action', 'action_log_prob', 'reward',
         'is_boundary', 'value', 'internal_value', 'internal_actions', 'internal_action_logits',
@@ -1084,11 +1125,24 @@ def collect_vectorized_rollouts(
         next_state_dict, reward_np, terminated, truncated, infos = env.step(env_action)
         next_state = torch.from_numpy(concat_goal_obs(next_state_dict)).float().to(device)
 
-        # reward shaping
+        # reward shaping: potential-based dense goal signal. the AntMaze v5
+        # continuing task teleports the goal to a new location when reached,
+        # which would otherwise inject a spurious potential spike at that step
 
-        exp_bonus = (std.mean(dim = -1) * 0.01).cpu().numpy()
-        extreme_penalty = ((mean.abs() > 1.).float().mean(dim = -1) * 0.01).cpu().numpy()
-        total_reward = reward_np.astype(float) + exp_bonus - extreme_penalty
+        if use_shaping:
+            next_achieved_goal = np.asarray(next_state_dict['achieved_goal'])
+            next_goal = np.asarray(next_state_dict['desired_goal'])
+            dist_prev = np.linalg.norm(prev_achieved_goal - goal, axis = -1)
+            dist_next = np.linalg.norm(next_achieved_goal - goal, axis = -1)
+
+            goal_changed = np.linalg.norm(next_goal - goal, axis = -1) > 1e-4
+            potential = np.where(goal_changed, 0., dist_prev - dist_next)
+
+            total_reward = reward_np.astype(float) + shaping_scale * potential
+            goal = next_goal
+            prev_achieved_goal = next_achieved_goal
+        else:
+            total_reward = reward_np.astype(float)
 
         done = terminated | truncated
 
@@ -1100,6 +1154,9 @@ def collect_vectorized_rollouts(
 
             cum_rewards[i] += total_reward[i]
             env_steps[i] += 1
+
+            if 'success' in infos:
+                env_success[i] = env_success[i] or bool(infos['success'][i])
 
             d = collected[i]
             d['learnable'].append(True)
@@ -1125,13 +1182,10 @@ def collect_vectorized_rollouts(
             if terminated[i] or len(d['state']) > memories.max_timesteps:
                 continue
 
-            final_obs = extract_final_obs(infos, i, num_envs)
+            # the truncated env does not provide final_observation, but the
+            # post-truncation state is simply the next_state we already have
 
-            if final_obs is None:
-                continue
-
-            final_state_np = concat_goal_obs({'observation': final_obs['observation'], 'desired_goal': final_obs['desired_goal']})
-            final_state_t = torch.from_numpy(final_state_np).float().to(device).unsqueeze(0)
+            final_state_t = next_state[i].unsqueeze(0)
             next_time_idx = (timestep + 1) % num_time_embeds
 
             with torch.no_grad():
@@ -1140,13 +1194,13 @@ def collect_vectorized_rollouts(
                     time_embed_index = tensor([next_time_idx], device = device, dtype = torch.long)
                 )
 
-                if next_time_idx == 0:
-                    next_internal_value = agent.ema_internal_critic.forward_eval(
-                        final_state_t,
-                        time_embed_index = tensor([next_time_idx], device = device, dtype = torch.long)
-                    )
-                else:
-                    next_internal_value = zeros_like(next_value)
+                # always bootstrap the internal value at truncation, so the last
+                # chunk's return is complete regardless of chunk alignment
+
+                next_internal_value = agent.ema_internal_critic.forward_eval(
+                    final_state_t,
+                    time_embed_index = tensor([next_time_idx], device = device, dtype = torch.long)
+                )
 
                 next_value, next_internal_value = next_value[0], next_internal_value[0]
 
@@ -1186,7 +1240,7 @@ def collect_vectorized_rollouts(
                     is_internal_action_sampled = bool(d['is_internal_action_sampled'][t])
                 )
 
-    return cum_rewards, env_steps
+    return cum_rewards, env_steps, env_success
 
 # main
 
@@ -1201,7 +1255,7 @@ def main(
     critic_depth = 12,
     critic_pred_num_bins = 100,
     reward_range = (-50., 50.),
-    update_episodes = 50,
+    update_episodes = 8,
     buffer_episodes = 100,
     minibatch_size = 1024,
     gae_batch_size = 256,
@@ -1226,19 +1280,25 @@ def main(
     video_folder = './antmaze-recording',
     load = False,
     use_wandb = True,
-    wandb_project = 'antmaze-internal-actions'
+    wandb_project = 'antmaze-internal-actions',
+    vectorization_mode = 'sync',
+    shaping_scale = 1.0
 ):
     if use_wandb:
         wandb.init(project=wandb_project, config=locals())
 
     rmtree(video_folder, ignore_errors = True)
 
-    # environment setup - always async for training
+    # environment setup - sync is more reliable on macOS (async workers have
+    # been observed to die with EOFError / BrokenPipeError mid-training)
 
-    env = gym.make_vec(env_name, num_envs = num_envs, vectorization_mode = 'async')
+    env = gym.make_vec(env_name, num_envs = num_envs, vectorization_mode = vectorization_mode)
 
     temp_env = gym.make(env_name)
-    state_dim = temp_env.observation_space['observation'].shape[0] + temp_env.observation_space['desired_goal'].shape[0]
+    obs_space = temp_env.observation_space
+    state_dim = obs_space['observation'].shape[0] + obs_space['desired_goal'].shape[0]
+    if 'achieved_goal' in obs_space.spaces:
+        state_dim += obs_space['achieved_goal'].shape[0]
     action_dim = temp_env.action_space.shape[0]
     temp_env.close()
 
@@ -1298,6 +1358,7 @@ def main(
 
     running_rewards = deque(maxlen = 100)
     running_steps = deque(maxlen = 100)
+    running_success = deque(maxlen = 100)
 
     if isinstance(phase_schedule, str):
         phase_schedule_tuples = parse_string_schedule(phase_schedule)
@@ -1335,13 +1396,15 @@ def main(
 
         # collect num_envs episodes in parallel
 
-        cum_rewards, steps = collect_vectorized_rollouts(
+        cum_rewards, steps, successes = collect_vectorized_rollouts(
             env, agent, num_envs, max_timesteps,
-            num_time_embeds, memories, seed
+            num_time_embeds, memories, seed,
+            shaping_scale = shaping_scale
         )
 
         running_rewards.extend(cum_rewards)
         running_steps.extend(steps)
+        running_success.extend(successes)
 
         total_eps += num_envs
         pbar.update(num_envs)
@@ -1353,19 +1416,23 @@ def main(
         if len(running_rewards) > 0:
             avg_reward = sum(running_rewards) / len(running_rewards)
             avg_steps = sum(running_steps) / len(running_steps)
+            avg_success = sum(running_success) / len(running_success)
             pbar.set_postfix({
                 'reward': round(avg_reward, 2),
+                'success': round(avg_success, 3),
                 'phase_upd': phase_update_count,
                 'steps': round(avg_steps, 2)
             })
 
             if use_wandb:
-                for cr, st in zip(cum_rewards, steps):
+                for cr, st, sc in zip(cum_rewards, steps, successes):
                     phase_mapping = {'outer': 0, 'inner': 1, 'both': 2}
                     wandb.log({
                         'episode_reward': cr,
                         'episode_steps': st,
+                        'episode_success': int(sc),
                         'avg_reward': avg_reward,
+                        'avg_success': avg_success,
                         'avg_steps': avg_steps,
                         'total_eps': total_eps,
                         'num_policy_updates': num_policy_updates,
