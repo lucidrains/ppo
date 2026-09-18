@@ -1,6 +1,6 @@
 [project]
 name = "x-ppo"
-version = "0.0.1"
+version = "0.0.2"
 description = "PPO"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -41,6 +41,9 @@ test = [
 [tool.pytest.ini_options]
 pythonpath = [
     "."
+]
+testpaths = [
+    "tests"
 ]
 
 [build-system]

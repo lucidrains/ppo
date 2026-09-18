@@ -12,10 +12,18 @@ def ppo_actor_loss(
     advantages,
     eps_clip = 0.2,
     mask = None,
-    normalize_advantages = False
+    normalize_advantages = False,
+    delightful = False,
+    delight_temp = 1.
 ):
     if normalize_advantages:
         advantages = z_score(advantages, mask = mask)
+
+    # delightful policy gradient - Ian Osband https://arxiv.org/abs/2603.14608
+
+    if delightful:
+        gate = (-action_log_probs * advantages / delight_temp).sigmoid().detach()
+        advantages = advantages * gate
 
     ratios = (action_log_probs - old_action_log_probs).exp()
 
