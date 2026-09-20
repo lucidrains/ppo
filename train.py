@@ -51,7 +51,7 @@ from torch_einops_utils import z_score
 
 import gymnasium as gym
 
-from x_ppo import ppo_actor_loss
+from x_ppo import ppo_actor_loss, spo_actor_loss
 
 # constants
 
@@ -428,6 +428,8 @@ class PPO(Module):
         eps_clip,
         value_clip,
         ema_decay,
+        use_spo = False,
+        asymmetric_spo = False,
         ema_kwargs: dict = dict(
             update_model_with_ema_every = 1000
         ),
@@ -490,6 +492,9 @@ class PPO(Module):
         self.spectral_entropy_reg = spectral_entropy_reg
         self.apply_spectral_entropy_every = apply_spectral_entropy_every
         self.spectral_entropy_reg_weight = spectral_entropy_reg_weight
+
+        self.use_spo = use_spo
+        self.asymmetric_spo = asymmetric_spo # https://arxiv.org/abs/2510.06062v1
 
         self.save_path = Path(save_path)
 
@@ -603,7 +608,10 @@ class PPO(Module):
                     post_advantages = z_score(post_returns - scalar_old_post_values.detach())
                     advantages = torch.max(advantages, post_advantages)
 
-                policy_loss = ppo_actor_loss(action_log_probs, old_log_probs, advantages, self.eps_clip)
+                if self.use_spo or self.asymmetric_spo:
+                    policy_loss = spo_actor_loss(action_log_probs, old_log_probs, advantages, self.eps_clip, asymmetric = self.asymmetric_spo)
+                else:
+                    policy_loss = ppo_actor_loss(action_log_probs, old_log_probs, advantages, self.eps_clip)
 
                 policy_loss = policy_loss - self.beta_s * entropy
 
@@ -687,6 +695,8 @@ def main(
     spectral_entropy_reg_weight = 0.025,
     cautious_factor = 0.1,
     ema_decay = 0.9,
+    use_spo = False,
+    asymmetric_spo = False,
     update_timesteps = 5000,
     epochs = 2,
     seed = None,
@@ -740,7 +750,9 @@ def main(
         use_post_decision_critic,
         eps_clip,
         value_clip,
-        ema_decay
+        ema_decay,
+        use_spo = use_spo,
+        asymmetric_spo = asymmetric_spo,
     ).to(device)
 
     if load:

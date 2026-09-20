@@ -51,7 +51,7 @@ from hyper_connections import ManifoldConstrainedHyperConnections
 
 from assoc_scan import AssocScan
 
-from x_ppo import ppo_actor_loss
+from x_ppo import ppo_actor_loss, spo_actor_loss
 
 import gymnasium as gym
 
@@ -369,6 +369,8 @@ class PPO(Module):
         eps_clip,
         value_clip,
         ema_decay,
+        use_spo = False,
+        asymmetric_spo = False,
         ema_kwargs: dict = dict(
             update_model_with_ema_every = 1000
         ),
@@ -416,6 +418,9 @@ class PPO(Module):
 
         self.eps_clip = eps_clip
         self.value_clip = value_clip
+
+        self.use_spo = use_spo
+        self.asymmetric_spo = asymmetric_spo # https://arxiv.org/abs/2510.06062v1
 
         self.save_path = Path(save_path)
 
@@ -504,7 +509,10 @@ class PPO(Module):
 
                 advantages = returns - scalar_old_values.detach()
 
-                policy_loss = ppo_actor_loss(action_log_probs, old_log_probs, advantages, self.eps_clip, normalize_advantages = True)
+                if self.use_spo or self.asymmetric_spo:
+                    policy_loss = spo_actor_loss(action_log_probs, old_log_probs, advantages, self.eps_clip, normalize_advantages = True, asymmetric = self.asymmetric_spo)
+                else:
+                    policy_loss = ppo_actor_loss(action_log_probs, old_log_probs, advantages, self.eps_clip, normalize_advantages = True)
 
                 policy_loss = policy_loss - self.beta_s * entropy
 
@@ -576,6 +584,8 @@ def main(
     regen_reg_rate = 1e-4,
     cautious_factor = 0.1,
     ema_decay = 0.9,
+    use_spo = False,
+    asymmetric_spo = False,
     epochs = 2,
     seed = None,
     render = True,
@@ -645,7 +655,9 @@ def main(
         cautious_factor,
         eps_clip,
         value_clip,
-        ema_decay
+        ema_decay,
+        use_spo = use_spo,
+        asymmetric_spo = asymmetric_spo,
     ).to(device)
 
     if load:

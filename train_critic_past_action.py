@@ -54,7 +54,7 @@ from memmap_replay_buffer import ReplayBuffer
 
 from torch_einops_utils import z_score
 
-from x_ppo import ppo_actor_loss
+from x_ppo import ppo_actor_loss, spo_actor_loss
 
 # constants
 
@@ -424,6 +424,8 @@ class PPO(Module):
         eps_clip,
         value_clip,
         ema_decay,
+        use_spo = False,
+        asymmetric_spo = False,
         use_delight_gating = False,
         next_state_value_weight = 0.,
         main_policy_loss_weight = 1.,
@@ -499,6 +501,8 @@ class PPO(Module):
         self.eps_clip = eps_clip
         self.value_clip = value_clip
 
+        self.use_spo = use_spo
+        self.asymmetric_spo = asymmetric_spo # https://arxiv.org/abs/2510.06062v1
         self.use_delight_gating = use_delight_gating
 
         self.save_path = Path(save_path)
@@ -588,7 +592,10 @@ class PPO(Module):
                     delight_gate = (-action_log_probs * advantages).sigmoid().detach()
                     maybe_gated_advantages = advantages * delight_gate
 
-                policy_loss = ppo_actor_loss(action_log_probs, old_log_probs, maybe_gated_advantages, self.eps_clip)
+                if self.use_spo or self.asymmetric_spo:
+                    policy_loss = spo_actor_loss(action_log_probs, old_log_probs, maybe_gated_advantages, self.eps_clip, asymmetric = self.asymmetric_spo)
+                else:
+                    policy_loss = ppo_actor_loss(action_log_probs, old_log_probs, maybe_gated_advantages, self.eps_clip)
 
                 policy_loss = policy_loss * self.main_policy_loss_weight - self.beta_s * entropy
 
@@ -673,6 +680,8 @@ def main(
     regen_reg_rate = 1e-4,
     next_state_value_weight = 0.1,
     main_policy_loss_weight = 1.,
+    use_spo = False,
+    asymmetric_spo = False,
     use_delight_gating = False,
     cautious_factor = 0.1,
     ema_decay = 0.9,
@@ -743,6 +752,8 @@ def main(
         eps_clip,
         value_clip,
         ema_decay,
+        use_spo = use_spo,
+        asymmetric_spo = asymmetric_spo,
         use_delight_gating = use_delight_gating,
         next_state_value_weight = next_state_value_weight,
         main_policy_loss_weight = main_policy_loss_weight,

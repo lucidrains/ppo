@@ -483,7 +483,7 @@ def collect_vectorized_rollouts(
                 chunk_dist = agent.actor(state[needs_chunk], past_action[needs_chunk], chunk_size = action_chunk_size)
                 chunk_actions = chunk_dist.sample()
                 chunk_log_probs = chunk_dist.log_prob(chunk_actions).sum(dim = -1)
-                
+
                 if dynamic_chunk:
                     state_seq = repeat(state[needs_chunk], 'b d -> b c d', c = action_chunk_size)
                     q_values = agent.critic_hl_gauss_loss(agent.critic(state_seq, chunk_actions))
