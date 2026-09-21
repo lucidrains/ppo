@@ -49,7 +49,6 @@ from ema_pytorch import EMA
 from adam_atan2_pytorch.adopt_atan2 import AdoptAtan2
 from hl_gauss_pytorch import HLGaussLoss
 
-from assoc_scan import AssocScan
 from x_transformers import Decoder
 from einops import rearrange, repeat
 from torch_einops_utils import lens_to_mask, masked_mean
@@ -61,7 +60,7 @@ from memmap_replay_buffer import ReplayBuffer
 
 from discrete_continuous_embed_readout import Readout
 
-from x_ppo import ppo_actor_loss
+from x_ppo import ppo_actor_loss, calc_gae
 
 # helpers
 
@@ -220,29 +219,6 @@ class TransformerCritic(nn.Module):
 
         return values
 
-# GAE
-
-def calc_gae(
-    rewards,
-    values,
-    masks,
-    gamma = 0.99,
-    lam = 0.95,
-    use_accelerated = None
-):
-    assert values.shape[-1] == rewards.shape[-1]
-    use_accelerated = default(use_accelerated, rewards.is_cuda)
-
-    values = F.pad(values, (0, 1), value = 0.)
-    values, values_next = values[..., :-1], values[..., 1:]
-
-    delta = rewards + gamma * values_next * masks - values
-    gates = gamma * lam * masks
-
-    scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
-    gae = scan(gates, delta)
-
-    return gae + values
 
 # agent
 

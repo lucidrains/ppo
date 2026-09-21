@@ -51,7 +51,7 @@ import gymnasium as gym
 
 from memmap_replay_buffer import ReplayBuffer
 
-from x_ppo import ppo_actor_loss
+from x_ppo import ppo_actor_loss, calc_gae
 
 # constants
 
@@ -291,33 +291,7 @@ class Critic(Module):
 
         return mean, std
 
-# GAE
 
-def calc_gae(
-    rewards,
-    values,
-    masks,
-    gamma = 0.99,
-    lam = 0.95,
-    use_accelerated = None
-):
-    assert values.shape[-1] == rewards.shape[-1]
-    use_accelerated = default(use_accelerated, rewards.is_cuda)
-
-    values = F.pad(values, (0, 1), value = 0.)
-
-    values, values_next = values[..., :-1], values[..., 1:]
-
-    delta = rewards + gamma * values_next * masks - values
-    gates = gamma * lam * masks
-
-    scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
-
-    gae = scan(gates, delta)
-
-    returns = gae + values
-
-    return returns
 
 # agent
 
@@ -338,7 +312,6 @@ class PPO(Module):
         regen_reg_rate,
         cautious_factor,
         eps_clip,
-        value_clip,
         ema_decay,
         downweight_advantages_with_value_uncertainty = False,
         use_relative_value_uncertainty = False,
@@ -380,7 +353,6 @@ class PPO(Module):
         self.beta_s = beta_s
 
         self.eps_clip = eps_clip
-        self.value_clip = value_clip
 
         self.downweight_advantages_with_value_uncertainty = downweight_advantages_with_value_uncertainty
         self.use_relative_value_uncertainty = use_relative_value_uncertainty
@@ -523,7 +495,6 @@ def main(
     lam = 0.95,
     gamma = 0.99,
     eps_clip = 0.2,
-    value_clip = 0.4,
     beta_s = .01,
     regen_reg_rate = 1e-4,
     cautious_factor = 0.1,
@@ -599,7 +570,6 @@ def main(
         regen_reg_rate,
         cautious_factor,
         eps_clip,
-        value_clip,
         ema_decay,
         downweight_advantages_with_value_uncertainty,
         use_relative_value_uncertainty,
@@ -662,7 +632,7 @@ def main(
                 eps_rewards += environment_rewards
                 eps_steps += 1
 
-                rolling_uncertainty.extend(stds.squeeze().cpu().tolist())
+                rolling_uncertainty.extend(stds.flatten().cpu().tolist())
 
                 memories.store_batch(
                     learnable = torch.ones(num_envs, dtype = torch.bool),

@@ -42,7 +42,7 @@ from x_mlps_pytorch import MLP
 from moviepy import VideoFileClip, clips_array, ColorClip
 import math
 
-from x_ppo import ppo_actor_loss
+from x_ppo import ppo_actor_loss, calc_returns
 
 # helpers
 
@@ -232,17 +232,9 @@ class PPOAgent(Module):
         return action
 
     def update(self, meta_temp = None):
-        rewards = []
-        discounted_reward = 0
-
-        for reward, is_terminal in zip(reversed(self.buffer_rewards), reversed(self.buffer_is_terminals)):
-            if is_terminal:
-                discounted_reward = 0
-
-            discounted_reward = reward + (self.config['ppo_gamma'] * discounted_reward)
-            rewards.insert(0, discounted_reward)
-
-        rewards = tensor(rewards, dtype = torch.float32, device = device)
+        rewards = tensor(self.buffer_rewards, dtype = torch.float32, device = device)
+        masks = ~tensor(self.buffer_is_terminals, dtype = torch.bool, device = device)
+        rewards = calc_returns(rewards, masks = masks, gamma = self.config['ppo_gamma'])
         rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
 
         old_states = stack(self.buffer_states).to(device).detach()
@@ -252,27 +244,26 @@ class PPOAgent(Module):
 
         advantages = rewards.detach() - old_values.detach()
 
+        if self.config['use_delightful_gating'] and exists(meta_temp):
+            with torch.no_grad():
+                delight_temp = meta_temp()
+        else:
+            delight_temp = self.config['delight_temp']
+
         for _ in range(self.config['ppo_k_epochs']):
             logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions)
 
-            policy_loss = ppo_actor_loss(logprobs, old_logprobs, advantages, self.config['ppo_eps_clip'])
-
-            if self.config['use_delightful_gating']:
-                surprisal = -logprobs.detach()
-                delight = advantages * surprisal
-
-                if exists(meta_temp):
-                    with torch.no_grad():
-                        temp = meta_temp()
-                else:
-                    temp = self.config['delight_temp']
-
-                gate = torch.sigmoid(delight / temp)
-                policy_loss = policy_loss * gate
-
-            policy_loss = policy_loss.mean()
+            policy_loss = ppo_actor_loss(
+                logprobs,
+                old_logprobs,
+                advantages,
+                self.config['ppo_eps_clip'],
+                delightful = self.config['use_delightful_gating'],
+                delight_temp = delight_temp
+            ).mean()
 
             value_loss = 0.5 * F.mse_loss(state_values, rewards)
+
             entropy_bonus = -self.entropy_coef * dist_entropy.mean()
 
             loss = policy_loss + value_loss + entropy_bonus

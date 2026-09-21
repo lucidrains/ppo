@@ -48,7 +48,7 @@ from hl_gauss_pytorch import HLGaussLoss
 
 from hyper_connections import ManifoldConstrainedHyperConnections
 
-from assoc_scan import AssocScan
+from x_ppo import calc_gae
 
 import gymnasium as gym
 
@@ -288,32 +288,7 @@ class Critic(Module):
 def log(t, eps = 1e-20):
     return t.clamp(min = eps).log()
 
-# GAE
 
-def calc_gae(
-    rewards,
-    values,
-    masks,
-    gamma = 0.99,
-    lam = 0.95,
-    use_accelerated = None
-):
-    assert values.shape[-1] == rewards.shape[-1]
-    use_accelerated = default(use_accelerated, rewards.is_cuda)
-
-    values = F.pad(values, (0, 1), value = 0.)
-    values, values_next = values[:-1], values[1:]
-
-    delta = rewards + gamma * values_next * masks - values
-    gates = gamma * lam * masks
-
-    scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
-
-    gae = scan(gates, delta)
-
-    returns = gae + values
-
-    return returns
 
 # agent
 
@@ -335,7 +310,6 @@ class PPO(Module):
         beta_s,
         regen_reg_rate,
         cautious_factor,
-        value_clip,
         ema_decay,
         kl_div_loss_weight = 0.1,
         ema_kwargs: dict = dict(
@@ -381,8 +355,6 @@ class PPO(Module):
         self.lam = lam
         self.gamma = gamma
         self.beta_s = beta_s
-
-        self.value_clip = value_clip
 
         self.kl_div_loss_weight = kl_div_loss_weight
 
@@ -499,40 +471,15 @@ class PPO(Module):
 
                 update_network_(policy_loss, self.opt_actor)
 
-                clip = self.value_clip
-
-                def update_critic(critic, old_values, opt_critic):
-                    # calculate clipped value loss and update value network separate from policy network
+                def update_critic(critic, opt_critic):
+                    # calculate value loss and update value network separate from policy network
 
                     values = critic(states)
-
-                    scalar_values = hl_gauss(values)
-
-                    # using the proposal from https://www.authorea.com/users/855021/articles/1240083-on-analysis-of-clipped-critic-loss-in-proximal-policy-gradient
-
-                    clipped_returns = returns.clamp(scalar_old_values - clip, scalar_old_values + clip)
-
-                    clipped_loss = hl_gauss(values, clipped_returns, reduction = 'none')
-                    loss = hl_gauss(values, returns, reduction = 'none')
-
-                    old_values_lo = scalar_old_values - clip
-                    old_values_hi = scalar_old_values + clip
-
-                    def is_between(mid, lo, hi):
-                        return (lo < mid) & (mid < hi)
-
-                    value_loss = torch.where(
-                        is_between(scalar_values, returns, old_values_lo) |
-                        is_between(scalar_values, old_values_hi, returns),
-                        0.,
-                        torch.min(loss, clipped_loss)
-                    )
-
-                    value_loss = value_loss.mean()
-
+                    value_loss = hl_gauss(values, returns).mean()
                     update_network_(value_loss, opt_critic)
 
-                update_critic(self.critic, old_values, self.opt_critic)
+                update_critic(self.critic, self.opt_critic)
+
 
         # update the state normalization with rsmnorm for 1 epoch after actor critic are updated
 
@@ -556,7 +503,6 @@ def main(
     betas = (0.9, 0.99),
     lam = 0.95,
     gamma = 0.99,
-    value_clip = 0.4,
     beta_s = .01,
     regen_reg_rate = 1e-4,
     kl_div_loss_weight = 0.1,
@@ -610,7 +556,6 @@ def main(
         beta_s,
         regen_reg_rate,
         cautious_factor,
-        value_clip,
         ema_decay,
         kl_div_loss_weight
     ).to(device)

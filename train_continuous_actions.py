@@ -4,10 +4,9 @@
 #   "torch-einops-utils>=0.1.24",
 #   "einops",
 #   "ema-pytorch",
-#   "adam-atan2-pytorch",
 #   "hl-gauss-pytorch",
-#   "hyper-connections",
 #   "assoc-scan",
+#   "mean-conc-beta",
 #   "gymnasium[box2d,other]",
 #   "moviepy",
 #   "memmap-replay-buffer",
@@ -19,6 +18,7 @@
 
 from __future__ import annotations
 
+import os
 import fire
 from pathlib import Path
 from shutil import rmtree
@@ -35,23 +35,19 @@ from torch import nn, tensor, cat, stack
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
 from torch.utils.data import TensorDataset, DataLoader
-from torch.distributions import Categorical, Beta, Normal, Kumaraswamy
-from torch.distributions.utils import broadcast_all
-from numbers import Number
+
+from mean_conc_beta import Beta as MeanConcBeta
 
 from einops import reduce, repeat, einsum, rearrange, pack
 
 from ema_pytorch import EMA
 
-from adam_atan2_pytorch.adopt_atan2 import AdoptAtan2
+from torch.optim import Adam
 
 from hl_gauss_pytorch import HLGaussLoss
+from torch_einops_utils import temp_eval
 
-from hyper_connections import ManifoldConstrainedHyperConnections
-
-from assoc_scan import AssocScan
-
-from x_ppo import ppo_actor_loss, spo_actor_loss
+from x_ppo import ppo_actor_loss, spo_actor_loss, calc_gae
 
 import gymnasium as gym
 
@@ -72,10 +68,16 @@ def default(v, d):
 def divisible_by(num, den):
     return (num % den) == 0
 
-def update_network_(loss, optimizer):
+def update_network_(loss, optimizer, params = None, max_grad_norm = None):
     optimizer.zero_grad()
     loss.mean().backward()
+
+    grad_norm = None
+    if exists(max_grad_norm) and exists(params):
+        grad_norm = torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
+
     optimizer.step()
+    return grad_norm
 
 
 # RSM Norm (not to be confused with RMSNorm from transformers)
@@ -128,25 +130,36 @@ class RSMNorm(Module):
 
         return normed
 
-# gradient dropout
+LinearNoBias = partial(nn.Linear, bias = False)
 
-class GradientDropout(Module):
+# enformer attention residual
+# attention residuals proposed by Guangyu (Nathan) Chen et al. with Kimi team (https://arxiv.org/abs/2603.15031)
+# using the attention pool designed by Žiga Avsec et al. in Enformer (https://www.nature.com/articles/s41592-021-01252-x)
+
+class EnformerAttentionResidual(Module):
     def __init__(
         self,
-        strength = 0. # increase for more dropout
+        dim,
+        *,
+        rank = 64
     ):
         super().__init__()
-        self.strength = strength
+        self.to_attn_logits = nn.Sequential(
+            LinearNoBias(dim, rank),
+            LinearNoBias(rank, dim)
+        )
 
-    def forward(self, x):
-        if not x.requires_grad or not self.training:
-            return x
+    def forward(
+        self,
+        block_outputs: list[Tensor] | Tensor
+    ):
+        block_outputs = list(block_outputs)
+        past_layers = rearrange(block_outputs, 'l b ... d -> b ... l d')
 
-        logit = torch.randn_like(x)
-        logit = logit + self.strength
-        mask = logit.sigmoid()
+        logits = self.to_attn_logits(past_layers)
+        attn = logits.softmax(dim = -2)
 
-        return x * (1. - mask) + x.detach() * mask
+        return einsum(past_layers, attn, 'b ... l d, b ... l d -> b ... d')
 
 # SimBa - Kaist + SonyAI
 
@@ -162,15 +175,12 @@ class SimBa(Module):
         dim_hidden = None,
         depth = 3,
         dropout = 0.,
-        expansion_factor = 2,
-        num_residual_streams = 4
+        expansion_factor = 2
     ):
         super().__init__()
         """
         following the design of SimBa https://arxiv.org/abs/2410.09754v1
         """
-
-        self.num_residual_streams = num_residual_streams
 
         dim_hidden = default(dim_hidden, dim * expansion_factor)
 
@@ -180,13 +190,9 @@ class SimBa(Module):
 
         dim_inner = dim_hidden * expansion_factor
 
-        # hyper connections
-
-        init_hyper_conn, self.expand_stream, self.reduce_stream = ManifoldConstrainedHyperConnections.get_init_and_expand_reduce_stream_functions(1, num_fracs = num_residual_streams, sinkhorn_iters = 2)
-
         for ind in range(depth):
 
-            layer = nn.Sequential(
+            block = nn.Sequential(
                 nn.RMSNorm(dim_hidden),
                 nn.Linear(dim_hidden, dim_inner),
                 ReluSquared(),
@@ -194,8 +200,9 @@ class SimBa(Module):
                 nn.Dropout(dropout),
             )
 
-            layer = init_hyper_conn(dim = dim_hidden, layer_index = ind, branch = layer)
-            layers.append(layer)
+            attn_residual = EnformerAttentionResidual(dim_hidden)
+
+            layers.append(ModuleList([block, attn_residual]))
 
         # final layer out
 
@@ -211,12 +218,12 @@ class SimBa(Module):
 
         x = self.proj_in(x)
 
-        x = self.expand_stream(x)
+        block_outputs = [x]
 
-        for layer in self.layers:
-            x = layer(x)
-
-        x = self.reduce_stream(x)
+        for block, attn_residual in self.layers:
+            x = block(x) + x
+            block_outputs.append(x)
+            x = attn_residual(block_outputs)
 
         out = self.final_norm(x)
 
@@ -233,13 +240,12 @@ class Actor(Module):
         state_dim,
         hidden_dim,
         action_dim,
-        distribution = 'kumaraswamy',
+        bounds = (-1., 1.),
         mlp_depth = 2,
         dropout = 0.1,
         rsmnorm_input = True,  # use the RSMNorm for inputs proposed by KAIST + SonyAI
     ):
         super().__init__()
-        self.distribution = distribution
         self.rsmnorm = RSMNorm(state_dim) if rsmnorm_input else nn.Identity()
 
         self.net = SimBa(
@@ -249,13 +255,20 @@ class Actor(Module):
             dropout = dropout
         )
 
-        self.grad_dropout = GradientDropout()
-
         self.action_head = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             ReluSquared(),
             nn.Linear(hidden_dim, action_dim * 2)
         )
+
+        # beta distribution parameterized by mean and concentration - https://github.com/lucidrains/mean-conc-beta
+
+        self.dist_module = MeanConcBeta(bounds = bounds, init_conc = 2., unimodal = True)
+
+    @temp_eval
+    def forward_eval(self, x):
+        with torch.no_grad():
+            return self.forward(x)
 
     def forward(self, x):
         with torch.no_grad():
@@ -264,19 +277,11 @@ class Actor(Module):
 
         hidden = self.net(x)
 
-        hidden = self.grad_dropout(hidden)
-
         out = self.action_head(hidden)
 
-        if self.distribution.lower() == 'gaussian':
-            loc, scale = out.chunk(2, dim = -1)
-            scale = F.softplus(scale) + 1e-3
-            return loc, scale
-        else:
-            alpha, beta = out.chunk(2, dim = -1)
-            alpha = F.softplus(alpha) + 1.0
-            beta = F.softplus(beta) + 1.0
-            return alpha, beta
+        params = rearrange(out, '... (a c) -> ... a c', c = 2)
+
+        return self.dist_module(params)
 
 class Critic(Module):
     def __init__(
@@ -299,9 +304,12 @@ class Critic(Module):
             dropout = dropout
         )
 
-        self.grad_dropout = GradientDropout()
-
         self.value_head = nn.Linear(hidden_dim, dim_pred)
+
+    @temp_eval
+    def forward_eval(self, x, past_action):
+        with torch.no_grad():
+            return self.forward(x, past_action)
 
     def forward(self, x, past_action):
 
@@ -312,38 +320,8 @@ class Critic(Module):
         x = torch.cat((x, past_action), dim = -1)
         hidden = self.net(x)
 
-        hidden = self.grad_dropout(hidden)
-
         value = self.value_head(hidden)
         return value
-
-# GAE
-
-def calc_gae(
-    rewards,
-    values,
-    masks,
-    gamma = 0.99,
-    lam = 0.95,
-    use_accelerated = None
-):
-    assert values.shape[-1] == rewards.shape[-1]
-    use_accelerated = default(use_accelerated, rewards.is_cuda)
-
-    values = F.pad(values, (0, 1), value = 0.)
-
-    values, values_next = values[..., :-1], values[..., 1:]
-
-    delta = rewards + gamma * values_next * masks - values
-    gates = gamma * lam * masks
-
-    scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
-
-    gae = scan(gates, delta)
-
-    returns = gae + values
-
-    return returns
 
 # agent
 
@@ -355,7 +333,7 @@ class PPO(Module):
         actor_hidden_dim,
         critic_hidden_dim,
         critic_pred_num_bins,
-        distribution,
+        bounds,
         reward_range: tuple[float, float],
         epochs,
         minibatch_size,
@@ -364,11 +342,9 @@ class PPO(Module):
         lam,
         gamma,
         beta_s,
-        regen_reg_rate,
-        cautious_factor,
         eps_clip,
-        value_clip,
         ema_decay,
+        max_grad_norm = 0.5,
         use_spo = False,
         asymmetric_spo = False,
         ema_kwargs: dict = dict(
@@ -377,9 +353,8 @@ class PPO(Module):
         save_path = './ppo.pt'
     ):
         super().__init__()
-        self.distribution = distribution.lower()
 
-        self.actor = Actor(state_dim, actor_hidden_dim, action_dim, distribution = distribution)
+        self.actor = Actor(state_dim, actor_hidden_dim, action_dim, bounds = bounds)
 
         self.critic = Critic(state_dim, critic_hidden_dim, action_dim, dim_pred = critic_pred_num_bins)
 
@@ -400,8 +375,8 @@ class PPO(Module):
         self.ema_actor = EMA(self.actor, beta = ema_decay, include_online_model = False, **ema_kwargs)
         self.ema_critic = EMA(self.critic, beta = ema_decay, include_online_model = False, **ema_kwargs)
 
-        self.opt_actor = AdoptAtan2(self.actor.parameters(), lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
-        self.opt_critic = AdoptAtan2(self.critic.parameters(), lr = lr, betas = betas, regen_reg_rate = regen_reg_rate, cautious_factor = cautious_factor)
+        self.opt_actor = Adam(self.actor.parameters(), lr = lr, betas = betas)
+        self.opt_critic = Adam(self.critic.parameters(), lr = lr, betas = betas)
 
         self.ema_actor.add_to_optimizer_post_step_hook(self.opt_actor)
         self.ema_critic.add_to_optimizer_post_step_hook(self.opt_critic)
@@ -417,7 +392,7 @@ class PPO(Module):
         self.beta_s = beta_s
 
         self.eps_clip = eps_clip
-        self.value_clip = value_clip
+        self.max_grad_norm = max_grad_norm
 
         self.use_spo = use_spo
         self.asymmetric_spo = asymmetric_spo # https://arxiv.org/abs/2510.06062v1
@@ -448,11 +423,11 @@ class PPO(Module):
         dl = memories.dataloader(
             batch_size = 4,
             return_indices = True,
-            to_named_tuple = ('_index', 'is_boundary', 'value', 'reward'),
+            to_named_tuple = ('_index', 'is_boundary', 'value', 'reward', '_lens'),
             device = device
         )
 
-        for indices, is_boundaries, values, rewards in dl:
+        for indices, is_boundaries, values, rewards, lens in dl:
 
             with torch.no_grad():
 
@@ -465,6 +440,7 @@ class PPO(Module):
                     lam = self.lam,
                     gamma = self.gamma,
                     values = scalar_values,
+                    lens = lens,
                     use_accelerated = False
                 )
 
@@ -492,13 +468,7 @@ class PPO(Module):
         for _ in range(self.epochs):
             for _, (states, actions, old_log_probs, returns, old_values, past_action) in enumerate(dl):
 
-                param1, param2 = self.actor(states)
-                if self.distribution == 'gaussian':
-                    dist = Normal(param1, param2)
-                elif self.distribution == 'beta':
-                    dist = Beta(param1, param2)
-                elif self.distribution == 'kumaraswamy':
-                    dist = Kumaraswamy(param1, param2)
+                dist = self.actor(states)
 
                 action_log_probs = dist.log_prob(actions).sum(dim = -1)
                 entropy = dist.entropy().sum(dim = -1)
@@ -516,42 +486,16 @@ class PPO(Module):
 
                 policy_loss = policy_loss - self.beta_s * entropy
 
-                update_network_(policy_loss, self.opt_actor)
+                update_network_(policy_loss, self.opt_actor, params = list(self.actor.parameters()), max_grad_norm = self.max_grad_norm)
 
-                clip = self.value_clip
-
-                def update_critic(critic, scalar_old_values, opt_critic):
-                    # calculate clipped value loss and update value network separate from policy network
+                def update_critic(critic, opt_critic):
+                    # calculate value loss and update value network separate from policy network
 
                     values = critic(states, past_action)
+                    value_loss = hl_gauss(values, returns).mean()
+                    update_network_(value_loss, opt_critic, params = list(critic.parameters()), max_grad_norm = self.max_grad_norm)
 
-                    scalar_values = hl_gauss(values)
-
-                    # using the proposal from https://www.authorea.com/users/855021/articles/1240083-on-analysis-of-clipped-critic-loss-in-proximal-policy-gradient
-
-                    clipped_returns = returns.clamp(scalar_old_values - clip, scalar_old_values + clip)
-
-                    clipped_loss = hl_gauss(values, clipped_returns, reduction = 'none')
-                    loss = hl_gauss(values, returns, reduction = 'none')
-
-                    old_values_lo = scalar_old_values - clip
-                    old_values_hi = scalar_old_values + clip
-
-                    def is_between(mid, lo, hi):
-                        return (lo < mid) & (mid < hi)
-
-                    value_loss = torch.where(
-                        is_between(scalar_values, returns, old_values_lo) |
-                        is_between(scalar_values, old_values_hi, returns),
-                        0.,
-                        torch.min(loss, clipped_loss)
-                    )
-
-                    value_loss = value_loss.mean()
-
-                    update_network_(value_loss, opt_critic)
-
-                update_critic(self.critic, scalar_old_values, self.opt_critic)
+                update_critic(self.critic, self.opt_critic)
 
         # update the state normalization with rsmnorm for 1 epoch after actor critic are updated
 
@@ -564,43 +508,45 @@ class PPO(Module):
 
 def main(
     env_name = 'LunarLander-v3',
-    num_episodes = 50000,
-    max_timesteps = 500,
+    num_episodes = 1000,
+    max_timesteps = None,
     actor_hidden_dim = 64,
     critic_hidden_dim = 256,
-    update_timesteps = 5000,
+    update_timesteps = 2048,
     buffer_episodes = 40,
     critic_pred_num_bins = 250,
-    distribution = 'kumaraswamy',
-    reward_range = (-100., 100.),
+    reward_range = (-300., 300.),
     minibatch_size = 64,
-    lr = 0.0008,
+    lr = 0.0005,
     betas = (0.9, 0.99),
     lam = 0.95,
     gamma = 0.99,
     eps_clip = 0.2,
-    value_clip = 0.4,
-    beta_s = .01,
-    regen_reg_rate = 1e-4,
-    cautious_factor = 0.1,
+    max_grad_norm = 0.5,
+    beta_s = 0.005,
     ema_decay = 0.9,
     use_spo = False,
     asymmetric_spo = False,
-    epochs = 2,
+    epochs = 4,
     seed = None,
-    render = True,
-    render_every_eps = 250,
+    render = False,
+    render_every_eps = 50,
+    log_every = 5,
     save_every = 1000,
     clear_videos = True,
     video_folder = './lunar-recording',
     load = False,
+    save_path = './ppo.pt',
     rolling_window_size = 100,
-    stop_at_reward = None
+    stop_at_reward = 200
 ):
-    if env_name == 'LunarLander-v3':
+    if env_name.startswith('LunarLander'):
         env = gym.make(env_name, render_mode = 'rgb_array', continuous = True)
     else:
         env = gym.make(env_name, render_mode = 'rgb_array')
+
+    if not exists(max_timesteps):
+        max_timesteps = 1000 if 'InvertedPendulum' in env_name else 500
 
     if render:
         if clear_videos:
@@ -616,6 +562,10 @@ def main(
 
     state_dim = int(env.observation_space.shape[0])
     action_dim = int(env.action_space.shape[0])
+
+    # action bounds - the beta distribution is defined directly on this range
+
+    action_bounds = np.stack([env.action_space.low, env.action_space.high], axis = -1)
 
     memories = ReplayBuffer(
         f"./{env_name.lower().replace('-v3', '')}-memories/past-action",
@@ -642,7 +592,7 @@ def main(
         actor_hidden_dim,
         critic_hidden_dim,
         critic_pred_num_bins,
-        distribution,
+        action_bounds,
         reward_range,
         epochs,
         minibatch_size,
@@ -651,13 +601,12 @@ def main(
         lam,
         gamma,
         beta_s,
-        regen_reg_rate,
-        cautious_factor,
         eps_clip,
-        value_clip,
         ema_decay,
+        max_grad_norm = max_grad_norm,
         use_spo = use_spo,
         asymmetric_spo = asymmetric_spo,
+        save_path = save_path
     ).to(device)
 
     if load:
@@ -673,11 +622,11 @@ def main(
     rolling_reward = deque(maxlen = rolling_window_size)
     rolling_steps = deque(maxlen = rolling_window_size)
 
-    pbar = tqdm(range(num_episodes), desc = f'episodes ({distribution})')
+    pbar = tqdm(range(num_episodes), desc = f'episodes ({env_name})')
     for eps in pbar:
 
         state, _ = env.reset(seed = seed)
-        state = torch.from_numpy(state).to(device)
+        state = torch.from_numpy(state).float().to(device)
 
         past_action = torch.zeros(action_dim).to(device)
 
@@ -688,34 +637,36 @@ def main(
             for timestep in range(max_timesteps):
                 time += 1
 
-                param1, param2 = agent.ema_actor.forward_eval(state)
-
-                if agent.distribution == 'gaussian':
-                    dist = Normal(param1, param2)
-                elif agent.distribution == 'beta':
-                    dist = Beta(param1, param2)
-                elif agent.distribution == 'kumaraswamy':
-                    dist = Kumaraswamy(param1, param2)
+                dist = agent.ema_actor.forward_eval(state)
 
                 action = dist.sample()
                 action_log_prob = dist.log_prob(action).sum(dim = -1)
 
-                if agent.distribution == 'gaussian':
-                    env_action = action.clamp(-1., 1.)
-                else:
-                    env_action = action * 2.0 - 1.0
+                env_action = action.clamp(action_bounds[:, 0].min(), action_bounds[:, 1].max())
                 env_action_item = env_action.cpu().numpy()
 
                 next_state, reward, terminated, truncated, _ = env.step(env_action_item)
 
-                next_state = torch.from_numpy(next_state).to(device)
+                next_state = torch.from_numpy(next_state).float().to(device)
 
-                # Custom reward scaling for LunarLander to help learning stability
+                # custom reward scaling for LunarLander to help learning stability
+
                 reward = float(reward)
                 eps_reward += reward
                 eps_steps += 1
-
                 value = agent.ema_critic.forward_eval(state, past_action)
+
+                # determine if truncating, either from environment or learning phase of the agent
+
+                updating_agent = divisible_by(time, update_timesteps)
+                done = terminated or truncated or updating_agent
+
+                # take care of truncated by bootstrapping the next value for GAE
+
+                if done and not terminated:
+                    next_value = agent.ema_critic.forward_eval(next_state, env_action)
+                    scalar_next_value = agent.critic_hl_gauss_loss(next_value).item()
+                    reward += agent.gamma * scalar_next_value
 
                 memory = memories.store(
                     learnable = True,
@@ -723,7 +674,7 @@ def main(
                     action = action,
                     action_log_prob = action_log_prob,
                     reward = reward,
-                    is_boundary = terminated,
+                    is_boundary = done,
                     value = value,
                     past_action = past_action
                 )
@@ -731,31 +682,12 @@ def main(
                 state = next_state
                 past_action = env_action
 
-                # determine if truncating, either from environment or learning phase of the agent
-
-                updating_agent = divisible_by(time, update_timesteps)
-                done = terminated or truncated or updating_agent
-
-                # take care of truncated by adding a non-learnable memory storing the next value for GAE
-
-                if done and not terminated:
-                    next_value = agent.ema_critic.forward_eval(state, past_action)
-
-                    bootstrap_value_memory = memory._replace(
-                        state = state,
-                        learnable = False,
-                        is_boundary = True,
-                        value = next_value,
-                        past_action = past_action
-                    )
-
-                    memories.store(**bootstrap_value_memory._asdict())
-
                 # updating of the agent
 
                 if updating_agent:
                     agent.learn(memories, device)
                     num_policy_updates += 1
+                    memories.clear()
 
                 # break if done
 
@@ -764,6 +696,9 @@ def main(
 
         rolling_reward.append(eps_reward)
         rolling_steps.append(eps_steps)
+
+        if divisible_by(eps, log_every):
+            print(f"Episode {eps:4d} | Avg reward: {np.mean(rolling_reward):+7.2f} | Ep reward: {eps_reward:+7.2f} | Ep steps: {eps_steps:3d}", flush = True)
 
         pbar.set_postfix(
             reward = f'{np.mean(rolling_reward):.2f}',

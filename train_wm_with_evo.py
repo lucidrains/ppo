@@ -68,7 +68,7 @@ from memmap_replay_buffer import ReplayBuffer
 
 from assoc_scan import AssocScan
 
-from x_ppo import ppo_actor_loss
+from x_ppo import ppo_actor_loss, calc_gae
 
 import gymnasium as gym
 
@@ -117,8 +117,7 @@ class WorldModelActorCritic(Module):
         dim_pred_state,
         frac_actor_critic_head_gradient = 0.5,
         entropy_weight = 0.02,
-        eps_clip = 0.2,
-        value_clip = 0.4
+        eps_clip = 0.2
     ):
         super().__init__()
         self.backbone_transformer = backbone_transformer
@@ -172,9 +171,6 @@ class WorldModelActorCritic(Module):
         self.eps_clip = eps_clip
         self.entropy_weight = entropy_weight
 
-        # clipped value loss related
-
-        self.value_clip = value_clip
 
     def compute_autoregressive_loss(
         self,
@@ -218,34 +214,9 @@ class WorldModelActorCritic(Module):
         self,
         values,
         returns,
-        old_values
+        old_values = None
     ):
-        clip, hl_gauss = self.value_clip, self.critic_hl_gauss_loss
-
-        scalar_old_values = hl_gauss(old_values)
-        scalar_values = hl_gauss(values)
-
-        # using the proposal from https://www.authorea.com/users/855021/articles/1240083-on-analysis-of-clipped-critic-loss-in-proximal-policy-gradient
-
-        clipped_returns = returns.clamp(scalar_old_values - clip, scalar_old_values + clip)
-
-        clipped_loss = hl_gauss(values, clipped_returns, reduction = 'none')
-        loss = hl_gauss(values, returns, reduction = 'none')
-
-        old_values_lo = scalar_old_values - clip
-        old_values_hi = scalar_old_values + clip
-
-        def is_between(mid, lo, hi):
-            return (lo < mid) & (mid < hi)
-
-        critic_loss = torch.where(
-            is_between(scalar_values, returns, old_values_lo) |
-            is_between(scalar_values, old_values_hi, returns),
-            0.,
-            torch.min(loss, clipped_loss)
-        )
-
-        return critic_loss
+        return self.critic_hl_gauss_loss(values, returns, reduction = 'none')
 
     def forward(
         self,
@@ -359,30 +330,7 @@ class RSMNorm(Module):
 # GAE
 
 @torch.no_grad()
-def calc_gae(
-    rewards,
-    values,
-    masks,
-    gamma = 0.99,
-    lam = 0.95,
-    use_accelerated = None
-):
-    assert values.shape[-1] == rewards.shape[-1]
-    use_accelerated = default(use_accelerated, rewards.is_cuda)
 
-    values = F.pad(values, (0, 1), value = 0.)
-    values, values_next = values[..., :-1], values[..., 1:]
-
-    delta = rewards + gamma * values_next * masks - values
-    gates = gamma * lam * masks
-
-    scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
-
-    gae = scan(gates, delta)
-
-    returns = gae + values
-
-    return returns
 
 # agent
 
@@ -404,7 +352,6 @@ class PPO(Module):
         regen_reg_rate,
         cautious_factor,
         eps_clip,
-        value_clip,
         ema_decay,
         hidden_dim = 32,
         backbone_depth = 1,
@@ -470,8 +417,7 @@ class PPO(Module):
             critic_min_max_value = reward_range,
             dim_pred_state = state_and_reward_dim,
             entropy_weight = beta_s,
-            eps_clip = eps_clip,
-            value_clip = value_clip
+            eps_clip = eps_clip
         )
 
         self.frac_actor_critic_head_gradient = frac_actor_critic_head_gradient
@@ -512,7 +458,6 @@ class PPO(Module):
         self.gamma = gamma
         self.beta_s = beta_s
         self.eps_clip = eps_clip
-        self.value_clip = value_clip
 
         self.save_path = Path(save_path)
 
@@ -695,7 +640,6 @@ def main(
     lam = 0.95,
     gamma = 0.99,
     eps_clip = 0.2,
-    value_clip = 0.4,
     beta_s = .01,
     regen_reg_rate = 1e-4,
     cautious_factor = 0.1,
@@ -784,7 +728,6 @@ def main(
         regen_reg_rate,
         cautious_factor,
         eps_clip,
-        value_clip,
         ema_decay,
         hidden_dim = hidden_dim,
         backbone_depth = backbone_depth,

@@ -56,7 +56,7 @@ from memmap_replay_buffer import ReplayBuffer
 
 from torch_einops_utils import z_score
 
-from x_ppo import ppo_actor_loss
+from x_ppo import ppo_actor_loss, calc_gae
 
 # constants
 
@@ -453,32 +453,7 @@ class Critic(Module):
         hidden, _ = self.net(x, time_embed_index = time_embed_index)
         return self.value_head(hidden)
 
-# GAE
 
-def calc_gae(
-    rewards,
-    values,
-    masks,
-    gamma = 0.99,
-    lam = 0.95,
-    use_accelerated = None
-):
-    assert values.shape[-1] == rewards.shape[-1]
-    use_accelerated = default(use_accelerated, rewards.is_cuda)
-
-    values = F.pad(values, (0, 1), value = 0.)
-    values, values_next = values[..., :-1], values[..., 1:]
-
-    delta = rewards + gamma * values_next * masks - values
-    gates = gamma * lam * masks
-
-    scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
-
-    gae = scan(gates, delta)
-
-    returns = gae + values
-
-    return returns
 
 def calc_internal_gae(
     rewards,
@@ -573,7 +548,6 @@ class PPO(Module):
         regen_reg_rate,
         cautious_factor,
         eps_clip,
-        value_clip,
         ema_decay,
         actor_depth = 6,
         critic_depth = 6,
@@ -678,7 +652,6 @@ class PPO(Module):
         self.beta_s = beta_s
 
         self.eps_clip = eps_clip
-        self.value_clip = value_clip
 
         self.internal_policy_loss_weight = internal_policy_loss_weight
         self.internal_action_dim = internal_action_dim
@@ -874,50 +847,19 @@ class PPO(Module):
 
                 update_network_(policy_loss, self.opt_actor_inner, self.opt_actor_outer, phase)
 
-                # calculate clipped value loss and update value network separate from policy network
-
-                clip = self.value_clip
+                # calculate value loss and update value network separate from policy network
 
                 values = self.critic(states, time_embed_index = time_embed_indices)
-                scalar_values = hl_gauss(values)
-
-                def is_between(mid, lo, hi):
-                    return (lo < mid) & (mid < hi)
-
-                def calc_value_loss(scalar_values, scalar_old_values, returns, values):
-                    clipped_returns = returns.clamp(scalar_old_values - clip, scalar_old_values + clip)
-                    clipped_loss = hl_gauss(values, clipped_returns, reduction = 'none')
-                    loss = hl_gauss(values, returns, reduction = 'none')
-
-                    old_values_lo = scalar_old_values - clip
-                    old_values_hi = scalar_old_values + clip
-
-                    return where(
-                        is_between(scalar_values, returns, old_values_lo) |
-                        is_between(scalar_values, old_values_hi, returns),
-                        0.,
-                        torch.min(loss, clipped_loss)
-                    )
-
-                value_loss_main = calc_value_loss(scalar_values, scalar_old_values, returns, values)
+                value_loss_main = hl_gauss(values, returns, reduction = 'none')
 
                 sampled_mask = is_internal_action_sampled
                 if sampled_mask.any():
                     sampled_states = states[sampled_mask]
                     sampled_times = time_embed_indices[sampled_mask]
                     sampled_internal_values = self.internal_critic(sampled_states, time_embed_index = sampled_times)
-                    sampled_scalar_internal = hl_gauss(sampled_internal_values)
-
-                    sampled_old_internal = hl_gauss(old_internal_values[sampled_mask])
-                    sampled_returns = internal_returns[sampled_mask]
-
-                    sampled_loss_inner = calc_value_loss(
-                        sampled_scalar_internal,
-                        sampled_old_internal,
-                        sampled_returns,
-                        sampled_internal_values
-                    )
+                    sampled_loss_inner = hl_gauss(sampled_internal_values, internal_returns[sampled_mask], reduction = 'none')
                     value_loss_inner_sum = sampled_loss_inner.sum()
+
                 else:
                     value_loss_inner_sum = zeros((1,), device=states.device)
 
@@ -1265,7 +1207,6 @@ def main(
     gamma = 0.99,
     gamma_inner = 0.99,
     eps_clip = 0.2,
-    value_clip = 0.4,
     beta_s = .01,
     regen_reg_rate = 1e-4,
     cautious_factor = 0.1,
@@ -1337,7 +1278,7 @@ def main(
         epochs, minibatch_size, gae_batch_size,
         lr, betas, lam, gamma, gamma_inner, beta_s,
         regen_reg_rate, cautious_factor,
-        eps_clip, value_clip, ema_decay,
+        eps_clip, ema_decay,
         actor_depth = actor_depth,
         critic_depth = critic_depth,
         num_internal_actions = num_internal_actions,

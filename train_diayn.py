@@ -33,7 +33,7 @@ import gymnasium as gym
 
 from memmap_replay_buffer import ReplayBuffer
 
-from x_ppo import ppo_actor_loss, spo_actor_loss
+from x_ppo import ppo_actor_loss, spo_actor_loss, calc_gae
 
 # constants
 
@@ -283,27 +283,6 @@ class Discriminator(Module):
 
 # GAE via associative scan
 
-def calc_gae(
-    rewards,
-    values,
-    masks,
-    gamma = 0.99,
-    lam = 0.95,
-    use_accelerated = None
-):
-    assert values.shape[-1] == rewards.shape[-1]
-    use_accelerated = default(use_accelerated, rewards.is_cuda)
-
-    values = F.pad(values, (0, 1), value = 0.)
-    values, values_next = values[..., :-1], values[..., 1:]
-
-    delta = rewards + gamma * values_next * masks - values
-    gates = gamma * lam * masks
-
-    scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
-    gae = scan(gates, delta)
-
-    return gae + values
 
 # agent
 
@@ -327,7 +306,6 @@ class PPO(Module):
         regen_reg_rate,
         cautious_factor,
         eps_clip,
-        value_clip,
         ema_decay,
         use_spo = False,
         asymmetric_spo = False,
@@ -389,7 +367,6 @@ class PPO(Module):
         self.beta_s = beta_s
 
         self.eps_clip = eps_clip
-        self.value_clip = value_clip
 
         self.use_spo = use_spo
         self.asymmetric_spo = asymmetric_spo # https://arxiv.org/abs/2510.06062v1
@@ -510,32 +487,14 @@ class PPO(Module):
                 update_network_(policy_loss, self.opt_actor)
                 total_policy_loss += policy_loss.mean().item()
 
-                # critic - clipped value loss
-                # https://www.authorea.com/users/855021/articles/1240083-on-analysis-of-clipped-critic-loss-in-proximal-policy-gradient
+                # critic - value loss
 
-                clip = self.value_clip
                 values = self.critic(states, skills)
-                scalar_values = hl_gauss(values)
-
-                clipped_returns = returns.clamp(scalar_old_values - clip, scalar_old_values + clip)
-
-                clipped_loss = hl_gauss(values, clipped_returns, reduction = 'none')
-                loss = hl_gauss(values, returns, reduction = 'none')
-
-                old_values_lo = scalar_old_values - clip
-                old_values_hi = scalar_old_values + clip
-
-                is_between = lambda mid, lo, hi: (lo < mid) & (mid < hi)
-
-                value_loss = torch.where(
-                    is_between(scalar_values, returns, old_values_lo) |
-                    is_between(scalar_values, old_values_hi, returns),
-                    0.,
-                    torch.min(loss, clipped_loss)
-                ).mean()
+                value_loss = hl_gauss(values, returns).mean()
 
                 update_network_(value_loss, self.opt_critic)
                 total_value_loss += value_loss.item()
+
 
                 # discriminator
 
@@ -607,7 +566,6 @@ def main(
     lam = 0.95,
     gamma = 0.99,
     eps_clip = 0.2,
-    value_clip = 0.4,
     beta_s = .01,
     regen_reg_rate = 1e-4,
     cautious_factor = 0.1,
@@ -685,7 +643,6 @@ def main(
         regen_reg_rate,
         cautious_factor,
         eps_clip,
-        value_clip,
         ema_decay,
         use_spo = use_spo,
         asymmetric_spo = asymmetric_spo,

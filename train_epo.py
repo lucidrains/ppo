@@ -47,7 +47,7 @@ from assoc_scan import AssocScan
 from memmap_replay_buffer import ReplayBuffer
 from evolutionary_policy_optimization import LatentGenePool
 
-from x_ppo import ppo_actor_loss
+from x_ppo import ppo_actor_loss, calc_gae
 
 # helpers
 
@@ -201,36 +201,6 @@ class Critic(Module):
 
         return self.value_head(hidden)
 
-# GAE
-
-def calc_gae(
-    rewards,
-    values,
-    masks,
-    gamma = 0.99,
-    lam = 0.95,
-    use_accelerated = None
-):
-    assert values.shape[-1] == rewards.shape[-1]
-    use_accelerated = default(use_accelerated, rewards.is_cuda)
-
-    rewards, ps = pack([rewards], '* n')
-    values, _ = pack([values], '* n')
-    masks, _ = pack([masks], '* n')
-
-    values = F.pad(values, (0, 1), value = 0.)
-
-    values, values_next = values[..., :-1], values[..., 1:]
-
-    delta = rewards + gamma * values_next * masks - values
-    gates = gamma * lam * masks
-
-    scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
-
-    gae = scan(gates, delta)
-
-    ret = gae + values
-    return unpack(ret, ps, '* n')[0]
 
 # agent
 
@@ -254,7 +224,6 @@ class PPO(Module):
         regen_reg_rate,
         cautious_factor,
         eps_clip,
-        value_clip,
         ema_decay,
         max_grad_norm = 0.5,
         ema_kwargs: dict = dict(
@@ -297,7 +266,6 @@ class PPO(Module):
         self.beta_s = beta_s
 
         self.eps_clip = eps_clip
-        self.value_clip = value_clip
         self.max_grad_norm = max_grad_norm
 
         self.save_path = Path(save_path)
@@ -376,27 +344,11 @@ class PPO(Module):
 
                 # update critic
 
-                def is_between(mid, lo, hi):
-                    return (lo < mid) & (mid < hi)
-
                 values = self.critic(states, past_action, latent = latents)
-                scalar_values = hl_gauss(values)
-
-                clipped_returns = returns.clamp(scalar_old_values - self.value_clip, scalar_old_values + self.value_clip)
-
-                clipped_loss = hl_gauss(values, clipped_returns, reduction = 'none')
-                loss = hl_gauss(values, returns, reduction = 'none')
-
-                value_loss = torch.where(
-                    is_between(scalar_values, returns, scalar_old_values - self.value_clip) |
-                    is_between(scalar_values, scalar_old_values + self.value_clip, returns),
-                    0.,
-                    torch.min(loss, clipped_loss)
-                )
-
-                value_loss = value_loss.mean()
+                value_loss = hl_gauss(values, returns).mean()
 
                 update_network_(value_loss, self.opt_critic, self.critic, max_grad_norm = self.max_grad_norm)
+
 
                 total_policy_loss += policy_loss.item()
                 total_value_loss += value_loss.item()
@@ -426,7 +378,6 @@ def main(
     lam = 0.95,
     gamma = 0.99,
     eps_clip = 0.2,
-    value_clip = 0.4,
     beta_s = .01,
     regen_reg_rate = 1e-4,
     cautious_factor = 0.1,
@@ -538,7 +489,6 @@ def main(
         regen_reg_rate,
         cautious_factor,
         eps_clip,
-        value_clip,
         ema_decay,
         max_grad_norm = max_grad_norm
     ).to(device)

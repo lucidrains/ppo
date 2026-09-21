@@ -32,12 +32,11 @@ from torch.utils.data import TensorDataset, DataLoader
 from torch.optim import AdamW
 
 from einops import reduce, rearrange
-from assoc_scan import AssocScan
 import gymnasium as gym
 
 from vector_quantize_pytorch import BinaryMapper
 
-from x_ppo import ppo_actor_loss
+from x_ppo import ppo_actor_loss, calc_gae
 
 # constants
 
@@ -185,15 +184,6 @@ class Critic(Module):
 
 # ppo trainer
 
-def calc_gae(rewards, values, masks, gamma = 0.99, lam = 0.95):
-    values = F.pad(values, (0, 1), value = 0.)
-    values, values_next = values[:-1], values[1:]
-
-    delta = rewards + gamma * values_next * masks - values
-    gates = gamma * lam * masks
-
-    scan = AssocScan(reverse = True, use_accelerated = False)
-    return scan(gates, delta) + values
 
 class PPO(Module):
     def __init__(

@@ -45,13 +45,11 @@ from hl_gauss_pytorch import HLGaussLoss
 
 from hyper_connections import ManifoldConstrainedHyperConnections
 
-from assoc_scan import AssocScan
-
 from torch_einops_utils import z_score
 
 import gymnasium as gym
 
-from x_ppo import ppo_actor_loss, spo_actor_loss
+from x_ppo import ppo_actor_loss, spo_actor_loss, calc_gae
 
 # constants
 
@@ -374,32 +372,6 @@ def simba_orthogonal_loss(
 
     return loss
 
-# GAE
-
-def calc_gae(
-    rewards,
-    values,
-    masks,
-    gamma = 0.99,
-    lam = 0.95,
-    use_accelerated = None
-):
-    assert values.shape[-1] == rewards.shape[-1]
-    use_accelerated = default(use_accelerated, rewards.is_cuda)
-
-    values = F.pad(values, (0, 1), value = 0.)
-    values, values_next = values[:-1], values[1:]
-
-    delta = rewards + gamma * values_next * masks - values
-    gates = gamma * lam * masks
-
-    scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
-
-    gae = scan(gates, delta)
-
-    returns = gae + values
-
-    return returns
 
 # agent
 
@@ -426,7 +398,6 @@ class PPO(Module):
         cautious_factor,
         use_post_decision_critic,
         eps_clip,
-        value_clip,
         ema_decay,
         use_spo = False,
         asymmetric_spo = False,
@@ -487,7 +458,6 @@ class PPO(Module):
         self.beta_s = beta_s
 
         self.eps_clip = eps_clip
-        self.value_clip = value_clip
 
         self.spectral_entropy_reg = spectral_entropy_reg
         self.apply_spectral_entropy_every = apply_spectral_entropy_every
@@ -622,46 +592,21 @@ class PPO(Module):
 
                 update_network_(policy_loss, self.opt_actor)
 
-                clip = self.value_clip
-
-                def update_critic(critic, scalar_old_values, opt_critic):
-                    # calculate clipped value loss and update value network separate from policy network
+                def update_critic(critic, opt_critic):
+                    # calculate value loss and update value network separate from policy network
 
                     values = critic(states)
-
-                    scalar_values = hl_gauss(values)
-
-                    # using the proposal from https://www.authorea.com/users/855021/articles/1240083-on-analysis-of-clipped-critic-loss-in-proximal-policy-gradient
-
-                    clipped_returns = returns.clamp(scalar_old_values - clip, scalar_old_values + clip)
-
-                    clipped_loss = hl_gauss(values, clipped_returns, reduction = 'none')
-                    loss = hl_gauss(values, returns, reduction = 'none')
-
-                    old_values_lo = scalar_old_values - clip
-                    old_values_hi = scalar_old_values + clip
-
-                    def is_between(mid, lo, hi):
-                        return (lo < mid) & (mid < hi)
-
-                    value_loss = torch.where(
-                        is_between(scalar_values, returns, old_values_lo) |
-                        is_between(scalar_values, old_values_hi, returns),
-                        0.,
-                        torch.min(loss, clipped_loss)
-                    )
-
-                    value_loss = value_loss.mean() + simba_orthogonal_loss(critic)
+                    value_loss = hl_gauss(values, returns).mean() + simba_orthogonal_loss(critic)
 
                     if self.spectral_entropy_reg and divisible_by(i, self.apply_spectral_entropy_every):
                         value_loss = value_loss + model_spectral_entropy_loss(critic) * self.spectral_entropy_reg_weight
 
                     update_network_(value_loss, opt_critic)
 
-                update_critic(self.critic, scalar_old_values, self.opt_critic)
+                update_critic(self.critic, self.opt_critic)
 
                 if use_post_decision:
-                    update_critic(self.post_critic, scalar_old_post_values, self.opt_post_critic)
+                    update_critic(self.post_critic, self.opt_post_critic)
 
         # update the state normalization with rsmnorm for 1 epoch after actor critic are updated
 
@@ -686,7 +631,6 @@ def main(
     lam = 0.95,
     gamma = 0.99,
     eps_clip = 0.2,
-    value_clip = 0.4,
     beta_s = .01,
     regen_reg_rate = 1e-4,
     use_post_decision_critic = True,
@@ -749,7 +693,6 @@ def main(
         cautious_factor,
         use_post_decision_critic,
         eps_clip,
-        value_clip,
         ema_decay,
         use_spo = use_spo,
         asymmetric_spo = asymmetric_spo,

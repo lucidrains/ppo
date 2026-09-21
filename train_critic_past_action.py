@@ -54,7 +54,7 @@ from memmap_replay_buffer import ReplayBuffer
 
 from torch_einops_utils import z_score
 
-from x_ppo import ppo_actor_loss, spo_actor_loss
+from x_ppo import ppo_actor_loss, spo_actor_loss, calc_gae
 
 # constants
 
@@ -373,33 +373,7 @@ class Critic(Module):
         value = self.value_head(hidden)
         return value
 
-# GAE
 
-def calc_gae(
-    rewards,
-    values,
-    masks,
-    gamma = 0.99,
-    lam = 0.95,
-    use_accelerated = None
-):
-    assert values.shape[-1] == rewards.shape[-1]
-    use_accelerated = default(use_accelerated, rewards.is_cuda)
-
-    values = F.pad(values, (0, 1), value = 0.)
-
-    values, values_next = values[..., :-1], values[..., 1:]
-
-    delta = rewards + gamma * values_next * masks - values
-    gates = gamma * lam * masks
-
-    scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
-
-    gae = scan(gates, delta)
-
-    returns = gae + values
-
-    return returns
 
 # agent
 
@@ -422,7 +396,6 @@ class PPO(Module):
         regen_reg_rate,
         cautious_factor,
         eps_clip,
-        value_clip,
         ema_decay,
         use_spo = False,
         asymmetric_spo = False,
@@ -499,7 +472,6 @@ class PPO(Module):
         self.main_policy_loss_weight = main_policy_loss_weight
 
         self.eps_clip = eps_clip
-        self.value_clip = value_clip
 
         self.use_spo = use_spo
         self.asymmetric_spo = asymmetric_spo # https://arxiv.org/abs/2510.06062v1
@@ -608,40 +580,15 @@ class PPO(Module):
 
                 update_network_(policy_loss, self.opt_actor)
 
-                clip = self.value_clip
-
-                def update_critic(critic, scalar_old_values, opt_critic):
-                    # calculate clipped value loss and update value network separate from policy network
+                def update_critic(critic, opt_critic):
+                    # calculate value loss and update value network separate from policy network
 
                     values = critic(states, past_action)
-
-                    scalar_values = hl_gauss(values)
-
-                    # using the proposal from https://www.authorea.com/users/855021/articles/1240083-on-analysis-of-clipped-critic-loss-in-proximal-policy-gradient
-
-                    clipped_returns = returns.clamp(scalar_old_values - clip, scalar_old_values + clip)
-
-                    clipped_loss = hl_gauss(values, clipped_returns, reduction = 'none')
-                    loss = hl_gauss(values, returns, reduction = 'none')
-
-                    old_values_lo = scalar_old_values - clip
-                    old_values_hi = scalar_old_values + clip
-
-                    def is_between(mid, lo, hi):
-                        return (lo < mid) & (mid < hi)
-
-                    value_loss = torch.where(
-                        is_between(scalar_values, returns, old_values_lo) |
-                        is_between(scalar_values, old_values_hi, returns),
-                        0.,
-                        torch.min(loss, clipped_loss)
-                    )
-
-                    value_loss = value_loss.mean()
-
+                    value_loss = hl_gauss(values, returns).mean()
                     update_network_(value_loss, opt_critic)
 
-                update_critic(self.critic, scalar_old_values, self.opt_critic)
+                update_critic(self.critic, self.opt_critic)
+
 
         # update the state normalization with rsmnorm for 1 epoch after actor critic are updated
 
@@ -675,7 +622,6 @@ def main(
     lam = 0.95,
     gamma = 0.99,
     eps_clip = 0.2,
-    value_clip = 0.4,
     beta_s = .01,
     regen_reg_rate = 1e-4,
     next_state_value_weight = 0.1,
@@ -750,7 +696,6 @@ def main(
         regen_reg_rate,
         cautious_factor,
         eps_clip,
-        value_clip,
         ema_decay,
         use_spo = use_spo,
         asymmetric_spo = asymmetric_spo,
