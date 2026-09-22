@@ -17,6 +17,7 @@ from torch_einops_utils import (
     pad_right_at_dim,
     pad_right_ndim_to,
     batched_index_select,
+    tree_map_tensor,
     tree_map_tensor_to_device,
     masked_reduce
 )
@@ -145,6 +146,17 @@ def calc_gae(
     return_advantages: bool = False
 ) -> Tensor | GAE:
     device, dtype = rewards.device, rewards.dtype
+
+    # handle single sequence input, with no batch dimension
+
+    is_single_sequence = rewards.ndim == 1
+
+    if is_single_sequence:
+        rewards, values, masks, done_masks, next_values, gamma, lam = tree_map_tensor(
+            lambda t: t[None] if t.ndim == 1 else t,
+            (rewards, values, masks, done_masks, next_values, gamma, lam)
+        )
+
     grouped = rewards.ndim > 2
 
     # canonicalize grouped inputs to (b g n), with shared value heads broadcast across groups
@@ -236,10 +248,12 @@ def calc_gae(
     if grouped:
         returns = returns.movedim(-2, group_dim)
 
+    remove_batch_dim = lambda t: t[0] if is_single_sequence else t
+
     # early return if advantages are not needed
 
     if not return_advantages:
-        return returns
+        return remove_batch_dim(returns)
 
     # combine grouped advantages, if weights are given
 
@@ -247,6 +261,8 @@ def calc_gae(
         gae = combine_grouped_advantages(gae, weights = weights, normalize = normalize_grouped, group_dim = -2, mask = done_masks)
     elif grouped:
         gae = gae.movedim(-2, group_dim)
+
+    returns, gae = tree_map_tensor(remove_batch_dim, (returns, gae))
 
     return GAE(returns, gae)
 
@@ -260,6 +276,16 @@ def calc_returns(
     lens: Tensor | None = None,               # (b)
     use_accelerated: bool | None = None
 ) -> Tensor:                                  # (b n)
+    # handle single sequence input, with no batch dimension
+
+    is_single_sequence = rewards.ndim == 1
+
+    if is_single_sequence:
+        rewards, masks, gamma = tree_map_tensor(
+            lambda t: t[None] if t.ndim == 1 else t,
+            (rewards, masks, gamma)
+        )
+
     device, dtype, seq_len = rewards.device, rewards.dtype, rewards.shape[-1]
 
     masks = default(masks, 1.)
@@ -299,6 +325,9 @@ def calc_returns(
 
     if exists(len_mask):
         returns = returns.masked_fill(~len_mask, 0.)
+
+    if is_single_sequence:
+        return returns[0]
 
     return returns
 

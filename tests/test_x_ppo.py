@@ -565,3 +565,43 @@ def test_value_clipping_masked_and_lens():
     assert loss_adv.ndim == 0 and loss_adv >= 0.
     loss_adv.backward()
     assert values.grad is not None
+
+
+# single sequence, no batch dimension
+
+def test_gae_single_sequence():
+    seq_len = 16
+    rewards = torch.randn(seq_len)
+    values = torch.randn(seq_len)
+    masks = (torch.rand(seq_len) > 0.1).float()
+    next_value = 2.5
+
+    returns, advantages = calc_gae(rewards, values, masks = masks, next_value = next_value, use_accelerated = False, return_advantages = True)
+
+    batched = calc_gae(rewards[None], values[None], masks = masks[None], next_value = next_value, use_accelerated = False, return_advantages = True)
+
+    assert returns.shape == rewards.shape
+    assert advantages.shape == rewards.shape
+
+    assert torch.allclose(returns, batched.returns[0], atol = 1e-5)
+    assert torch.allclose(advantages, batched.advantages[0], atol = 1e-5)
+
+    # a tensor next value with batch size 1 is also valid
+
+    tensor_next = calc_gae(rewards, values, masks = masks, next_value = torch.tensor([next_value]), use_accelerated = False)
+    assert torch.allclose(tensor_next, batched.returns[0], atol = 1e-5)
+
+def test_calc_returns_single_sequence():
+    seq_len = 16
+    rewards = torch.randn(seq_len)
+    masks = (torch.rand(seq_len) > 0.1).float()
+    next_value = 2.5
+
+    returns = calc_returns(rewards, masks = masks, next_value = next_value, use_accelerated = False)
+    batched_returns = calc_returns(rewards[None], masks = masks[None], next_value = next_value, use_accelerated = False)
+
+    assert returns.shape == rewards.shape
+    assert torch.allclose(returns, batched_returns[0], atol = 1e-5)
+
+    tensor_next_returns = calc_returns(rewards, masks = masks, next_value = torch.tensor([next_value]), use_accelerated = False)
+    assert torch.allclose(tensor_next_returns, batched_returns[0], atol = 1e-5)
