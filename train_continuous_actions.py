@@ -6,7 +6,7 @@
 #   "ema-pytorch",
 #   "hl-gauss-pytorch",
 #   "assoc-scan",
-#   "mean-conc-beta",
+#   "mean-conc-beta>=0.1.5",
 #   "gymnasium[box2d,other]",
 #   "moviepy",
 #   "memmap-replay-buffer",
@@ -31,7 +31,7 @@ import numpy as np
 from tqdm import tqdm
 
 import torch
-from torch import nn, tensor, cat, stack
+from torch import nn, tensor, cat, stack, Tensor
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
 from torch.utils.data import TensorDataset, DataLoader
@@ -78,7 +78,6 @@ def update_network_(loss, optimizer, params = None, max_grad_norm = None):
 
     optimizer.step()
     return grad_norm
-
 
 # RSM Norm (not to be confused with RMSNorm from transformers)
 # this was proposed by SimBa https://arxiv.org/abs/2410.09754
@@ -128,38 +127,55 @@ class RSMNorm(Module):
             self.running_mean.copy_(new_mean)
             self.running_variance.copy_(new_variance)
 
-        return normed
+# attention residual - enformer pooling with pre-rmsnorm on keys
 
 LinearNoBias = partial(nn.Linear, bias = False)
 
-# enformer attention residual
-# attention residuals proposed by Guangyu (Nathan) Chen et al. with Kimi team (https://arxiv.org/abs/2603.15031)
-# using the attention pool designed by Žiga Avsec et al. in Enformer (https://www.nature.com/articles/s41592-021-01252-x)
+# LoRA - https://arxiv.org/abs/2106.09685
 
-class EnformerAttentionResidual(Module):
+class LoRA(Module):
     def __init__(
         self,
         dim,
-        *,
-        rank = 64
+        r = 16
     ):
         super().__init__()
-        self.to_attn_logits = nn.Sequential(
-            LinearNoBias(dim, rank),
-            LinearNoBias(rank, dim)
+        self.down = LinearNoBias(dim, r)
+        self.up = LinearNoBias(r, dim)
+
+    def forward(self, x):
+        return self.up(self.down(x))
+
+# uncompetitive sigmoid attention residual
+
+class AttentionResidual(Module):
+    def __init__(
+        self,
+        dim,
+        lora_rank = 16
+    ):
+        super().__init__()
+        self.scale = dim ** -0.5
+
+        self.pseudo_query = nn.Parameter(torch.zeros(dim))
+        self.to_keys = nn.Sequential(
+            nn.RMSNorm(dim),
+            LoRA(dim, r = lora_rank),
+            nn.RMSNorm(dim)
         )
 
     def forward(
         self,
-        block_outputs: list[Tensor] | Tensor
+        past_deltas: list[Tensor] | Tensor
     ):
-        block_outputs = list(block_outputs)
-        past_layers = rearrange(block_outputs, 'l b ... d -> b ... l d')
+        stacked = torch.stack(list(past_deltas), dim = 0)
+        keys = self.to_keys(stacked)
 
-        logits = self.to_attn_logits(past_layers)
-        attn = logits.softmax(dim = -2)
+        logits = einsum(self.pseudo_query, keys, 'd, l b ... d -> l b ...') * self.scale
 
-        return einsum(past_layers, attn, 'b ... l d, b ... l d -> b ... d')
+        weights = 2.0 * torch.sigmoid(logits) # uncompetitive sigmoid attention
+
+        return einsum(weights, stacked, 'l b ..., l b ... d -> b ... d')
 
 # SimBa - Kaist + SonyAI
 
@@ -175,12 +191,16 @@ class SimBa(Module):
         dim_hidden = None,
         depth = 3,
         dropout = 0.,
-        expansion_factor = 2
+        expansion_factor = 2,
+        use_attn_residual = True,
+        lora_rank = 16
     ):
         super().__init__()
         """
         following the design of SimBa https://arxiv.org/abs/2410.09754v1
         """
+
+        self.use_attn_residual = use_attn_residual
 
         dim_hidden = default(dim_hidden, dim * expansion_factor)
 
@@ -197,16 +217,16 @@ class SimBa(Module):
                 nn.Linear(dim_hidden, dim_inner),
                 ReluSquared(),
                 nn.Linear(dim_inner, dim_hidden),
-                nn.Dropout(dropout),
+                nn.Dropout(dropout)
             )
 
-            attn_residual = EnformerAttentionResidual(dim_hidden)
+            attn_residual = AttentionResidual(dim_hidden, lora_rank = lora_rank) if use_attn_residual else None
 
-            layers.append(ModuleList([block, attn_residual]))
-
-        # final layer out
+            layers.append(ModuleList([block, attn_residual]) if use_attn_residual else block)
 
         self.layers = ModuleList(layers)
+
+        self.final_attn = AttentionResidual(dim_hidden, lora_rank = lora_rank) if use_attn_residual else None
 
         self.final_norm = nn.RMSNorm(dim_hidden)
 
@@ -218,12 +238,18 @@ class SimBa(Module):
 
         x = self.proj_in(x)
 
-        block_outputs = [x]
+        if not self.use_attn_residual:
+            for block in self.layers:
+                x = block(x) + x
+        else:
+            deltas = [x]
 
-        for block, attn_residual in self.layers:
-            x = block(x) + x
-            block_outputs.append(x)
-            x = attn_residual(block_outputs)
+            for block, attn_residual in self.layers:
+                h = attn_residual(deltas)
+                res = block(h)
+                deltas.append(res)
+
+            x = self.final_attn(deltas)
 
         out = self.final_norm(x)
 
@@ -244,6 +270,8 @@ class Actor(Module):
         mlp_depth = 2,
         dropout = 0.1,
         rsmnorm_input = True,  # use the RSMNorm for inputs proposed by KAIST + SonyAI
+        use_attn_residual = True,
+        beta_eps = 1e-5
     ):
         super().__init__()
         self.rsmnorm = RSMNorm(state_dim) if rsmnorm_input else nn.Identity()
@@ -252,7 +280,8 @@ class Actor(Module):
             state_dim,
             dim_hidden = hidden_dim * 2,
             depth = mlp_depth,
-            dropout = dropout
+            dropout = dropout,
+            use_attn_residual = use_attn_residual
         )
 
         self.action_head = nn.Sequential(
@@ -263,7 +292,7 @@ class Actor(Module):
 
         # beta distribution parameterized by mean and concentration - https://github.com/lucidrains/mean-conc-beta
 
-        self.dist_module = MeanConcBeta(bounds = bounds, init_conc = 2., unimodal = True)
+        self.dist_module = MeanConcBeta(bounds = bounds, init_conc = 2., unimodal = True, eps = beta_eps)
 
     @temp_eval
     def forward_eval(self, x):
@@ -293,6 +322,7 @@ class Critic(Module):
         mlp_depth = 6, # recent paper has findings that show scaling critic is more important than scaling actor
         dropout = 0.1,
         rsmnorm_input = True,
+        use_attn_residual = True
     ):
         super().__init__()
         self.rsmnorm = RSMNorm(state_dim) if rsmnorm_input else nn.Identity()
@@ -301,7 +331,8 @@ class Critic(Module):
             state_dim + action_dim,
             dim_hidden = hidden_dim,
             depth = mlp_depth,
-            dropout = dropout
+            dropout = dropout,
+            use_attn_residual = use_attn_residual
         )
 
         self.value_head = nn.Linear(hidden_dim, dim_pred)
@@ -347,6 +378,10 @@ class PPO(Module):
         max_grad_norm = 0.5,
         use_spo = False,
         asymmetric_spo = False,
+        actor_depth = 2,
+        critic_depth = 6,
+        use_attn_residual = True,
+        beta_eps = 1e-5,
         ema_kwargs: dict = dict(
             update_model_with_ema_every = 1000
         ),
@@ -354,9 +389,27 @@ class PPO(Module):
     ):
         super().__init__()
 
-        self.actor = Actor(state_dim, actor_hidden_dim, action_dim, bounds = bounds)
+        self.actor = Actor(
+            state_dim,
+            actor_hidden_dim,
+            action_dim,
+            bounds = bounds,
+            mlp_depth = actor_depth,
+            use_attn_residual = use_attn_residual,
+            beta_eps = beta_eps
+        )
 
-        self.critic = Critic(state_dim, critic_hidden_dim, action_dim, dim_pred = critic_pred_num_bins)
+        self.critic = Critic(
+            state_dim,
+            critic_hidden_dim,
+            action_dim,
+            dim_pred = critic_pred_num_bins,
+            mlp_depth = critic_depth,
+            use_attn_residual = use_attn_residual
+        )
+
+        self.last_actor_grad_norm = 0.
+        self.last_critic_grad_norm = 0.
 
         # weight tie rsmnorm
 
@@ -486,16 +539,16 @@ class PPO(Module):
 
                 policy_loss = policy_loss - self.beta_s * entropy
 
-                update_network_(policy_loss, self.opt_actor, params = list(self.actor.parameters()), max_grad_norm = self.max_grad_norm)
+                actor_grad_norm = update_network_(policy_loss, self.opt_actor, params = list(self.actor.parameters()), max_grad_norm = self.max_grad_norm)
 
-                def update_critic(critic, opt_critic):
-                    # calculate value loss and update value network separate from policy network
+                values = self.critic(states, past_action)
+                value_loss = hl_gauss(values, returns).mean()
+                critic_grad_norm = update_network_(value_loss, self.opt_critic, params = list(self.critic.parameters()), max_grad_norm = self.max_grad_norm)
 
-                    values = critic(states, past_action)
-                    value_loss = hl_gauss(values, returns).mean()
-                    update_network_(value_loss, opt_critic, params = list(critic.parameters()), max_grad_norm = self.max_grad_norm)
-
-                update_critic(self.critic, self.opt_critic)
+                if exists(actor_grad_norm):
+                    self.last_actor_grad_norm = actor_grad_norm.item()
+                if exists(critic_grad_norm):
+                    self.last_critic_grad_norm = critic_grad_norm.item()
 
         # update the state normalization with rsmnorm for 1 epoch after actor critic are updated
 
@@ -512,6 +565,10 @@ def main(
     max_timesteps = None,
     actor_hidden_dim = 64,
     critic_hidden_dim = 256,
+    actor_depth = 2,
+    critic_depth = 6,
+    use_attn_residual = True,
+    beta_eps = 1e-5,
     update_timesteps = 2048,
     buffer_episodes = 40,
     critic_pred_num_bins = 250,
@@ -606,6 +663,10 @@ def main(
         max_grad_norm = max_grad_norm,
         use_spo = use_spo,
         asymmetric_spo = asymmetric_spo,
+        actor_depth = actor_depth,
+        critic_depth = critic_depth,
+        use_attn_residual = use_attn_residual,
+        beta_eps = beta_eps,
         save_path = save_path
     ).to(device)
 
@@ -698,11 +759,13 @@ def main(
         rolling_steps.append(eps_steps)
 
         if divisible_by(eps, log_every):
-            print(f"Episode {eps:4d} | Avg reward: {np.mean(rolling_reward):+7.2f} | Ep reward: {eps_reward:+7.2f} | Ep steps: {eps_steps:3d}", flush = True)
+            print(f"Episode {eps:4d} | Avg reward: {np.mean(rolling_reward):+7.2f} | Ep reward: {eps_reward:+7.2f} | Ep steps: {eps_steps:3d} | a_grad: {agent.last_actor_grad_norm:.2f} | c_grad: {agent.last_critic_grad_norm:.2f}", flush = True)
 
         pbar.set_postfix(
             reward = f'{np.mean(rolling_reward):.2f}',
-            steps = f'{np.mean(rolling_steps):.1f}'
+            steps = f'{np.mean(rolling_steps):.1f}',
+            a_grad = f'{agent.last_actor_grad_norm:.2f}',
+            c_grad = f'{agent.last_critic_grad_norm:.2f}'
         )
 
         if divisible_by(eps, save_every):
@@ -711,6 +774,8 @@ def main(
         if exists(stop_at_reward) and len(rolling_reward) >= rolling_window_size and np.mean(rolling_reward) >= stop_at_reward:
             print(f"Rolling reward reached {stop_at_reward}, stopping training.")
             break
+
+    agent.save()
 
 if __name__ == '__main__':
     fire.Fire(main)
