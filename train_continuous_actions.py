@@ -146,7 +146,7 @@ class LoRA(Module):
     def forward(self, x):
         return self.up(self.down(x))
 
-# uncompetitive sigmoid attention residual
+# attention residual
 
 class AttentionResidual(Module):
     def __init__(
@@ -173,7 +173,7 @@ class AttentionResidual(Module):
 
         logits = einsum(self.pseudo_query, keys, 'd, l b ... d -> l b ...') * self.scale
 
-        weights = 2.0 * torch.sigmoid(logits) # uncompetitive sigmoid attention
+        weights = logits.softmax(dim = 0)
 
         return einsum(weights, stacked, 'l b ..., l b ... d -> b ... d')
 
