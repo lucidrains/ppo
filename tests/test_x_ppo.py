@@ -16,26 +16,50 @@ from x_ppo import (
 
 param = pytest.mark.parametrize
 
+from functools import partial
+
+# helpers
+
+def exists(val):
+    return val is not None
+
+@param('loss_fn', (ppo_actor_loss, spo_actor_loss, partial(spo_actor_loss, asymmetric = True)))
+@param('eps_clip', (0.2, (0.2, 0.3)))
+@param('dual_clip', (False, True))
 @param('normalize_advantages', (False, True))
 @param('delightful', (False, True))
 @param('use_mask', (False, True))
 def test_actor_loss(
+    loss_fn,
+    eps_clip,
+    dual_clip,
     normalize_advantages,
     delightful,
     use_mask
 ):
     batch, seq = 2, 4
 
-    action_log_probs = torch.randn(batch, seq, requires_grad = True)
-    old_action_log_probs = torch.randn(batch, seq)
-    advantages = torch.randn(batch, seq)
-
+    rewards = torch.randn(batch, seq)
+    values = torch.randn(batch, seq)
     mask = lens_to_mask(torch.tensor([2, 4]), seq) if use_mask else None
 
-    loss = ppo_actor_loss(
+    returns, advantages = calc_gae(
+        rewards,
+        values,
+        masks = mask,
+        return_advantages = True,
+        use_accelerated = False
+    )
+
+    action_log_probs = torch.randn(batch, seq, requires_grad = True)
+    old_action_log_probs = torch.randn(batch, seq)
+
+    loss = loss_fn(
         action_log_probs,
         old_action_log_probs,
         advantages,
+        eps_clip = eps_clip,
+        dual_clip = dual_clip,
         mask = mask,
         normalize_advantages = normalize_advantages,
         delightful = delightful
@@ -43,39 +67,7 @@ def test_actor_loss(
 
     loss.sum().backward()
 
-    assert action_log_probs.grad is not None
-
-@param('asymmetric', (False, True))
-@param('normalize_advantages', (False, True))
-@param('delightful', (False, True))
-@param('use_mask', (False, True))
-def test_spo_actor_loss(
-    asymmetric,
-    normalize_advantages,
-    delightful,
-    use_mask
-):
-    batch, seq = 2, 4
-
-    action_log_probs = torch.randn(batch, seq, requires_grad = True)
-    old_action_log_probs = torch.randn(batch, seq)
-    advantages = torch.randn(batch, seq)
-
-    mask = lens_to_mask(torch.tensor([2, 4]), seq) if use_mask else None
-
-    loss = spo_actor_loss(
-        action_log_probs,
-        old_action_log_probs,
-        advantages,
-        mask = mask,
-        normalize_advantages = normalize_advantages,
-        delightful = delightful,
-        asymmetric = asymmetric
-    )
-
-    loss.sum().backward()
-
-    assert action_log_probs.grad is not None
+    assert exists(action_log_probs.grad)
 
 # GAE vs Sequential Ground Truth
 
@@ -558,13 +550,13 @@ def test_value_clipping_masked_and_lens():
     loss_std = clipped_value_loss_fn(values, old_values, returns, lens = lens)
     assert loss_std.ndim == 0 and loss_std >= 0.
     loss_std.backward()
-    assert values.grad is not None
+    assert exists(values.grad)
 
     values.grad = None
     loss_adv = improved_value_clipping_fn(values, old_values, returns, lens = lens)
     assert loss_adv.ndim == 0 and loss_adv >= 0.
     loss_adv.backward()
-    assert values.grad is not None
+    assert exists(values.grad)
 
 
 # single sequence, no batch dimension

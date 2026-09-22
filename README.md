@@ -233,3 +233,16 @@ $ python train.py
     url     = {https://arxiv.org/abs/2605.10044},
 }
 ```
+
+```bibtex
+@inproceedings{ye2020mastering,
+    title   = {Mastering Complex Control in MOBA Games with Deep Reinforcement Learning},
+    author  = {Deheng Ye and Zhao Liu and Mingfei Sun and Bei Shi and Peilin Zhao and Hao Wu and Hongsheng Yu and Shaojie Yang and Xipeng Wu and Qingwei Guo and Qiaobo Chen and Yinyuting Yin and Hao Zhang and Tengfei Shi and Liang Wang and Qiang Fu and Wei Yang and Lanxiao Huang},
+    booktitle = {Proceedings of the AAAI Conference on Artificial Intelligence},
+    volume  = {34},
+    number  = {04},
+    pages   = {6672--6679},
+    year    = {2020},
+    url     = {https://arxiv.org/abs/1912.09729}
+}
+```
