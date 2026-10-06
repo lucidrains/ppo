@@ -246,3 +246,13 @@ $ python train.py
     url     = {https://arxiv.org/abs/1912.09729}
 }
 ```
+
+```bibtex
+@inproceedings{sharma2020dynamics,
+    title   = {Dynamics-Aware Unsupervised Discovery of Skills},
+    author  = {Archit Sharma and Shixiang Gu and Sergey Levine and Vikash Kumar and Karol Hausman},
+    booktitle = {International Conference on Learning Representations},
+    year    = {2020},
+    url     = {https://arxiv.org/abs/1907.01657}
+}
+```
