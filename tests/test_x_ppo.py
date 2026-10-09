@@ -28,6 +28,7 @@ def exists(val):
 @param('dual_clip', (False, True))
 @param('normalize_advantages', (False, True))
 @param('delightful', (False, True))
+@param('log_ratio_clamp', (None, (-20., 20.)))
 @param('use_mask', (False, True))
 def test_actor_loss(
     loss_fn,
@@ -35,6 +36,7 @@ def test_actor_loss(
     dual_clip,
     normalize_advantages,
     delightful,
+    log_ratio_clamp,
     use_mask
 ):
     batch, seq = 2, 4
@@ -62,12 +64,41 @@ def test_actor_loss(
         dual_clip = dual_clip,
         mask = mask,
         normalize_advantages = normalize_advantages,
-        delightful = delightful
+        delightful = delightful,
+        log_ratio_clamp = log_ratio_clamp
     )
 
     loss.sum().backward()
 
     assert exists(action_log_probs.grad)
+
+def test_log_ratio_clamp_prevents_overflow():
+    action_log_probs = torch.tensor([200., -200.], requires_grad = True)
+    old_action_log_probs = torch.zeros(2)
+    advantages = torch.tensor([-1., 1.])
+
+    loss = ppo_actor_loss(action_log_probs, old_action_log_probs, advantages, log_ratio_clamp = (-20., 20.))
+
+    assert torch.isfinite(loss).all()
+
+    loss.sum().backward()
+
+    assert torch.isfinite(action_log_probs.grad).all()
+
+@param('loss_fn', (ppo_actor_loss, spo_actor_loss))
+def test_actor_loss_fp32(loss_fn):
+    action_log_probs = torch.randn(2, 4)
+    old_action_log_probs = torch.randn(2, 4)
+    advantages = torch.randn(2, 4)
+
+    with torch.autocast(device_type = 'cpu', dtype = torch.bfloat16):
+        loss = loss_fn(action_log_probs, old_action_log_probs, advantages)
+
+    assert loss.dtype == torch.float32
+
+    loss = loss_fn(action_log_probs.half(), old_action_log_probs.half(), advantages.half())
+
+    assert loss.dtype == torch.float32
 
 # GAE vs Sequential Ground Truth
 

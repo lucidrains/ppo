@@ -1,7 +1,7 @@
 import torch
 from torch_einops_utils import z_score, masked_mean
 
-from x_ppo.ppo import ppo_actor_loss, cast_tuple
+from x_ppo.ppo import calc_ratios, cast_tuple, force_fp32, ppo_actor_loss
 
 # helpers
 
@@ -10,6 +10,7 @@ def exists(val):
 
 # simple policy optimization - Xie et al. https://arxiv.org/abs/2401.16025
 
+@force_fp32
 def spo_actor_loss(
     action_log_probs,
     old_action_log_probs,
@@ -21,7 +22,8 @@ def spo_actor_loss(
     delight_temp = 1.,
     asymmetric = False,
     dual_clip = False,
-    dual_clip_threshold = 3.
+    dual_clip_threshold = 3.,
+    log_ratio_clamp = None
 ):
     if normalize_advantages:
         advantages = z_score(advantages, mask = mask)
@@ -32,7 +34,7 @@ def spo_actor_loss(
         gate = (-action_log_probs * advantages / delight_temp).sigmoid().detach()
         advantages = advantages * gate
 
-    ratios = (action_log_probs - old_action_log_probs).exp()
+    ratios = calc_ratios(action_log_probs, old_action_log_probs, log_ratio_clamp)
 
     # decoupled clipping - Zhou et al. https://arxiv.org/abs/2503.14476
 
@@ -60,7 +62,8 @@ def spo_actor_loss(
             advantages,
             eps_clip = eps_clip,
             dual_clip = dual_clip,
-            dual_clip_threshold = dual_clip_threshold
+            dual_clip_threshold = dual_clip_threshold,
+            log_ratio_clamp = log_ratio_clamp
         )
         loss = torch.where(advantages > 0, ppo_loss, loss)
 
