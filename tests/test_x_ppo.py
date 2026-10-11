@@ -1,5 +1,6 @@
 import pytest
 import torch
+from torch import cat, tensor
 from torch_einops_utils import lens_to_mask
 
 from x_ppo import (
@@ -9,7 +10,6 @@ from x_ppo import (
     calc_returns,
     combine_grouped_advantages,
     dones_to_masks,
-    GAE,
     clipped_value_loss_fn,
     improved_value_clipping_fn
 )
@@ -628,3 +628,39 @@ def test_calc_returns_single_sequence():
 
     tensor_next_returns = calc_returns(rewards, masks = masks, next_value = torch.tensor([next_value]), use_accelerated = False)
     assert torch.allclose(tensor_next_returns, batched_returns[0], atol = 1e-5)
+
+# per sequence discount factors
+
+@param('grouped', (False, True))
+def test_gae_per_sample_discounts(grouped):
+    b, n = 3, 6
+    shape = (b, 2, n) if grouped else (b, n)
+    rewards = torch.randn(*shape)
+    values = torch.randn(*shape)
+    masks = torch.ones(b, n)
+    gammas = tensor([0.9, 0.99, 0.999])
+    lams = tensor([0.5, 0.8, 0.95])
+    kwargs = dict(group_dim = 1) if grouped else dict()
+
+    out = calc_gae(rewards, values, masks = masks, gamma = gammas, lam = lams, use_accelerated = False, return_advantages = True, **kwargs)
+
+    per_sample = [
+        calc_gae(rewards[i:i + 1], values[i:i + 1], masks = masks[i:i + 1], gamma = gammas[i].item(), lam = lams[i].item(), use_accelerated = False, return_advantages = True, **kwargs)
+        for i in range(b)
+    ]
+
+    assert torch.allclose(out.returns, cat([p.returns for p in per_sample]), atol = 1e-5)
+    assert torch.allclose(out.advantages, cat([p.advantages for p in per_sample]), atol = 1e-5)
+
+def test_calc_returns_per_sample_gamma():
+    b, t = 3, 8
+    rewards = torch.randn(b, t)
+    masks = (torch.rand(b, t) > 0.2).float()
+    gammas = tensor([0.9, 0.99, 0.999])
+    next_value = torch.randn(b)
+
+    out = calc_returns(rewards, masks = masks, gamma = gammas, next_value = next_value, use_accelerated = False)
+
+    expected = cat([calc_returns(rewards[i:i + 1], masks = masks[i:i + 1], gamma = gammas[i].item(), next_value = next_value[i:i + 1], use_accelerated = False) for i in range(b)])
+
+    assert torch.allclose(out, expected, atol = 1e-5)

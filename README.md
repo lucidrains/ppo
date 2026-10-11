@@ -20,11 +20,92 @@ You may need to install `swig`
 $ apt install swig
 ```
 
-## Use
+## Usage
+
+Training
 
 ```bash
 $ python train.py
 ```
+
+### actor loss
+
+Clipped surrogate - Schulman et al.
+
+```python
+import torch
+from x_ppo import ppo_actor_loss
+
+action_log_probs = torch.randn(2, 8, requires_grad = True)
+old_action_log_probs = torch.randn(2, 8)
+advantages = torch.randn(2, 8)
+
+loss = ppo_actor_loss(action_log_probs, old_action_log_probs, advantages)
+
+loss.mean().backward()
+```
+
+### critic loss
+
+Clipped value regression - Schulman et al.
+
+```python
+import torch
+from x_ppo import clipped_value_loss_fn
+
+values = torch.randn(2, 8, requires_grad = True)
+old_values = torch.randn(2, 8)
+returns = torch.randn(2, 8)
+
+loss = clipped_value_loss_fn(values, old_values, returns)
+
+loss.backward()
+```
+
+### advantages
+
+Generalized advantage estimation - Schulman et al.
+
+```python
+from x_ppo import calc_gae
+
+# rewards and values - (b n), masks - (b n)
+
+returns, advantages = calc_gae(rewards, values, masks = masks, return_advantages = True)
+
+actor_loss = ppo_actor_loss(action_log_probs, old_action_log_probs, advantages, mask = masks)
+critic_loss = clipped_value_loss_fn(new_values, old_values, returns, mask = masks)
+```
+
+### multi-critic
+
+One value network per reward group, each group's advantages normalized separately before combination - Mysore et al., Vijayan et al.
+
+```python
+from torch import tensor
+from x_ppo import calc_gae, combine_grouped_advantages, ppo_actor_loss, clipped_value_loss_fn
+
+# rewards and values - (b g n), one value head per reward group
+
+gae = calc_gae(rewards, values, masks = masks, group_dim = 1, return_advantages = True)
+
+# normalize each group, then combine with weights - (g)
+
+weights = tensor([1., 0.5, 0.25])
+advantages = combine_grouped_advantages(gae.advantages, weights = weights, group_dim = 1, mask = masks)
+
+actor_loss = ppo_actor_loss(action_log_probs, old_action_log_probs, advantages, mask = masks)
+
+# each value head regresses its own group's returns
+
+critic_loss = clipped_value_loss_fn(new_values, values, gae.returns, mask = masks)
+
+# or fold the combination into calc_gae
+
+gae = calc_gae(rewards, values, masks = masks, weights = weights, group_dim = 1, return_advantages = True)
+```
+
+`spo_actor_loss` and `improved_value_clipping_fn` are drop-in alternatives to the actor and critic losses above, and `combine_grouped_advantages` accepts a `reduce` of `'sum'`, `'max'`, `'min'` or a custom callable
 
 ## Citations
 
@@ -254,5 +335,52 @@ $ python train.py
     booktitle = {International Conference on Learning Representations},
     year    = {2020},
     url     = {https://arxiv.org/abs/1907.01657}
+}
+```
+
+```bibtex
+@inproceedings{mysore2022multicritic,
+    title   = {Multi-Critic Actor Learning: Teaching RL Policies to Act with Style},
+    author  = {Siddharth Mysore and George Cheng and Yunqi Zhao and Kate Saenko and Meng Wu},
+    booktitle = {International Conference on Learning Representations},
+    year    = {2022},
+    url     = {https://openreview.net/forum?id=rJvY_5OzoI}
+}
+```
+
+```bibtex
+@article{vijayan2025multicritic,
+    title   = {Multi-critic Learning for Whole-body End-effector Twist Tracking},
+    author  = {Aravind Elanjimattathil Vijayan and Andrei Cramariuc and Mattia Risiglione and Christian Gehring and Marco Hutter},
+    journal = {arXiv preprint arXiv:2507.08656},
+    year    = {2025}
+}
+```
+
+```bibtex
+@article{huang2025host,
+    title   = {Learning Humanoid Standing-up Control across Diverse Postures},
+    author  = {Huang, Tao and Ren, Junli and Wang, Huayi and Wang, Zirui and Ben, Qingwei and Wen, Muning and Chen, Xiao and Li, Jianan and Pang, Jiangmiao},
+    journal = {arXiv preprint arXiv:2502.08378},
+    year    = {2025}
+}
+```
+
+```bibtex
+@inproceedings{schaul2015universal,
+    title   = {Universal Value Function Approximators},
+    author  = {Tom Schaul and Daniel Horgan and Karol Gregor and David Silver},
+    booktitle = {International Conference on Machine Learning},
+    year    = {2015},
+    url     = {https://proceedings.mlr.press/v37/schaul15.html}
+}
+```
+
+```bibtex
+@article{farebrother2026jumpy,
+    title   = {Compositional Planning with Jumpy World Models},
+    author  = {Jesse Farebrother and Matteo Pirotta and Andrea Tirinzoni and Marc G. Bellemare and Alessandro Lazaric and Ahmed Touati},
+    journal = {arXiv preprint arXiv:2602.19634},
+    year    = {2026}
 }
 ```

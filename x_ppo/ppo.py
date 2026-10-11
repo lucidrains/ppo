@@ -4,6 +4,8 @@ import torch
 from torch import is_tensor
 from torch_einops_utils import z_score, masked_mean
 
+from x_ppo.values import resolve_grouped_mask
+
 # helpers
 
 def exists(val):
@@ -52,8 +54,11 @@ def ppo_actor_loss(
     delight_temp = 1.,
     dual_clip = False,
     dual_clip_threshold = 3.,
-    log_ratio_clamp = None
+    log_ratio_clamp = None,
+    group_dim = -2
 ):
+    mask = resolve_grouped_mask(advantages, action_log_probs, mask, group_dim)
+
     if normalize_advantages:
         advantages = z_score(advantages, mask = mask)
 

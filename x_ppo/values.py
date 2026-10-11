@@ -47,6 +47,18 @@ def align_grouped_next_value(next_value, group_dim, ndim):
 
     return next_value.movedim(0, -1) if group_dim in (0, -ndim) else next_value
 
+def align_grouped_mask(
+    mask: Tensor | None,
+    ndim: int,
+    group_dim: int = -2
+) -> Tensor | None:
+    # (b n) -> (b 1 n) or (b n 1), broadcastable against values / advantages grouped over critics
+
+    if not is_tensor(mask) or mask.ndim >= ndim:
+        return mask
+
+    return mask.unsqueeze(group_dim)
+
 def lens_to_last_mask(lens, max_len):
     # (b n) one hot mask at each sequence's last valid timestep
 
@@ -81,19 +93,35 @@ def dones_to_masks(
     return term_mask, done_mask
 
 # grouped advantages (multi-critic)
+# each reward group gets its own value network - normalize each group before combining, else reward scale dominates
+# https://openreview.net/forum?id=rJvY_5OzoI
+# https://arxiv.org/abs/2507.08656
+
+def resolve_grouped_mask(
+    advantages: Tensor,
+    action_log_probs: Tensor,
+    mask: Tensor | None = None,
+    group_dim: int = -2
+) -> Tensor | None:
+    # grouped advantages must first be combined into a single advantage, unless log probs are grouped in the same layout
+
+    if advantages.ndim > action_log_probs.ndim:
+        raise ValueError('advantages is grouped over multiple critics - combine with `combine_grouped_advantages` first')
+
+    return align_grouped_mask(mask, advantages.ndim, group_dim)
 
 def combine_grouped_advantages(
     advantages: Tensor,                       # (b n g) or (b g n)
-    weights: Tensor | None = None,            # (g)
+    weights: Tensor | None = None,            # (g) - weights each group before 'sum' / callable reductions, renormalized for 'mean'
     normalize: bool = True,
     group_dim: int = -2,
     mask: Tensor | None = None,               # (b n)
+    reduce: str | Callable = 'mean',          # 'sum' | 'mean' | 'max' | 'min', or callable receiving (g ...) and returning (...)
     eps: float = 1e-5
 ) -> Tensor:                                  # (b n)
     assert advantages.ndim >= 2, 'advantages must have at least 2 dimensions'
 
-    if is_tensor(mask) and mask.ndim < advantages.ndim:
-        mask = mask.unsqueeze(group_dim)
+    mask = align_grouped_mask(mask, advantages.ndim, group_dim)
 
     if normalize:
         adv_groups = advantages.movedim(group_dim, 0)
@@ -101,11 +129,27 @@ def combine_grouped_advantages(
         normed = z_score(adv_groups, dim = tuple(range(1, adv_groups.ndim)), mask = mask_groups, eps = eps)
         advantages = normed.movedim(0, group_dim)
 
-    if not exists(weights):
-        return advantages.mean(dim = group_dim)
+    # group first
 
-    weights = as_tensor(weights, device = advantages.device, dtype = advantages.dtype)
-    return advantages.movedim(group_dim, -1) @ weights
+    grouped = advantages.movedim(group_dim, 0)
+
+    weight = None
+    if exists(weights):
+        weight = pad_right_ndim_to(as_tensor(weights, device = grouped.device, dtype = grouped.dtype), grouped.ndim)
+
+    if callable(reduce):
+        return reduce(grouped if not exists(weight) else grouped * weight)
+
+    # masked reductions accept continuous weights
+    # for 'mean' the weights act as importance and are renormalized, making it invariant to their scale
+
+    if reduce in ('sum', 'mean'):
+        return masked_reduce(grouped, mode = reduce, mask = weight, dim = 0, eps = eps)
+
+    if reduce in ('max', 'min'):
+        return grouped.amax(dim = 0) if reduce == 'max' else grouped.amin(dim = 0)
+
+    raise ValueError(f'unknown reduce mode {reduce}')
 
 # scans
 
@@ -133,14 +177,15 @@ def calc_gae(
     rewards: Tensor,                          # (b n) or (b n g)
     values: Tensor,                           # (b n) or (b n + 1) or (b n g)
     masks: Tensor | None = None,              # (b n)
-    gamma: float | Tensor = 0.99,
-    lam: float | Tensor = 0.95,
+    gamma: float | Tensor = 0.99,             # () or (b)
+    lam: float | Tensor = 0.95,               # () or (b)
     done_masks: Tensor | None = None,         # (b n)
     next_value: float | Tensor | None = None, # () or (b) or (b g)
     next_values: Tensor | None = None,        # (b n) or (b n g)
     lens: Tensor | None = None,               # (b)
     weights: Tensor | None = None,            # (g)
     normalize_grouped: bool = True,
+    group_reduce: str | Callable = 'mean',
     group_dim: int = -2,
     use_accelerated: bool | None = None,
     return_advantages: bool = False
@@ -229,6 +274,10 @@ def calc_gae(
     if is_tensor(masks):
         next_values = next_values.masked_fill(masks == 0., 0.)
 
+    # discount factors and lambdas may differ across the batch
+
+    gamma, lam = tree_map_tensor(lambda t: pad_right_ndim_to(t, rewards.ndim), (gamma, lam))
+
     delta = rewards + gamma * next_values * masks - values
 
     if exists(len_mask):
@@ -258,7 +307,7 @@ def calc_gae(
     # combine grouped advantages, if weights are given
 
     if exists(weights):
-        gae = combine_grouped_advantages(gae, weights = weights, normalize = normalize_grouped, group_dim = -2, mask = done_masks)
+        gae = combine_grouped_advantages(gae, weights = weights, normalize = normalize_grouped, group_dim = -2, mask = done_masks, reduce = group_reduce)
     elif grouped:
         gae = gae.movedim(-2, group_dim)
 
@@ -271,7 +320,7 @@ def calc_gae(
 def calc_returns(
     rewards: Tensor,                          # (b n)
     masks: Tensor | None = None,              # (b n)
-    gamma: float | Tensor = 0.99,
+    gamma: float | Tensor = 0.99,             # () or (b)
     next_value: float | Tensor | None = None, # () or (b)
     lens: Tensor | None = None,               # (b)
     use_accelerated: bool | None = None
@@ -320,6 +369,9 @@ def calc_returns(
 
     # scan
 
+    if is_tensor(gamma):
+        gamma = pad_right_ndim_to(gamma, rewards.ndim)
+
     gates = as_tensor(gamma * masks, device = device, dtype = dtype).expand_as(rewards)
     returns = reverse_assoc_scan(gates, rewards, use_accelerated)
 
@@ -333,6 +385,22 @@ def calc_returns(
 
 # value clipping functions
 
+def resolve_value_mask(
+    values: Tensor,
+    mask: Tensor | None,
+    lens: Tensor | None,
+    group_dim: int
+) -> Tensor | None:
+    if exists(lens):
+        # time is the last dimension, unless the group dimension trails it
+
+        max_len = values.shape[-2] if group_dim == -1 and values.ndim > 2 else values.shape[-1]
+        mask = default(mask, lens_to_mask(lens, max_len = max_len))
+
+    # grouped values - one value head per reward group - align the mask against the group dimension
+
+    return align_grouped_mask(mask, values.ndim, group_dim)
+
 # classic clipped value loss - Schulman et al.
 
 def clipped_value_loss_fn(
@@ -343,10 +411,10 @@ def clipped_value_loss_fn(
     loss_fn: Callable = F.mse_loss,
     mask: Tensor | None = None,
     lens: Tensor | None = None,
+    group_dim: int = -2,
     reduction: str = 'mean'
 ) -> Tensor:
-    if exists(lens):
-        mask = default(mask, lens_to_mask(lens, max_len = values.shape[-1]))
+    mask = resolve_value_mask(values, mask, lens, group_dim)
 
     clipped_values = old_values + (values - old_values).clamp(-clip, clip)
 
@@ -369,10 +437,10 @@ def improved_value_clipping_fn(
     scalar_old_values: Tensor | None = None,
     mask: Tensor | None = None,
     lens: Tensor | None = None,
+    group_dim: int = -2,
     reduction: str = 'mean'
 ) -> Tensor:
-    if exists(lens):
-        mask = default(mask, lens_to_mask(lens, max_len = values.shape[-1]))
+    mask = resolve_value_mask(values, mask, lens, group_dim)
 
     scalar_values = default(scalar_values, values)
     scalar_old_values = default(scalar_old_values, old_values)

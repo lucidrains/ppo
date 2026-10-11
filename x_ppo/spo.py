@@ -2,6 +2,7 @@ import torch
 from torch_einops_utils import z_score, masked_mean
 
 from x_ppo.ppo import calc_ratios, cast_tuple, force_fp32, ppo_actor_loss
+from x_ppo.values import resolve_grouped_mask
 
 # helpers
 
@@ -23,8 +24,11 @@ def spo_actor_loss(
     asymmetric = False,
     dual_clip = False,
     dual_clip_threshold = 3.,
-    log_ratio_clamp = None
+    log_ratio_clamp = None,
+    group_dim = -2
 ):
+    mask = resolve_grouped_mask(advantages, action_log_probs, mask, group_dim)
+
     if normalize_advantages:
         advantages = z_score(advantages, mask = mask)
 
