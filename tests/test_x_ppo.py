@@ -664,3 +664,16 @@ def test_calc_returns_per_sample_gamma():
     expected = cat([calc_returns(rewards[i:i + 1], masks = masks[i:i + 1], gamma = gammas[i].item(), next_value = next_value[i:i + 1], use_accelerated = False) for i in range(b)])
 
     assert torch.allclose(out, expected, atol = 1e-5)
+
+def test_value_clipping_none_or_false():
+    values = torch.randn(8, requires_grad = True)
+    old_values = torch.randn(8)
+    returns = torch.randn(8)
+
+    for fn in (clipped_value_loss_fn, improved_value_clipping_fn):
+        for clip in (None, False):
+            loss = fn(values, old_values, returns, clip = clip)
+            assert torch.allclose(loss, torch.nn.functional.mse_loss(values, returns))
+
+        loss_no_old = fn(values, None, returns)
+        assert torch.allclose(loss_no_old, torch.nn.functional.mse_loss(values, returns))

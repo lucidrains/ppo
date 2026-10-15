@@ -405,9 +405,9 @@ def resolve_value_mask(
 
 def clipped_value_loss_fn(
     values: Tensor,
-    old_values: Tensor,
-    returns: Tensor,
-    clip: float = 0.2,
+    old_values: Tensor | None = None,
+    returns: Tensor = None,
+    clip: float | None = 0.2,
     loss_fn: Callable = F.mse_loss,
     mask: Tensor | None = None,
     lens: Tensor | None = None,
@@ -415,6 +415,10 @@ def clipped_value_loss_fn(
     reduction: str = 'mean'
 ) -> Tensor:
     mask = resolve_value_mask(values, mask, lens, group_dim)
+
+    if not exists(clip) or clip is False or not exists(old_values):
+        loss = loss_fn(values, returns, reduction = 'none')
+        return masked_reduce(loss, mode = reduction, mask = mask)
 
     clipped_values = old_values + (values - old_values).clamp(-clip, clip)
 
@@ -429,9 +433,9 @@ def clipped_value_loss_fn(
 
 def improved_value_clipping_fn(
     values: Tensor,
-    old_values: Tensor,
-    returns: Tensor,
-    clip: float = 0.2,
+    old_values: Tensor | None = None,
+    returns: Tensor = None,
+    clip: float | None = 0.2,
     loss_fn: Callable = F.mse_loss,
     scalar_values: Tensor | None = None,
     scalar_old_values: Tensor | None = None,
@@ -441,6 +445,10 @@ def improved_value_clipping_fn(
     reduction: str = 'mean'
 ) -> Tensor:
     mask = resolve_value_mask(values, mask, lens, group_dim)
+
+    if not exists(clip) or clip is False or not exists(old_values):
+        loss = loss_fn(values, returns, reduction = 'none')
+        return masked_reduce(loss, mode = reduction, mask = mask)
 
     scalar_values = default(scalar_values, values)
     scalar_old_values = default(scalar_old_values, old_values)
