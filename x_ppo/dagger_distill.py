@@ -39,12 +39,19 @@ The whole ladder, simplest first:
 
     DaggerDistiller(student, teacher)
 
-    # 5. teacher and student disagree on the observation, or on what an
-    #    action means (a phase, an open-loop waveform, an action scaling)
+    # 5. the env's observation may be a dict - each side reads its own subset,
+    #    or they disagree on what an action means (a phase, an action scaling)
+
+    def student_view(obs, info, step):     # (raw obs, info, step) -> the student's state
+        return obs['state']                # deployable fields only
+
+    def teacher_view(obs, info, step):     # (raw obs, info, step) -> the teacher's state
+        return obs                         # privileged fields and all
 
     DaggerDistiller(student, teacher,
-        teacher_state_fn = my_view,        # (state, info, step) -> teacher's state
-        label_transform = my_transform)    # (state, action, info, step) -> student-space action
+        student_state_fn = student_view,
+        teacher_obs_fn = teacher_view,     # teacher_state_fn instead refines the student's state
+        label_transform = my_transform)    # (student state, action, info, step) -> student-space action
 
     # 6. hand it the env and it runs the whole DAgger loop itself - roll the
     #    student out, label every visited state, fit
@@ -54,9 +61,13 @@ The whole ladder, simplest first:
     for cycle in range(cycles):
         stats = distiller.step(collect_steps = 128, epochs = 2)
 
-`state` is batched; `info` carries the env's info plus `episode_steps` (per
-env steps since the last done) and `collect_step` - pass your own dict in
-env-free use. Non-finite teacher labels are parked on the student's own mean
+`state` is batched and may be a pytree - a dict observation rides through the
+buffer; `info` carries the env's info plus `episode_steps` (per env steps
+since the last done) and `collect_step` - pass your own dict in env-free use.
+The env's observation reaches the views raw, a dict keeping its fields:
+`student_state_fn` picks the student's state, `teacher_state_fn` refines it,
+`teacher_obs_fn` reads the raw observation instead - a privileged teacher.
+Non-finite teacher labels are parked on the student's own mean
 and masked out of the mean, so a bad teacher never poisons the graph (an
 entirely unusable batch comes back as a nan loss the caller can skip). Pass
 `return_loss_breakdown = True` for the components on top of the total -
@@ -286,9 +297,10 @@ class DaggerDistiller:
         optimizer: torch.optim.Optimizer | None = None,
         params = None,
         lr: float = 5e-4,
-        # state and label views
+        # views - the raw observation to each side's own state, and labels
         student_state_fn: Callable | None = None,
         teacher_state_fn: Callable | None = None,
+        teacher_obs_fn: Callable | None = None,
         label_transform: Callable | None = None,
         state_to_torch_fn: Callable | None = None,
         # objective
@@ -327,6 +339,7 @@ class DaggerDistiller:
 
         self.student_state_fn = student_state_fn
         self.teacher_state_fn = teacher_state_fn
+        self.teacher_obs_fn = teacher_obs_fn
         self.label_transform = label_transform
         self.state_to_torch_fn = state_to_torch_fn
 
@@ -376,7 +389,8 @@ class DaggerDistiller:
         self.num_envs = int(getattr(env, 'num_envs', 1)) if exists(env) else 0
         self.episode_steps = np.zeros(self.num_envs, dtype = np.int64)
 
-        self.state_buffer = None
+        self.state_buffers = None
+        self.state_treedef = None
         self.action_buffers = None
         self.action_treedef = None
         self.rep_buffer = None
@@ -387,14 +401,24 @@ class DaggerDistiller:
 
     # ------------------------------------------------------------------ helpers
 
-    def _to_torch(self, obs) -> Tensor:
+    def _as_tensor(self, value):
+        if isinstance(value, dict):
+            return {key: self._as_tensor(nested) for key, nested in value.items()}
+
+        if is_tensor(value):
+            return value.to(self.device) if exists(self.device) else value
+
+        return cast_tensor(value, dtype = torch.float32, device = self.device)
+
+    def _to_torch(self, obs):
+        """A dict observation (gym `Dict` spaces, privileged fields) keeps its
+        fields - each leaf lands as a tensor on the device, so the view
+        callables read it the same way however the env returned it."""
+
         if exists(self.state_to_torch_fn):
             obs = self.state_to_torch_fn(obs)
 
-        if is_tensor(obs):
-            return obs.to(self.device) if exists(self.device) else obs
-
-        return cast_tensor(obs, dtype = torch.float32, device = self.device)
+        return self._as_tensor(obs)
 
     def _resolve_kind(self, policy_out, source = 'student'):
         kind = policy_kind(policy_out)
@@ -405,6 +429,15 @@ class DaggerDistiller:
         self.kind = kind
 
     # -------------------------------------------------------------- teacher labels
+
+    def _teacher_input(self, obs, state, info, step):
+        # the teacher reads the raw observation (teacher_obs_fn - privileged
+        # fields and all), or refines the student's state (teacher_state_fn)
+
+        if exists(self.teacher_obs_fn):
+            return self.teacher_obs_fn(obs, info, step)
+
+        return self.teacher_state_fn(state, info, step) if exists(self.teacher_state_fn) else state
 
     @torch.no_grad()
     def _teacher_label(self, teacher_input, state, info, step):
@@ -504,26 +537,19 @@ class DaggerDistiller:
         """Distill one batch of data directly - no env involved. The teacher
         labels `state`, and back comes `(distill_loss, student_out)`;
         differentiable, so the caller owns `.backward()` and the optimizer.
-        Pass the teacher's own data as `teacher_state` to skip
-        `teacher_state_fn`; ask for `return_loss_breakdown` to get the loss
-        components instead of just the total."""
+        Pass the teacher's own data as `teacher_state` to skip the teacher's
+        view; ask for `return_loss_breakdown` to get the loss components
+        instead of just the total."""
 
         info = default(info, {})
 
-        state = self._to_torch(state)
-
-        if exists(self.student_state_fn):
-            state = self.student_state_fn(state, info, step)
+        obs = self._to_torch(state)
+        state = self.student_state_fn(obs, info, step) if exists(self.student_state_fn) else obs
 
         student_out = self.student(state)
         self._resolve_kind(student_out)
 
-        if exists(teacher_state):
-            teacher_input = self._to_torch(teacher_state)
-        elif exists(self.teacher_state_fn):
-            teacher_input = self.teacher_state_fn(state, info, step)
-        else:
-            teacher_input = state
+        teacher_input = self._to_torch(teacher_state) if exists(teacher_state) else self._teacher_input(obs, state, info, step)
 
         label, teacher_out = self._teacher_label(teacher_input, state, info, step)
 
@@ -557,17 +583,15 @@ class DaggerDistiller:
 
         info = dict(self._last_info, episode_steps = self.episode_steps.copy(), collect_step = step)
 
-        state = self._to_torch(self._last_obs)
-
-        if exists(self.student_state_fn):
-            state = self.student_state_fn(state, info, step)
+        obs = self._to_torch(self._last_obs)
+        state = self.student_state_fn(obs, info, step) if exists(self.student_state_fn) else obs
 
         student_out = self.student(state)
         self._resolve_kind(student_out)
 
-        # teacher labels the student's state, its action mapped into student space
+        # the teacher reads the raw observation, or refines the student's state
 
-        teacher_input = self.teacher_state_fn(state, info, step) if exists(self.teacher_state_fn) else state
+        teacher_input = self._teacher_input(obs, state, info, step)
         label, _ = self._teacher_label(teacher_input, state, info, step)
 
         teacher_rep = self._pop(self.teacher_capture, 'teacher') if exists(self.teacher_capture) else None
@@ -594,14 +618,20 @@ class DaggerDistiller:
 
     # --------------------------------------------------------------------- buffer
 
-    def _write(self, state: Tensor, target, teacher_rep: Tensor | None = None):
-        # one buffer per action leaf - long for indices, float for values
+    def _write(self, state, target, teacher_rep: Tensor | None = None):
+        # one buffer per state / action leaf, so a dict observation fits too -
+        # long for indices, float for values
 
+        state_leaves = pytree.tree_leaves(state)
         targets = pytree.tree_leaves(target)
-        n = state.shape[0]
+        n = state_leaves[0].shape[0]
 
-        if not exists(self.state_buffer):
-            self.state_buffer = torch.zeros(self.buffer_size, *state.shape[1:], dtype = torch.float32, device = self.buffer_device)
+        if not exists(self.state_buffers):
+            self.state_treedef = pytree.tree_structure(state)
+            self.state_buffers = [
+                torch.zeros(self.buffer_size, *leaf.shape[1:], dtype = torch.float32, device = self.buffer_device)
+                for leaf in state_leaves
+            ]
             self.action_treedef = pytree.tree_structure(target)
             self.action_buffers = [
                 torch.zeros(self.buffer_size, *leaf.shape[1:], dtype = torch.long if not leaf.is_floating_point() else torch.float32, device = self.buffer_device)
@@ -610,7 +640,8 @@ class DaggerDistiller:
 
         idx = (self.count + torch.arange(n, device = self.buffer_device)) % self.buffer_size
 
-        self.state_buffer[idx] = state.detach().float()
+        for buffer, leaf in zip(self.state_buffers, state_leaves):
+            buffer[idx] = leaf.detach().float()
 
         for buffer, leaf in zip(self.action_buffers, targets):
             buffer[idx] = leaf.detach().to(buffer.dtype)
@@ -637,7 +668,7 @@ class DaggerDistiller:
         n = min(self.count, self.buffer_size)
 
         if exists(self.optimizer) and n > 0:
-            states = self.state_buffer[:n]
+            state_leaves = [buffer[:n] for buffer in self.state_buffers]
             action_leaves = [buffer[:n] for buffer in self.action_buffers]
             reps = self.rep_buffer[:n] if exists(self.rep_buffer) else None
 
@@ -651,14 +682,14 @@ class DaggerDistiller:
                         finite &= reduce(torch.isfinite(leaf), 'n ... -> n', 'all')
 
                 if not finite.all():
-                    states = states[finite]
+                    state_leaves = [leaf[finite] for leaf in state_leaves]
                     action_leaves = [leaf[finite] for leaf in action_leaves]
                     reps = reps[finite] if exists(reps) else None
-                    n = states.shape[0]
+                    n = state_leaves[0].shape[0]
 
             if exists(max_samples) and n > max_samples:
                 sel = torch.randperm(n, device = self.buffer_device)[:max_samples]
-                states = states[sel]
+                state_leaves = [leaf[sel] for leaf in state_leaves]
                 action_leaves = [leaf[sel] for leaf in action_leaves]
                 reps = reps[sel] if exists(reps) else None
                 n = max_samples
@@ -668,7 +699,8 @@ class DaggerDistiller:
 
                 for i in range(0, n, batch_size):
                     b = perm[i:i + batch_size]
-                    student_out = self.student(states[b])
+                    states = pytree.tree_unflatten([leaf[b] for leaf in state_leaves], self.state_treedef)
+                    student_out = self.student(states)
                     label = pytree.tree_unflatten([leaf[b] for leaf in action_leaves], self.action_treedef)
                     breakdown = self._loss(student_out, label, teacher_rep = reps[b] if exists(reps) else None)
                     loss = breakdown.loss
@@ -785,22 +817,26 @@ if __name__ == '__main__':
 
     print(f'[composite] loss {composite_loss.item():.3f} | actions {tuple(composite_action["buttons"].shape)} {tuple(composite_action["arm"].shape)}')
 
-    # 5. hooks - the teacher's view of the state, and its action space
+    # 5. views - the env hands back a dict observation and each side reads its
+    #    own subset of it: the student drops the privileged field, the teacher
+    #    keeps it, and labels map across action spaces
 
     wider_net = nn.Linear(3, 2)
 
     def wider_teacher(teacher_state):
         return Normal(wider_net(teacher_state), 0.1)
 
-    def teacher_state_fn(state, info, step):
-        clock = torch.full_like(state[:, :1], info['phase'])
-        return torch.cat([state, clock], -1)
+    def student_state_fn(obs, info, step):
+        return obs['state']                                     # deployable at test time
+
+    def teacher_obs_fn(obs, info, step):
+        return torch.cat([obs['state'], obs['privileged']], -1)  # privileged teacher
 
     def label_transform(state, action, info, step):
         return action * 0.5
 
-    hooked = DaggerDistiller(student, wider_teacher, teacher_state_fn = teacher_state_fn, label_transform = label_transform)
-    hook_loss, _ = hooked(torch.randn(32, 2), info = dict(phase = 0.3), step = 5)
+    hooked = DaggerDistiller(student, wider_teacher, student_state_fn = student_state_fn, teacher_obs_fn = teacher_obs_fn, label_transform = label_transform)
+    hook_loss, _ = hooked(dict(state = torch.randn(32, 2), privileged = torch.randn(32, 1)), info = dict(phase = 0.3), step = 5)
 
     print(f'[hooks]     hook loss {hook_loss.item():.3f}')
 

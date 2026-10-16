@@ -272,3 +272,74 @@ def test_e2e_distills_every_action_space(family):
 
     assert student_goal < goal_distance(snapshot) * 0.5, f'{family=} {student_goal=:.3f}'
     assert student_goal < goal_distance(teacher) * 2.0 + 0.05, f'{family=} {student_goal=:.3f}'
+
+class PrivilegedGoalEnv(ToyGoalEnv):
+    # env hands back a dict observation - the student reads its subset `obs`
+    # (position only), the teacher's view adds `privileged` (true velocity)
+
+    def _split(self, state):
+        return dict(obs = state[:, :self.control_dim].clone(), privileged = state.clone())
+
+    def reset(self):
+        state, info = super().reset()
+        return self._split(state), info
+
+    def step(self, control):
+        state, reward, term, trunc, info = super().step(control)
+        return self._split(state), reward, term, trunc, info
+
+def test_e2e_privileged_teacher_view():
+    # the env gives back a dict observation and each side reads its own subset -
+    # the teacher keeps the field the student cannot see
+
+    torch.manual_seed(0)
+    num_envs, cycles, collect_steps = 16, 24, 4
+    control_dim = 2
+
+    student = NormalHead(control_dim, control_dim)   # position only
+    snapshot = copy.deepcopy(student)
+    optimizer = torch.optim.Adam(student.parameters(), lr = 5e-3)
+
+    def teacher(full_state):
+        goal = -2.0 * full_state[..., :control_dim] - full_state[..., control_dim:]
+        return Normal(goal, torch.full_like(goal, 0.05))
+
+    def student_state_fn(obs, info, step):
+        return obs['obs']
+
+    def teacher_obs_fn(obs, info, step):
+        return obs['privileged']
+
+    distiller = DaggerDistiller(
+        student, teacher,
+        env = PrivilegedGoalEnv(num_envs, control_dim, seed = 1),
+        optimizer = optimizer,
+        student_state_fn = student_state_fn,
+        teacher_obs_fn = teacher_obs_fn,
+        batch_size = 128,
+        max_samples = 2048
+    )
+
+    for _ in range(cycles):
+        stats = distiller.step(collect_steps = collect_steps)
+
+    assert distiller.count == cycles * collect_steps * num_envs
+    assert math.isfinite(stats['loss'])
+
+    # behaviour - the position-only student still drives to the goal
+
+    def goal_distance(policy_fn, seed = 123, steps = 40):
+        env = PrivilegedGoalEnv(num_envs, control_dim, seed = seed)
+        obs, _ = env.reset()
+        total = 0.
+
+        with torch.no_grad():
+            for _ in range(steps):
+                obs, *_ = env.step(best_action(policy_fn(obs['obs'])))
+                total += obs['obs'].pow(2).sum(-1)
+
+        return (total / steps).mean().item()
+
+    student_goal = goal_distance(student)
+
+    assert student_goal < goal_distance(snapshot) * 0.5, f'{student_goal=:.3f}'

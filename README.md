@@ -131,6 +131,8 @@ distiller = DaggerDistiller(student, teacher,
     student_layer = 'trunk.2',                  # representation alignment, 1 - cosine
     teacher_layer = 'trunk.6',
     loss_fn = kl_loss,
+    student_state_fn = lambda obs, info, step: obs['obs'],      # deployable fields
+    teacher_obs_fn = lambda obs, info, step: obs['privileged'], # a privileged teacher
     env = env,
     optimizer = optimizer
 )

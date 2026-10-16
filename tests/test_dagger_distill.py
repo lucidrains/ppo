@@ -471,6 +471,75 @@ def test_env_loop():
 
     assert phase_steps == [0, 1, 2]
 
+    # a dict observation (numpy, as a vec env hands back) keeps its fields -
+    # the student reads its subset, the teacher its own
+
+    class DictObsEnv(ToyVecEnv):
+        def _wrap(self, obs):
+            return dict(state = obs.numpy(), privileged = 2. * obs.numpy())
+
+        def reset(self):
+            obs, info = super().reset()
+            return self._wrap(obs), info
+
+        def step(self, actions):
+            obs, reward, term, trunc, info = super().step(actions)
+            return self._wrap(obs), reward, term, trunc, info
+
+    views, teacher_inputs = [], []
+
+    def dict_student_state_fn(obs, info, step):
+        views.append(sorted(obs))
+        return obs['state']
+
+    def dict_teacher_obs_fn(obs, info, step):
+        views.append(sorted(obs))
+        return obs['privileged']
+
+    def wide_teacher(teacher_state):
+        teacher_inputs.append(teacher_state)
+        return Normal(0.1 * teacher_state[..., :1], 1.)
+
+    dict_obs = DaggerDistiller(student, wide_teacher, env = DictObsEnv(4, 2, 1, lambda s, a: s), optimizer = optimizer, student_state_fn = dict_student_state_fn, teacher_obs_fn = dict_teacher_obs_fn)
+    dict_obs.collect(2)
+
+    assert all(keys == ['privileged', 'state'] for keys in views)
+    assert torch.allclose(torch.cat(teacher_inputs), 2. * dict_obs.state_buffers[0][:8])
+
+    # teacher_state_fn still refines the student's state, as it did before
+
+    raws, chained = [], []
+
+    def scaling_student_state_fn(state, info, step):
+        raws.append(state)
+        return state * 3.
+
+    def chaining_teacher_state_fn(state, info, step):
+        chained.append(state)
+        return state
+
+    chain_distiller = DaggerDistiller(student, normal_teacher(1), env = ToyVecEnv(4, 2, 1, lambda s, a: s), optimizer = optimizer, student_state_fn = scaling_student_state_fn, teacher_state_fn = chaining_teacher_state_fn)
+    chain_distiller.collect(1)
+
+    assert torch.allclose(torch.cat(chained), 3. * torch.cat(raws))
+    assert torch.allclose(chain_distiller.state_buffers[0][:4], 3. * torch.cat(raws))
+
+    # a multi-key subset is a state too - the buffer carries the pytree
+
+    class DictStudent(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Linear(4, 1)
+
+        def forward(self, state):
+            return Normal(self.net(torch.cat([state['state'], state['privileged']], -1)), 1.)
+
+    subset_student = DictStudent()
+    subset = DaggerDistiller(subset_student, normal_teacher(1), env = DictObsEnv(4, 2, 1, lambda s, a: s), optimizer = torch.optim.Adam(subset_student.parameters()), student_state_fn = lambda obs, info, step: dict(state = obs['state'], privileged = obs['privileged']), teacher_obs_fn = dict_teacher_obs_fn)
+    subset_stats = subset.step(collect_steps = 2, epochs = 1)
+
+    assert math.isfinite(subset_stats['loss']) and len(subset.state_buffers) == 2
+
     # non-finite teacher labels never poison the student
 
     def bad_label_transform(state, action, info, step):
