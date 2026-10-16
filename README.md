@@ -107,7 +107,63 @@ gae = calc_gae(rewards, values, masks = masks, weights = weights, group_dim = 1,
 
 `spo_actor_loss` and `improved_value_clipping_fn` are drop-in alternatives to the actor and critic losses above, and `combine_grouped_advantages` accepts a `reduce` of `'sum'`, `'max'`, `'min'` or a custom callable
 
+### dagger distillation
+
+Distill any teacher into any student - one module, any action space, no environment required
+
+```python
+from x_ppo import DaggerDistiller
+
+distiller = DaggerDistiller(student, teacher)   # state -> Distribution each
+
+distill_loss, student_distr = distiller(states)
+
+distill_loss.backward()
+```
+
+Composite action spaces (a pytree of heads), representation alignment against any layer of the teacher or student (repa), soft and deterministic objectives (`kl_loss`, `mse_loss`), and the full DAgger loop (roll the student out, label with the teacher, fit) are one argument each away
+
+```python
+from x_ppo import DaggerDistiller
+from x_ppo.dagger_distill import kl_loss
+
+distiller = DaggerDistiller(student, teacher,
+    student_layer = 'trunk.2',                  # representation alignment, 1 - cosine
+    teacher_layer = 'trunk.6',
+    loss_fn = kl_loss,
+    env = env,
+    optimizer = optimizer
+)
+
+for cycle in range(cycles):
+    stats = distiller.step(collect_steps = 128, epochs = 2)
+```
+
+Pass `return_loss_breakdown = True` for the loss components - `LossBreakdown(loss, policy, entropy, alignment)` - on top of the total
+
 ## Citations
+
+```bibtex
+@article{Ross2011DAgger,
+    title   = {A Reduction of Imitation Learning and Structured Prediction to No-Regret Online Learning},
+    author  = {Stephane Ross and Geoffrey J. Gordon and Drew Bagnell},
+    journal = {ArXiv},
+    year    = {2011},
+    volume  = {abs/1011.0686},
+    url     = {https://arxiv.org/abs/1011.0686}
+}
+```
+
+```bibtex
+@article{Yu2024REPA,
+    title   = {Representation Alignment for Generation: Training Diffusion Transformers Is Easier Than You Think},
+    author  = {Sihyun Yu and Sangkyung Kwak and Huiwon Jang and Jongheon Jeong and Jonathan Huang and Jinwoo Shin and Saining Xie},
+    journal = {ArXiv},
+    year    = {2024},
+    volume  = {abs/2410.06940},
+    url     = {https://arxiv.org/abs/2410.06940}
+}
+```
 
 ```bibtex
 @article{Schulman2017ProximalPO,
