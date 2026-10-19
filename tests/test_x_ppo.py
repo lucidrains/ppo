@@ -6,6 +6,7 @@ from torch_einops_utils import lens_to_mask
 from x_ppo import (
     ppo_actor_loss,
     spo_actor_loss,
+    hpo_actor_loss,
     calc_gae,
     calc_returns,
     combine_grouped_advantages,
@@ -85,7 +86,50 @@ def test_log_ratio_clamp_prevents_overflow():
 
     assert torch.isfinite(action_log_probs.grad).all()
 
-@param('loss_fn', (ppo_actor_loss, spo_actor_loss))
+@param('use_mask', (False, True))
+def test_hpo_actor_loss(use_mask):
+    batch, seq = 2, 4
+    mask = lens_to_mask(torch.tensor([2, 4]), seq) if use_mask else None
+
+    action_log_probs = torch.randn(batch, seq, requires_grad = True)
+    old_action_log_probs = torch.randn(batch, seq)
+    advantages = torch.randn(batch, seq)
+
+    loss = hpo_actor_loss(
+        action_log_probs,
+        old_action_log_probs,
+        advantages,
+        mask = mask,
+        normalize_advantages = True
+    )
+
+    loss.sum().backward()
+
+    assert exists(action_log_probs.grad)
+    assert torch.isfinite(loss).all()
+
+def test_hpo_advantage_gate():
+    action_log_probs = torch.zeros(4, requires_grad = True)
+    old_action_log_probs = torch.zeros(4)
+    advantages = torch.tensor([0.2, -0.4, 3., -3.])
+
+    hpo_actor_loss(
+        action_log_probs,
+        old_action_log_probs,
+        advantages
+    ).sum().backward()
+
+    assert torch.allclose(action_log_probs.grad, -advantages * advantages.abs().clamp(max = 1.))
+
+def test_hpo_full_gradient_on_outliers():
+    advantages = torch.tensor([10., -10.])
+    action_log_probs = torch.tensor([-5., 5.], requires_grad = True)
+
+    hpo_actor_loss(action_log_probs, torch.zeros(2), advantages).sum().backward()
+
+    assert torch.allclose(action_log_probs.grad.abs(), advantages.abs())
+
+@param('loss_fn', (ppo_actor_loss, spo_actor_loss, hpo_actor_loss))
 def test_actor_loss_fp32(loss_fn):
     action_log_probs = torch.randn(2, 4)
     old_action_log_probs = torch.randn(2, 4)

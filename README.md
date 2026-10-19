@@ -442,3 +442,13 @@ Pass `return_loss_breakdown = True` for the loss components - `LossBreakdown(los
     year    = {2026}
 }
 ```
+
+```bibtex
+@article{kaddour2026target,
+    title   = {Target Policy Optimization},
+    author  = {Jean Kaddour},
+    journal = {arXiv preprint arXiv:2604.06159},
+    year    = {2026},
+    url     = {https://arxiv.org/abs/2604.06159}
+}
+```
