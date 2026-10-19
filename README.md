@@ -137,6 +137,8 @@ distiller = DaggerDistiller(student, teacher,
     optimizer = optimizer
 )
 
+distiller.pretrain(128, epochs = 4)   # teacher-rollout behavior-cloning warmup
+
 for cycle in range(cycles):
     stats = distiller.step(collect_steps = 128, epochs = 2)
 ```

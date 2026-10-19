@@ -57,6 +57,7 @@ The whole ladder, simplest first:
     #    student out, label every visited state, fit
 
     distiller = DaggerDistiller(student, teacher, env = env, optimizer = optimizer)
+    distiller.pretrain(128, epochs = 4)   # teacher-rollout BC warmup
 
     for cycle in range(cycles):
         stats = distiller.step(collect_steps = 128, epochs = 2)
@@ -561,22 +562,29 @@ class DaggerDistiller:
     # -------------------------------------------------------------------- rollout
 
     @torch.no_grad()
-    def collect(self, steps: int, sample = True) -> dict:
-        """Roll the student for `steps` control steps, labelling every visited
-        state with the teacher."""
+    def collect(self, steps: int, sample = True, teacher_acts = False) -> dict:
+        """Roll a policy for `steps`, labelling every visited state with the teacher."""
 
         if not exists(self.env):
             raise RuntimeError('no env was given - the env-free distiller is called with data: distiller(state) -> (distill_loss, student_out)')
 
+        if teacher_acts:
+            assert not exists(self.label_transform), 'teacher rollout needs untransformed actions'
+
         before = self.count
 
         for step in range(steps):
-            self._collect_step(step, sample)
+            self._collect_step(step, sample, teacher_acts)
 
         return dict(labeled = self.count - before, buffer = min(self.count, self.buffer_size))
 
+    def pretrain(self, steps: int, epochs = None, return_loss_breakdown = False) -> dict:
+        """Teacher-rollout behavior cloning, then one supervised fit."""
+
+        return {**self.collect(steps, teacher_acts = True), **self.train(epochs = epochs, return_loss_breakdown = return_loss_breakdown)}
+
     @torch.no_grad()
-    def _collect_step(self, step: int, sample: bool):
+    def _collect_step(self, step: int, sample: bool, teacher_acts = False):
         if not exists(self._last_obs):
             out = self.env.reset()
             self._last_obs = out[0] if isinstance(out, (tuple, list)) else out
@@ -597,7 +605,7 @@ class DaggerDistiller:
         teacher_rep = self._pop(self.teacher_capture, 'teacher') if exists(self.teacher_capture) else None
         self._write(state, label, teacher_rep)
 
-        actions = best_action(student_out, sample = sample)
+        actions = label if teacher_acts else best_action(student_out, sample = sample)
 
         if exists(self.action_to_env_fn):
             actions = self.action_to_env_fn(actions)
