@@ -15,6 +15,7 @@ def hpo_actor_loss(
     delightful = False,
     delight_temp = 1.,
     log_ratio_clamp = None,
+    min_width = 1e-8,
     group_dim = -2
 ):
     mask = resolve_grouped_mask(advantages, action_log_probs, mask, group_dim)
@@ -42,13 +43,19 @@ def hpo_actor_loss(
 
     eps = torch.where(advantages >= 0., eps_clip_high, eps_clip_low)
 
-    # proportional target + |A| gate - quadratic below 1 sigma, linear above
-    target = (eps * advantages).clamp(-eps_clip_low, eps_clip_high)
+    # proportional stop target, saturating at |A| = 1
+    prop_target = eps * advantages.clamp(-1., 1.)
+    approaching = (log_ratios - prop_target) * advantages < 0.
+
+    # stop at proportional target - track inside trust band, restore past bound
+    target = torch.where(approaching, prop_target, log_ratios.detach().clamp(-eps_clip_low, eps_clip_high))
     weight = advantages.abs()
 
-    # per-sample huber
+    # huber width - |prop target| on approach, eps on restore
+    width = torch.where(approaching, prop_target.abs().clamp(min = min_width), eps)
+
     error = log_ratios - target
-    diff = error.abs()
-    loss = weight * torch.where(diff < eps, 0.5 * error.square() / eps, diff - 0.5 * eps)
+    abs_error = error.abs()
+    loss = weight * torch.where(abs_error < width, 0.5 * error.square() / width, abs_error - 0.5 * width)
 
     return masked_mean(loss, mask = mask) if exists(mask) else loss

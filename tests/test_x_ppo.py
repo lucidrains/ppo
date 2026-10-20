@@ -109,14 +109,26 @@ def grad_magnitude(loss_fn, log_ratios, advantages):
     return torch.autograd.grad(loss, x)[0].abs()
 
 def test_hpo():
-    # gate at zero and full gradient on outliers
+    # vanilla gradient at init, min huber width gates down small advantages
 
     advantages = torch.tensor([0.2, -0.4, 3., -3.])
     log_probs = torch.zeros(4, requires_grad = True)
 
     hpo_actor_loss(log_probs, torch.zeros(4), advantages).sum().backward()
 
+    assert torch.allclose(log_probs.grad, -advantages)
+
+    log_probs = torch.zeros(4, requires_grad = True)
+    hpo_actor_loss(log_probs, torch.zeros(4), advantages, eps_clip = 0.2, min_width = 0.2).sum().backward()
+
     assert torch.allclose(log_probs.grad, -advantages * advantages.abs().clamp(max = 1.))
+
+    # deadzone inside trust band, restoring outside
+
+    log_ratios = torch.tensor([0.12, -0.12, 0.5, -0.5], requires_grad = True)
+    hpo_actor_loss(log_ratios, torch.zeros(4), torch.tensor([0.3, -0.3, 0.3, -0.3]), eps_clip = 0.2).sum().backward()
+
+    assert torch.allclose(log_ratios.grad, torch.tensor([0., 0., 0.3, -0.3]))
 
     advantages = torch.tensor([10., -10.])
     log_probs = torch.tensor([-5., 5.], requires_grad = True)
