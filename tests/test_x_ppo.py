@@ -1,26 +1,19 @@
 import copy
 import math
+from functools import partial
 
 import pytest
 import torch
 import torch.nn.functional as F
 from torch import cat, nn, tensor
-from torch.distributions import Bernoulli, Categorical, Distribution, Normal, OneHotCategorical
+from torch.distributions import Bernoulli, Categorical, Distribution, Normal, OneHotCategorical, kl_divergence
 from torch_einops_utils import lens_to_mask
 
-from x_ppo.dagger_distill import (
-    DISCRETE_DISTRIBUTIONS,
+from x_ppo import (
     DaggerDistiller,
-    best_action,
-    is_discrete,
     kl_loss,
-    log_prob_sum,
     mse_loss,
     nll_loss,
-    policy_kind,
-    to_log_prob_target,
-)
-from x_ppo import (
     ppo_actor_loss,
     spo_actor_loss,
     hpo_actor_loss,
@@ -31,10 +24,16 @@ from x_ppo import (
     clipped_value_loss_fn,
     improved_value_clipping_fn
 )
+from x_ppo.dagger_distill import (
+    DISCRETE_DISTRIBUTIONS,
+    best_action,
+    is_discrete,
+    log_prob_sum,
+    policy_kind,
+    to_log_prob_target,
+)
 
 param = pytest.mark.parametrize
-
-from functools import partial
 
 # helpers
 
@@ -1265,11 +1264,12 @@ def test_dagger_env_loop():
         teacher_inputs.append(teacher_state)
         return Normal(0.1 * teacher_state[..., :1], 1.)
 
-    dict_obs = DaggerDistiller(student, wide_teacher, env = DictObsEnv(4, 2, 1, lambda s, a: s), optimizer = optimizer, student_state_fn = dict_student_state_fn, teacher_obs_fn = dict_teacher_obs_fn)
+    dict_obs = DaggerDistiller(student, wide_teacher, env = DictObsEnv(4, 2, 1, lambda s, a: s), optimizer = optimizer, student_state_fn = dict_student_state_fn, teacher_obs_fn = dict_teacher_obs_fn, loss_fn = kl_loss)
     dict_obs.collect(2)
 
     assert all(keys == ['privileged', 'state'] for keys in views)
     assert torch.allclose(torch.cat(teacher_inputs), 2. * dict_obs.state_buffers[0][:8])
+    assert torch.allclose(dict_obs.teacher_input_buffers[0][:8], torch.cat(teacher_inputs))
 
     # teacher_state_fn still refines the student's state, as it did before
 
@@ -1319,7 +1319,7 @@ def test_dagger_env_loop():
 
     assert all(torch.isfinite(p).all() for p in student.parameters())
 
-    # custom objectives in the loop fit from the label-only buffer
+    # custom objectives fit from the labels - soft built-ins re-run the teacher
 
     label_only = []
 
@@ -1327,11 +1327,25 @@ def test_dagger_env_loop():
         label_only.append(teacher_distr is None and info is None)
         return (student_distr.mean - label).pow(2).mean(dim = 1)
 
-    for loss_fn in (label_mse, kl_loss):
+    for loss_fn in (label_mse, kl_loss, partial(kl_loss, reverse = True)):
         loop = DaggerDistiller(student, normal_teacher(1), env = ToyVecEnv(4, 2, 1, step_fn), optimizer = optimizer, loss_fn = loss_fn)
         assert math.isfinite(loop.step(collect_steps = 4, epochs = 1)['loss'])
+        assert loop.needs_teacher_out == (loss_fn is not label_mse)
 
     assert all(label_only)
+
+    # kl in the loop matches the teacher distributions, not just its actions
+
+    teacher = normal_teacher(1)
+    kl_distiller = DaggerDistiller(student, teacher, env = ToyVecEnv(4, 2, 1, step_fn), optimizer = optimizer, loss_fn = kl_loss, batch_size = 16, max_samples = 16)
+    kl_distiller.collect(4)
+
+    states = kl_distiller.state_buffers[0][:16]
+
+    with torch.no_grad():
+        expected_kl = kl_divergence(teacher(states), student(states)).sum(-1).mean()
+
+    assert torch.allclose(tensor(kl_distiller.train(epochs = 1)['loss']), expected_kl, atol = 1e-5)
 
     # requirements fail early and loudly
 
@@ -1525,10 +1539,14 @@ def build_policy_family(family, state_dim, control_dim, num_actions = 5, chunk =
 
     raise ValueError(f'{family=}')
 
+@param('loss_fn', (nll_loss, kl_loss, mse_loss))
 @param('family', ('normal', 'normal_chunk', 'categorical', 'onehot', 'bernoulli', 'beta', 'hybrid'))
-def test_dagger_e2e_action_spaces(family):
+def test_dagger_e2e_action_spaces(family, loss_fn):
     if family in ('beta', 'hybrid'):
         pytest.importorskip('mean_conc_beta')
+
+    if loss_fn is mse_loss and family in ('categorical', 'onehot'):
+        pytest.skip('categorical has no mean - use kl_loss')
 
     torch.manual_seed(0)
     num_envs, cycles, collect_steps = 16, 18, 4
@@ -1544,6 +1562,7 @@ def test_dagger_e2e_action_spaces(family):
         env = ToyGoalEnv(num_envs, control_dim, seed = 1),
         optimizer = optimizer,
         action_to_env_fn = action_to_env_fn,
+        loss_fn = loss_fn,
         batch_size = 128,
         max_samples = 2048
     )
@@ -1616,7 +1635,8 @@ class PrivilegedGoalEnv(ToyGoalEnv):
         state, reward, term, trunc, info = super().step(control)
         return self._split(state), reward, term, trunc, info
 
-def test_dagger_e2e_privileged():
+@param('loss_fn', (nll_loss, kl_loss, mse_loss))
+def test_dagger_e2e_privileged(loss_fn):
     # the env gives back a dict observation and each side reads its own subset -
     # the teacher keeps the field the student cannot see
 
@@ -1644,6 +1664,7 @@ def test_dagger_e2e_privileged():
         optimizer = optimizer,
         student_state_fn = student_state_fn,
         teacher_obs_fn = teacher_obs_fn,
+        loss_fn = loss_fn,
         batch_size = 128,
         max_samples = 2048
     )

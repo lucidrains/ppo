@@ -62,6 +62,10 @@ The whole ladder, simplest first:
     for cycle in range(cycles):
         stats = distiller.step(collect_steps = 128, epochs = 2)
 
+`kl_loss` and `mse_loss` re-evaluate the teacher on its buffered inputs at fit
+time - keep the teacher in eval mode. A raw-action teacher or a
+`label_transform` falls back to the stored action.
+
 `state` is batched and may be a pytree - a dict observation rides through the
 buffer; `info` carries the env's info plus `episode_steps` (per env steps
 since the last done) and `collect_step` - pass your own dict in env-free use.
@@ -79,6 +83,7 @@ entirely unusable batch comes back as a nan loss the caller can skip). Pass
 from __future__ import annotations
 
 from collections import namedtuple
+from functools import partial
 from typing import Callable
 
 import numpy as np
@@ -196,8 +201,8 @@ def kl_loss(student_out, teacher_out = None, label = None, info = None, *, rever
     """Per-sample KL between the two policies, summed over every head - soft
     distillation. The default direction is KL(teacher || student)
     (mode-covering); `reverse` flips it to KL(student || teacher). Falls back
-    to the nll on `label` when only actions are around (e.g. fitting from the
-    labelled buffer)."""
+    to the nll on `label` when only actions are around (e.g. when the teacher
+    hands back raw actions)."""
 
     if not exists(teacher_out):
         return nll_loss(student_out, teacher_out, label, info)
@@ -232,6 +237,12 @@ def mse_loss(student_out, teacher_out = None, label = None, info = None) -> Tens
         )
 
     return sum(pytree.tree_leaves(head_losses))
+
+# kl / mse need the teacher's distribution - the loop re-evaluates it at fit time
+
+def uses_teacher_out(loss_fn) -> bool:
+    fn = loss_fn.func if isinstance(loss_fn, partial) else loss_fn
+    return fn in (kl_loss, mse_loss)
 
 # --------------------------------------------------------------- alignment (repa)
 
@@ -346,6 +357,11 @@ class DaggerDistiller:
 
         self.loss_fn = loss_fn
         self.entropy_weight = entropy_weight
+
+        # kl / mse need the teacher's distribution, not just its action
+
+        self.needs_teacher_out = uses_teacher_out(loss_fn) and exists(teacher) and not exists(teacher_action_fn) and not exists(label_transform)
+        self.buffer_teacher_input = self.needs_teacher_out and (exists(teacher_obs_fn) or exists(teacher_state_fn))
         self.teacher_sample = teacher_sample
 
         # representation alignment - resolve the hooked layers up front
@@ -392,6 +408,8 @@ class DaggerDistiller:
 
         self.state_buffers = None
         self.state_treedef = None
+        self.teacher_input_buffers = None
+        self.teacher_input_treedef = None
         self.action_buffers = None
         self.action_treedef = None
         self.rep_buffer = None
@@ -464,6 +482,15 @@ class DaggerDistiller:
             action = self.label_transform(state, action, info, step)
 
         return action, teacher_out
+
+    @torch.no_grad()
+    def _teacher_distribution(self, teacher_input):
+        out = self.teacher(teacher_input)
+
+        if exists(self.teacher_capture):
+            self.teacher_capture.pop()
+
+        return out if is_policy_out(out) else None
 
     # --------------------------------------------------------------------- loss
 
@@ -603,7 +630,8 @@ class DaggerDistiller:
         label, _ = self._teacher_label(teacher_input, state, info, step)
 
         teacher_rep = self._pop(self.teacher_capture, 'teacher') if exists(self.teacher_capture) else None
-        self._write(state, label, teacher_rep)
+        buffered_teacher_input = teacher_input if self.buffer_teacher_input else None
+        self._write(state, label, teacher_rep = teacher_rep, teacher_input = buffered_teacher_input)
 
         actions = label if teacher_acts else best_action(student_out, sample = sample)
 
@@ -626,33 +654,42 @@ class DaggerDistiller:
 
     # --------------------------------------------------------------------- buffer
 
-    def _write(self, state, target, teacher_rep: Tensor | None = None):
+    def _init_buffers(self, tree):
+        leaves, treedef = pytree.tree_flatten(tree)
+        buffers = [
+            torch.zeros(
+                self.buffer_size,
+                *leaf.shape[1:],
+                dtype = torch.float32 if leaf.is_floating_point() else leaf.dtype,
+                device = self.buffer_device
+            )
+            for leaf in leaves
+        ]
+        return buffers, treedef
+
+    def _write_tree(self, buffers, tree, idx):
+        for buffer, leaf in zip(buffers, pytree.tree_leaves(tree)):
+            buffer[idx] = leaf.detach().to(buffer.dtype)
+
+    def _write(self, state, target, teacher_rep: Tensor | None = None, teacher_input = None):
         # one buffer per state / action leaf, so a dict observation fits too -
-        # long for indices, float for values
+        # each leaf keeps its dtype, floating point in fp32
 
-        state_leaves = pytree.tree_leaves(state)
-        targets = pytree.tree_leaves(target)
-        n = state_leaves[0].shape[0]
-
-        if not exists(self.state_buffers):
-            self.state_treedef = pytree.tree_structure(state)
-            self.state_buffers = [
-                torch.zeros(self.buffer_size, *leaf.shape[1:], dtype = torch.float32, device = self.buffer_device)
-                for leaf in state_leaves
-            ]
-            self.action_treedef = pytree.tree_structure(target)
-            self.action_buffers = [
-                torch.zeros(self.buffer_size, *leaf.shape[1:], dtype = torch.long if not leaf.is_floating_point() else torch.float32, device = self.buffer_device)
-                for leaf in targets
-            ]
-
+        n = pytree.tree_leaves(state)[0].shape[0]
         idx = (self.count + torch.arange(n, device = self.buffer_device)) % self.buffer_size
 
-        for buffer, leaf in zip(self.state_buffers, state_leaves):
-            buffer[idx] = leaf.detach().float()
+        if not exists(self.state_buffers):
+            self.state_buffers, self.state_treedef = self._init_buffers(state)
+            self.action_buffers, self.action_treedef = self._init_buffers(target)
 
-        for buffer, leaf in zip(self.action_buffers, targets):
-            buffer[idx] = leaf.detach().to(buffer.dtype)
+        self._write_tree(self.state_buffers, state, idx)
+        self._write_tree(self.action_buffers, target, idx)
+
+        if exists(teacher_input):
+            if not exists(self.teacher_input_buffers):
+                self.teacher_input_buffers, self.teacher_input_treedef = self._init_buffers(teacher_input)
+
+            self._write_tree(self.teacher_input_buffers, teacher_input, idx)
 
         if exists(teacher_rep):
             if not exists(self.rep_buffer):
@@ -676,8 +713,15 @@ class DaggerDistiller:
         n = min(self.count, self.buffer_size)
 
         if exists(self.optimizer) and n > 0:
-            state_leaves = [buffer[:n] for buffer in self.state_buffers]
-            action_leaves = [buffer[:n] for buffer in self.action_buffers]
+            def take(leaves, idx):
+                return [leaf[idx] for leaf in leaves] if exists(leaves) else None
+
+            def batch(leaves, treedef, idx):
+                return pytree.tree_unflatten([leaf[idx] for leaf in leaves], treedef)
+
+            state_leaves = take(self.state_buffers, slice(0, n))
+            teacher_input_leaves = take(self.teacher_input_buffers, slice(0, n))
+            action_leaves = take(self.action_buffers, slice(0, n))
             reps = self.rep_buffer[:n] if exists(self.rep_buffer) else None
 
             # default nll validates targets - drop non-finite labels (a custom loss_fn owns its own)
@@ -690,15 +734,17 @@ class DaggerDistiller:
                         finite &= reduce(torch.isfinite(leaf), 'n ... -> n', 'all')
 
                 if not finite.all():
-                    state_leaves = [leaf[finite] for leaf in state_leaves]
-                    action_leaves = [leaf[finite] for leaf in action_leaves]
+                    state_leaves = take(state_leaves, finite)
+                    teacher_input_leaves = take(teacher_input_leaves, finite)
+                    action_leaves = take(action_leaves, finite)
                     reps = reps[finite] if exists(reps) else None
                     n = state_leaves[0].shape[0]
 
             if exists(max_samples) and n > max_samples:
                 sel = torch.randperm(n, device = self.buffer_device)[:max_samples]
-                state_leaves = [leaf[sel] for leaf in state_leaves]
-                action_leaves = [leaf[sel] for leaf in action_leaves]
+                state_leaves = take(state_leaves, sel)
+                teacher_input_leaves = take(teacher_input_leaves, sel)
+                action_leaves = take(action_leaves, sel)
                 reps = reps[sel] if exists(reps) else None
                 n = max_samples
 
@@ -707,10 +753,17 @@ class DaggerDistiller:
 
                 for i in range(0, n, batch_size):
                     b = perm[i:i + batch_size]
-                    states = pytree.tree_unflatten([leaf[b] for leaf in state_leaves], self.state_treedef)
+                    states = batch(state_leaves, self.state_treedef, b)
+                    label = batch(action_leaves, self.action_treedef, b)
+
                     student_out = self.student(states)
-                    label = pytree.tree_unflatten([leaf[b] for leaf in action_leaves], self.action_treedef)
-                    breakdown = self._loss(student_out, label, teacher_rep = reps[b] if exists(reps) else None)
+                    teacher_out = None
+
+                    if self.needs_teacher_out:
+                        teacher_inputs = batch(teacher_input_leaves, self.teacher_input_treedef, b) if exists(teacher_input_leaves) else states
+                        teacher_out = self._teacher_distribution(teacher_inputs)
+
+                    breakdown = self._loss(student_out, label, teacher_out = teacher_out, teacher_rep = reps[b] if exists(reps) else None)
                     loss = breakdown.loss
 
                     # beta nll gradients spike - skip bad batches, clip the rest

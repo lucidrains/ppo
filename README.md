@@ -124,13 +124,12 @@ distill_loss.backward()
 Composite action spaces (a pytree of heads), representation alignment against any layer of the teacher or student (repa), soft and deterministic objectives (`kl_loss`, `mse_loss`), and the full DAgger loop (roll the student out, label with the teacher, fit) are one argument each away
 
 ```python
-from x_ppo import DaggerDistiller
-from x_ppo.dagger_distill import kl_loss
+from x_ppo import DaggerDistiller, kl_loss
 
 distiller = DaggerDistiller(student, teacher,
+    loss_fn = kl_loss,                          # soft distillation (default: hard-label nll)
     student_layer = 'trunk.2',                  # representation alignment, 1 - cosine
     teacher_layer = 'trunk.6',
-    loss_fn = kl_loss,
     student_state_fn = lambda obs, info, step: obs['obs'],      # deployable fields
     teacher_obs_fn = lambda obs, info, step: obs['privileged'], # a privileged teacher
     env = env,
@@ -143,7 +142,7 @@ for cycle in range(cycles):
     stats = distiller.step(collect_steps = 128, epochs = 2)
 ```
 
-Pass `return_loss_breakdown = True` for the loss components - `LossBreakdown(loss, policy, entropy, alignment)` - on top of the total
+Pass `return_loss_breakdown = True` for the loss components - `LossBreakdown(loss, policy, entropy, alignment)` - on top of the total. In the loop, `kl_loss` and `mse_loss` re-evaluate the teacher on its buffered inputs at fit time, so keep the teacher in eval mode
 
 ## Citations
 
