@@ -15,6 +15,7 @@ def hpo_actor_loss(
     delightful = False,
     delight_temp = 1.,
     log_ratio_clamp = None,
+    advantage_clip = 2.,
     group_dim = -2
 ):
     mask = resolve_grouped_mask(advantages, action_log_probs, mask, group_dim)
@@ -42,14 +43,12 @@ def hpo_actor_loss(
 
     eps = torch.where(advantages >= 0., eps_clip_high, eps_clip_low)
 
-    # proportional stop target, saturating at |A| = 1
-    prop_target = eps * advantages.clamp(-1., 1.)
-    approaching = (log_ratios - prop_target) * advantages < 0.
+    # fixed target
+    advantage_clip_low, advantage_clip_high = cast_tuple(advantage_clip, 2)
+    target = eps * advantages.clamp(-advantage_clip_low, advantage_clip_high)
+    weight = advantages.abs()
 
-    # stop at proportional target - track inside trust band, restore past bound
-    target = torch.where(approaching, prop_target, log_ratios.detach().clamp(-eps_clip_low, eps_clip_high))
-    weight = torch.where(approaching, advantages.abs(), action_log_probs.detach().exp().clamp(max = 1.))
-
+    # huber - smooth gradient decay at the target, no clip cliff
     error = log_ratios - target
     abs_error = error.abs()
     loss = weight * torch.where(abs_error < eps, 0.5 * error.square() / eps, abs_error - 0.5 * eps)

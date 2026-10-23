@@ -1,6 +1,6 @@
 [project]
 name = "x-ppo"
-version = "0.0.21"
+version = "0.0.22"
 description = "PPO"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -36,7 +36,7 @@ Homepage = "https://pypi.org/project/x-ppo/"
 Repository = "https://github.com/lucidrains/x-ppo"
 
 [project.optional-dependencies]
-examples = []
+examples = ["mean-conc-beta"]
 test = [
     "pytest"
 ]

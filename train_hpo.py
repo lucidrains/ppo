@@ -9,6 +9,8 @@ import torch
 import torch.nn.functional as F
 from torch.distributions import Categorical
 
+from mean_conc_beta import Beta
+
 from x_ppo import ppo_actor_loss, hpo_actor_loss, calc_gae
 
 # keep runs single threaded and comparable
@@ -26,17 +28,35 @@ def mlp(n_in, n_out, hidden = 64):
     )
 
 
+class Actor(torch.nn.Module):
+    def __init__(self, obs_dim, action_dim, continuous, bounds = None):
+        super().__init__()
+        self.continuous = continuous
+        self.net = mlp(obs_dim, action_dim * 2 if continuous else action_dim)
+        self.beta = Beta(bounds = bounds, init_conc = 2.) if continuous else None
+
+    def forward(self, state, perturb_mean_scale = 0.):
+        out = self.net(state)
+
+        if not self.continuous:
+            return Categorical(logits = out)
+
+        params = out.view(*state.shape[:-1], -1, 2)
+        return self.beta(params, perturb_mean_scale = perturb_mean_scale)
+
+
 def actor_loss(
     method,
     log_probs,
     old_log_probs,
     advantages,
-    eps_clip
+    eps_clip,
+    advantage_clip = 1.
 ):
     if method == 'ppo':
         return ppo_actor_loss(log_probs, old_log_probs, advantages, eps_clip = eps_clip)
 
-    return hpo_actor_loss(log_probs, old_log_probs, advantages, eps_clip = eps_clip)
+    return hpo_actor_loss(log_probs, old_log_probs, advantages, eps_clip = eps_clip, advantage_clip = advantage_clip)
 
 
 @torch.no_grad()
@@ -44,13 +64,23 @@ def evaluate(actor, eval_seeds, max_steps = 500, env_name = 'CartPole-v1'):
     env = gym.make(env_name)
     returns = []
 
+    continuous = isinstance(env.action_space, gym.spaces.Box)
+    action_low = torch.as_tensor(env.action_space.low, dtype = torch.float32) if continuous else None
+    action_high = torch.as_tensor(env.action_space.high, dtype = torch.float32) if continuous else None
+
     for eval_seed in eval_seeds:
         obs, _ = env.reset(seed = eval_seed)
         episode_return = 0.
 
         for _ in range(max_steps):
             obs_t = torch.as_tensor(obs, dtype = torch.float32)
-            action = actor(obs_t).argmax().item()
+            dist = actor(obs_t)
+
+            if continuous:
+                action = dist.mean.clamp(action_low, action_high).numpy()
+            else:
+                action = dist.probs.argmax().item()
+
             obs, reward, terminated, truncated, _ = env.step(action)
             episode_return += reward
 
@@ -76,6 +106,8 @@ def train(
     gamma = 0.99,
     lam = 0.95,
     eps_clip = 0.2,
+    advantage_clip = 1.,
+    rpo_alpha = 0.,
     value_coef = 0.5,
     entropy_coef = 0.01,
     grad_clip = 0.5,
@@ -88,9 +120,17 @@ def train(
 
     env = gym.make(env_name)
     max_steps = env.spec.max_episode_steps or 1_000
-    obs_dim, action_dim = env.observation_space.shape[0], env.action_space.n
 
-    actor = mlp(obs_dim, action_dim)
+    continuous = isinstance(env.action_space, gym.spaces.Box)
+
+    if rpo_alpha > 0. and not continuous:
+        raise ValueError('rpo_alpha is only supported for continuous action spaces')
+
+    obs_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0] if continuous else env.action_space.n
+    bounds = np.stack([env.action_space.low, env.action_space.high], axis = -1) if continuous else None
+
+    actor = Actor(obs_dim, action_dim, continuous, bounds)
     critic = mlp(obs_dim, 1)
     params = list(actor.parameters()) + list(critic.parameters())
     opt = torch.optim.Adam(params, lr = lr)
@@ -113,17 +153,21 @@ def train(
 
         for _ in range(rollout):
             state = torch.as_tensor(obs, dtype = torch.float32)
-            dist = Categorical(logits = actor(state))
+            dist = actor(state)
             action = dist.sample()
 
             with torch.no_grad():
                 value = critic(state).item()
 
-            next_obs, reward, terminated, truncated, _ = env.step(action.item())
+            env_action = action.numpy() if continuous else action.item()
+            next_obs, reward, terminated, truncated, _ = env.step(env_action)
 
             states.append(state)
             actions.append(action)
-            old_log_probs.append(dist.log_prob(action).detach())
+
+            log_prob = dist.log_prob(action)
+            old_log_probs.append((log_prob.sum(-1) if continuous else log_prob).detach())
+
             rewards.append(reward)
             values.append(value)
             masks.append(1. - float(terminated))
@@ -180,15 +224,21 @@ def train(
                 advantage = advantages[batch_indices]
                 ret = returns[batch_indices]
 
-                dist = Categorical(logits = actor(state))
+                dist = actor(state, perturb_mean_scale = rpo_alpha)
                 log_prob = dist.log_prob(action)
+                entropy = dist.entropy()
+
+                if continuous:
+                    log_prob = log_prob.sum(-1)
+                    entropy = entropy.sum(-1)
 
                 policy_loss = actor_loss(
                     method,
                     log_prob,
                     old_log_prob,
                     advantage,
-                    eps_clip
+                    eps_clip,
+                    advantage_clip = advantage_clip
                 ).mean()
 
                 with torch.no_grad():
@@ -198,7 +248,7 @@ def train(
                 clipped_value = value.clamp(old_value - eps_clip, old_value + eps_clip)
                 value_loss = torch.max(F.mse_loss(value, ret, reduction = 'none'), F.mse_loss(clipped_value, ret, reduction = 'none')).mean()
 
-                entropy = dist.entropy().mean()
+                entropy = entropy.mean()
                 loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
 
                 opt.zero_grad()
@@ -254,6 +304,7 @@ def train(
         'seed': seed,
         'config': {
             'env_name': env_name,
+            'policy': 'beta' if continuous else 'categorical',
             'solve_return': solve_return,
             'total_steps': updates * rollout,
             'rollout': rollout,
@@ -263,6 +314,8 @@ def train(
             'gamma': gamma,
             'lam': lam,
             'eps_clip': eps_clip,
+            'advantage_clip': advantage_clip,
+            'rpo_alpha': rpo_alpha,
             'value_coef': value_coef,
             'entropy_coef': entropy_coef,
             'grad_clip': grad_clip,
@@ -356,6 +409,8 @@ def run(
     epochs = 10,
     lr = 3e-4,
     eps = 0.2,
+    advantage_clip = 1.,
+    rpo_alpha = 0.,
     grad_clip = 0.5,
     eval_every = 5,
     eval_episodes = 10,
@@ -388,6 +443,8 @@ def run(
                 epochs = epochs,
                 lr = lr,
                 eps_clip = eps,
+                advantage_clip = advantage_clip,
+                rpo_alpha = rpo_alpha,
                 grad_clip = grad_clip,
                 eval_every = eval_every,
                 eval_episodes = eval_episodes,

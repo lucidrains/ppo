@@ -117,12 +117,12 @@ def test_hpo():
 
     assert torch.allclose(log_probs.grad, -advantages * advantages.abs().clamp(max = 1.))
 
-    # deadzone inside trust band, probability-weighted restoring outside
+    # fixed target inside trust band, linear restore outside
 
     log_ratios = torch.tensor([0.12, -0.12, 0.5, -0.5], requires_grad = True)
     hpo_actor_loss(log_ratios, torch.zeros(4), torch.tensor([0.3, -0.3, 0.3, -0.3]), eps_clip = 0.2).sum().backward()
 
-    assert torch.allclose(log_ratios.grad, torch.tensor([0., 0., 1., -math.exp(-0.5)]))
+    assert torch.allclose(log_ratios.grad, torch.tensor([0.09, -0.09, 0.3, -0.3]))
 
     advantages = torch.tensor([10., -10.])
     log_probs = torch.tensor([-5., 5.], requires_grad = True)
@@ -138,7 +138,7 @@ def test_hpo():
 
     hpo_actor_loss(log_ratios, torch.zeros(2), torch.tensor([1., -1.]), eps_clip = (eps_low, eps_high)).sum().backward()
 
-    assert torch.allclose(log_ratios.grad, torch.tensor([1., -math.exp(-2 * eps_low)]))
+    assert torch.allclose(log_ratios.grad, torch.tensor([1., -1.]))
 
     # gradient decays smoothly to the target, PPO clips
 
@@ -162,7 +162,15 @@ def test_hpo():
 
     hpo_actor_loss(log_probs, torch.zeros(2), torch.tensor([1., -1.]), log_ratio_clamp = (-1., 1.)).sum().backward()
 
-    assert torch.allclose(log_probs.grad, torch.tensor([1., -math.exp(-5.)]))
+    assert torch.allclose(log_probs.grad, torch.tensor([1., -1.]))
+
+    # advantage_clip saturates the target, asymmetric low / high
+
+    log_ratios = torch.tensor([0.25, -0.25], requires_grad = True)
+
+    hpo_actor_loss(log_ratios, torch.zeros(2), torch.tensor([1.5, -1.5]), eps_clip = 0.2, advantage_clip = (1., 2.)).sum().backward()
+
+    assert torch.allclose(log_ratios.grad, torch.full((2,), -0.375))
 
 @param('loss_fn', (ppo_actor_loss, spo_actor_loss, hpo_actor_loss))
 def test_actor_loss_fp32(loss_fn):
