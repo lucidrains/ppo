@@ -1,6 +1,6 @@
 [project]
 name = "x-ppo"
-version = "0.0.22"
+version = "0.0.25"
 description = "PPO"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -28,7 +28,7 @@ dependencies = [
     "einops>=0.8.0",
     "einx>=0.4.0",
     "torch>=2.5",
-    "torch-einops-utils>=0.1.24",
+    "torch-einops-utils>=0.1.42",
 ]
 
 [project.urls]

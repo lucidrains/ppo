@@ -93,7 +93,7 @@ from einops import rearrange, reduce
 from torch import Tensor, is_tensor, nn
 from torch.distributions import Bernoulli, Categorical, Distribution, OneHotCategorical, kl_divergence
 from torch.utils import _pytree as pytree
-from torch_einops_utils import cast_tensor, masked_mean
+from torch_einops_utils import bernoulli_kl, categorical_kl, cast_tensor, cross_entropy, masked_mean
 
 def exists(v):
     return v is not None
@@ -184,6 +184,14 @@ def to_log_prob_target(label: Tensor, distr: Distribution) -> Tensor:
 
 def log_prob_sum(distr: Distribution, label: Tensor) -> Tensor:
     # one (batch,) log-prob per transition, whatever the event shape
+
+    if isinstance(distr, (Categorical, OneHotCategorical)):
+        if isinstance(distr, OneHotCategorical):
+            label = label.argmax(dim = -1)
+
+        label = label.reshape(distr.batch_shape).long()
+        return reduce(-cross_entropy(distr.logits, label, reduction = 'none'), 'b ... -> b', 'sum')
+
     return reduce(distr.log_prob(label), 'b ... -> b', 'sum')
 
 # ------------------------------------------------------------------- objectives
@@ -197,6 +205,24 @@ def nll_loss(student_out, teacher_out = None, label = None, info = None) -> Tens
     head_losses = pytree.tree_map(lambda distr, target: -log_prob_sum(distr, to_log_prob_target(target, distr)), student_out, label)
     return sum(pytree.tree_leaves(head_losses))
 
+def _leaf_kl(student_distr, teacher_distr, reverse):
+    discrete = (Categorical, OneHotCategorical, Bernoulli)
+
+    if isinstance(student_distr, discrete) and isinstance(teacher_distr, discrete):
+        # stable KL - the gradient q - p is computed from logits, not probabilities
+
+        if isinstance(student_distr, Bernoulli):
+            kl = bernoulli_kl(student_distr.logits, teacher_distr.logits) if reverse \
+                else bernoulli_kl(teacher_distr.logits, student_distr.logits)
+        else:
+            kl = categorical_kl(student_distr.logits, teacher_distr.logits) if reverse \
+                else categorical_kl(teacher_distr.logits, student_distr.logits)
+    else:
+        kl = kl_divergence(student_distr, teacher_distr) if reverse \
+            else kl_divergence(teacher_distr, student_distr)
+
+    return reduce(kl, 'b ... -> b', 'sum')
+
 def kl_loss(student_out, teacher_out = None, label = None, info = None, *, reverse = False) -> Tensor:
     """Per-sample KL between the two policies, summed over every head - soft
     distillation. The default direction is KL(teacher || student)
@@ -207,15 +233,7 @@ def kl_loss(student_out, teacher_out = None, label = None, info = None, *, rever
     if not exists(teacher_out):
         return nll_loss(student_out, teacher_out, label, info)
 
-    head_losses = pytree.tree_map(
-        lambda student_distr, teacher_distr: reduce(
-            kl_divergence(student_distr, teacher_distr) if reverse else kl_divergence(teacher_distr, student_distr),
-            'b ... -> b',
-            'sum'
-        ),
-        student_out,
-        teacher_out
-    )
+    head_losses = pytree.tree_map(lambda student_distr, teacher_distr: _leaf_kl(student_distr, teacher_distr, reverse), student_out, teacher_out)
     return sum(pytree.tree_leaves(head_losses))
 
 def mse_loss(student_out, teacher_out = None, label = None, info = None) -> Tensor:
